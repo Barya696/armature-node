@@ -16,8 +16,8 @@ bl_info = {
     "location": "Node Editor > Armature Nodes",
     "description": (
         "Procedural node system that compiles node graphs into armatures, "
-        "decompiles armatures back into node graphs, and drives Rigify rigs "
-        "from a MediaPipe marker skeleton"
+        "decompiles armatures back into node graphs, places bones from "
+        "markers, and drives Rigify rigs from a marker skeleton"
     ),
     "category": "Rigging",
 }

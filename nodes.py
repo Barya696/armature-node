@@ -33,6 +33,7 @@ from .sockets import (
     BoneSocket,
     ChainSocket,
     ConstraintSocket,
+    MarkerSocket,
     PoseSocket,
 )
 from .widgets import PRESET_ITEMS as _widget_preset_items
@@ -513,8 +514,62 @@ class CustomShapeNode(ArmatureNodeBase, Node):
 
     def init(self, context):
         self.inputs.new(ChainSocket.bl_idname, "Bones")
+        self.inputs.new(MarkerSocket.bl_idname, "Marker")
         self.outputs.new(ChainSocket.bl_idname, "Bones")
         self.width = 240
+
+    def ensure_sockets(self):
+        """Migrate nodes saved before the Marker input existed."""
+        if self.inputs.get("Marker") is None:
+            self.inputs.new(MarkerSocket.bl_idname, "Marker")
+
+    def linked_marker(self):
+        """(position, rotation | None) of the marker wired into this node.
+
+        The link carries an identity, not a value: the socket names a marker
+        key and the upstream Skeleton node holds that marker's live position,
+        so dragging the handle in the viewport moves this bone.
+        """
+        sock = self.inputs.get("Marker")
+        if sock is None:
+            return None
+        for link in sock.links:
+            if not link.is_valid:
+                continue
+            key = getattr(link.from_socket, "marker_key", "")
+            node = link.from_node
+            if not key or not hasattr(node, "marker_by_key"):
+                continue
+            marker = node.marker_by_key(key)
+            if marker is None:
+                continue
+            rotation = tuple(marker.rotation) if marker.use_rotation else None
+            return Vector(marker.position), rotation
+        return None
+
+    def _place_on_marker(self, bone, head, rotation=None):
+        """Move ``bone`` so its head sits on the marker.
+
+        The head-to-tail offset is carried along, so the bone keeps the length
+        and direction it already had and only moves. An oriented marker also
+        turns that offset and supplies the roll, which is what lets a single
+        marker fully place a control.
+        """
+        from mathutils import Euler
+        from .primary_rig import roll_from_marker
+
+        offset = Vector(bone.tail) - Vector(bone.head)
+        if offset.length < _TRANSFORM_EPS:
+            # Blender rejects zero-length bones; give it something to keep.
+            offset = Vector((0.0, 0.0, 0.1))
+        if rotation is not None:
+            offset = Euler(tuple(rotation), "XYZ").to_matrix() @ offset
+        head = Vector(head)
+        tail = head + offset
+        bone.head = tuple(head)
+        bone.tail = tuple(tail)
+        if rotation is not None:
+            bone.roll = roll_from_marker(head, tail, tuple(rotation))
 
     def filtered_names(self):
         return {n.strip() for n in self.bone_filter.split(";") if n.strip()}
@@ -1003,6 +1058,7 @@ class CustomShapeNode(ArmatureNodeBase, Node):
     def draw_buttons(self, context, layout):
         from .snapshot import describe_geometry
 
+        self.ensure_sockets()
         layout.context_pointer_set("node", self)
 
         # Visible, adjustable part: which bone, and where it is in the WORLD
@@ -1023,12 +1079,23 @@ class CustomShapeNode(ArmatureNodeBase, Node):
         pose_col.prop(self, "world_rotation", text="Rotation")
         pose_col.prop(self, "world_scale", text="Scale")
 
-        # Edit mode: rest Head/Tail of the bone in armature space.
+        # Edit mode: rest Head/Tail of the bone in armature space. A wired
+        # marker owns these, so they are shown read-only rather than letting
+        # an edit be silently overwritten on the next rebuild.
+        driven = self.linked_marker() is not None
         rest_col = box.column(align=True)
-        rest_col.label(text="Rest (edit)", icon="EDITMODE_HLT")
-        rest_col.enabled = bool(self.controlled_bone)
+        rest_col.label(
+            text="Rest (marker)" if driven else "Rest (edit)",
+            icon="EMPTY_AXIS" if driven else "EDITMODE_HLT",
+        )
+        rest_col.enabled = bool(self.controlled_bone) and not driven
         rest_col.prop(self, "bone_head", text="Head")
         rest_col.prop(self, "bone_tail", text="Tail")
+
+        if driven and not self.controlled_bone:
+            box.label(text="Set a bone name for the marker to place", icon="ERROR")
+        elif driven:
+            box.label(text="Head follows the wired marker", icon="EMPTY_AXIS")
 
         if self.controlled_bone:
             if obj is None:
@@ -1164,6 +1231,19 @@ class CustomShapeNode(ArmatureNodeBase, Node):
                     break
             else:
                 bones.append(own)
+
+        # A wired marker places the bone: the head goes to the marker and the
+        # tail follows rigidly. Applied after the stored rest values above, so
+        # the marker wins over what was decompiled -- which is the point of
+        # wiring one in. Without a bone filter there is no single bone to
+        # place, so nothing is moved.
+        placed = self.linked_marker()
+        if placed is not None:
+            head, rotation = placed
+            targets = names or ({own.name} if own is not None else set())
+            for b in bones:
+                if b.name in targets:
+                    self._place_on_marker(b, head, rotation)
 
         # What the widget IS depends on Source, so a change of Source or
         # Preset always resolves to a different form (otherwise the stored
@@ -1303,22 +1383,174 @@ def _landmark_use_rotation_prop(key):
     )
 
 
-class PrimaryRigNode(ArmatureNodeBase, Node):
-    """Marker skeleton placed from MediaPipe's 33 pose landmarks.
+def _slug(text):
+    """A key-safe token from a display name."""
+    out = "".join(c if c.isalnum() else "_" for c in (text or "").strip().lower())
+    return out.strip("_")
 
-    The landmarks are drawn in the viewport as a MediaPipe-style skeleton
-    (orange left, cyan right) with one draggable handle per point. Position is
-    always adjustable; rotation can be switched on per landmark, on any of the
-    33, and then feeds bone roll and the retarget twist.
 
-    Two outputs: *Skeleton* is the bones themselves (wire it into an Armature
-    Output), *Rig* hands the same skeleton to an Armature Input node, which
-    matches it onto an existing Rigify rig's controls and drives them.
+def _marker_owner(marker):
+    """The Skeleton node a marker belongs to.
+
+    A PropertyGroup only knows its owning ID (the node tree), not the node, so
+    the node is found by identity. Trees hold a handful of Skeleton nodes at
+    most, and this only runs on an edit, so the scan is cheaper than keeping a
+    back-reference in sync across copy / paste / rename.
+    """
+    tree = marker.id_data
+    if tree is None:
+        return None
+    for node in tree.nodes:
+        if node.bl_idname != "ArmatureNodesPrimaryRigNode":
+            continue
+        for m in node.markers:
+            if m == marker:
+                return node
+    return None
+
+
+def _on_marker_changed(self, context):
+    """A marker position/rotation was typed: move its handle and rebuild."""
+    if _syncing_landmarks:
+        return
+    from .primary_rig import tag_viewports_redraw
+
+    node = _marker_owner(self)
+    if node is not None:
+        node.push_landmarks_to_empties()
+    tag_viewports_redraw()
+    tree = self.id_data
+    if tree is not None and hasattr(tree, "mark_dirty"):
+        tree.mark_dirty()
+
+
+def _on_marker_name_changed(self, context):
+    """Renaming a marker renames its output socket; links survive because they
+    are attached to the socket, not to its name."""
+    node = _marker_owner(self)
+    if node is not None:
+        node.sync_marker_sockets()
+
+
+def _on_marker_use_rotation_changed(self, context):
+    """Rotation enabled/disabled on one marker: re-lock and redraw its handle,
+    then rebuild (roll and retarget twist both change)."""
+    from .primary_rig import (
+        apply_marker_locks,
+        find_marker_empties,
+        tag_viewports_redraw,
+    )
+
+    node = _marker_owner(self)
+    if node is None:
+        return
+    for key, obj in find_marker_empties(node).items():
+        apply_marker_locks(node, obj, key)
+        marker = node.marker_by_key(key)
+        if marker is not None and marker.use_rotation:
+            obj.rotation_euler = tuple(marker.rotation)
+    tag_viewports_redraw()
+    tree = self.id_data
+    if tree is not None and hasattr(tree, "mark_dirty"):
+        tree.mark_dirty()
+
+
+class SkeletonMarker(bpy.types.PropertyGroup):
+    """One marker on a Skeleton node: a world position, optionally oriented.
+
+    ``key`` is the stable identity -- the output socket and the viewport
+    handle are both bound to it, so it is assigned once and never changes.
+    ``name`` is only the label, and is free to be edited.
     """
 
-    bl_idname = "ArmatureNodesPrimaryRigNode"
-    bl_label = "Primary Rig"
+    key: StringProperty(name="Key", default="", options={"HIDDEN"})
+    name: StringProperty(
+        name="Name",
+        description="Label for this marker; also names its output socket",
+        default="Marker",
+        update=_on_marker_name_changed,
+    )
+    position: FloatVectorProperty(
+        name="Position",
+        description="World position of the marker handle",
+        size=3,
+        default=(0.0, 0.0, 0.0),
+        subtype="TRANSLATION",
+        update=_on_marker_changed,
+    )
+    rotation: FloatVectorProperty(
+        name="Rotation",
+        description=(
+            "Orientation of the marker. Supplies the roll of a bone placed "
+            "here and its twist when retargeting"
+        ),
+        size=3,
+        default=(0.0, 0.0, 0.0),
+        subtype="EULER",
+        update=_on_marker_changed,
+    )
+    use_rotation: BoolProperty(
+        name="Rotation",
+        description=(
+            "Adjust this marker's rotation as well as its position. Off by "
+            "default: the handle is position-only until this is enabled"
+        ),
+        default=False,
+        update=_on_marker_use_rotation_changed,
+    )
+
+    def set_position(self, value):
+        """Write without firing the per-marker rebuild callback.
+
+        Callers that set many markers at once (the preset, a mirror, a handle
+        drag) push to the viewport and mark the tree dirty themselves; letting
+        each component fire would rebuild the rig dozens of times per edit.
+        """
+        global _syncing_landmarks
+        was = _syncing_landmarks
+        _syncing_landmarks = True
+        try:
+            self.position = tuple(value)
+        finally:
+            _syncing_landmarks = was
+
+    def set_rotation(self, value):
+        global _syncing_landmarks
+        was = _syncing_landmarks
+        _syncing_landmarks = True
+        try:
+            self.rotation = tuple(value)
+        finally:
+            _syncing_landmarks = was
+
+
+class SkeletonNode(ArmatureNodeBase, Node):
+    """Marker skeleton: any number of named, draggable markers.
+
+    A marker is a world position (plus an optional orientation) with a stable
+    key, drawn in the viewport as a grabbable handle. Markers are user-defined
+    -- the node starts empty and you add as many as the rig needs. Each one
+    gets its own output socket, so a marker can be wired straight into a
+    Custom Shape node to place that bone.
+
+    MediaPipe's 33 pose landmarks are a *preset*, not the node's structure:
+    loading it creates 33 markers whose keys match the landmark names, which
+    is what the Skeleton / Rig outputs and the retarget table key off. Without
+    it the node is still perfectly usable for hand-placed markers; only the
+    two skeleton outputs need the preset's landmarks to produce anything.
+
+    Outputs: one *Marker* socket per marker, plus *Skeleton* (the 22 bones
+    themselves, wire into an Armature Output) and *Rig* (the same skeleton as
+    a pose, wire into an Armature Input to drive an existing rig).
+    """
+
+    bl_idname = "ArmatureNodesPrimaryRigNode"  # unchanged: saved files use it
+    bl_label = "Skeleton"
     bl_icon = "OUTLINER_OB_ARMATURE"
+
+    markers: bpy.props.CollectionProperty(type=SkeletonMarker)
+    active_marker: IntProperty(name="Active Marker", default=0)
+    markers_migrated: BoolProperty(default=False, options={"HIDDEN"})
 
     lock_depth: BoolProperty(
         name="Lock Depth (2D)",
@@ -1328,7 +1560,10 @@ class PrimaryRigNode(ArmatureNodeBase, Node):
     )
     symmetric: BoolProperty(
         name="Symmetric",
-        description="Right-side landmarks are locked and mirror the left side",
+        description=(
+            "Right-side MediaPipe landmarks are locked and mirror the left "
+            "side. Custom markers have no mirror partner and are unaffected"
+        ),
         default=True,
         update=_on_marker_lock_changed,
     )
@@ -1339,11 +1574,11 @@ class PrimaryRigNode(ArmatureNodeBase, Node):
     )
     show_skeleton: BoolProperty(
         name="Skeleton",
-        description="Draw the landmark skeleton in the 3D viewport",
+        description="Draw the markers in the 3D viewport",
         default=True,
         update=_on_overlay_changed,
     )
-    show_markers: BoolProperty(name="Landmarks", default=False)
+    show_markers: BoolProperty(name="Markers", default=True)
     show_detail: BoolProperty(name="Face / Hands / Feet", default=False)
     show_advanced: BoolProperty(name="Advanced", default=False)
 
@@ -1354,7 +1589,8 @@ class PrimaryRigNode(ArmatureNodeBase, Node):
         self.width = 320
 
     def ensure_sockets(self):
-        """Migrate nodes saved before the Skeleton / Rig split."""
+        """Migrate nodes saved before the Skeleton / Rig split, then bring the
+        per-marker sockets in line with the marker list."""
         old = self.outputs.get("Bones")
         if old is not None and self.outputs.get("Skeleton") is None:
             old.name = "Skeleton"
@@ -1362,6 +1598,7 @@ class PrimaryRigNode(ArmatureNodeBase, Node):
             self.outputs.new(ChainSocket.bl_idname, "Skeleton")
         if self.outputs.get("Rig") is None:
             self.outputs.new(PoseSocket.bl_idname, "Rig")
+        self.sync_marker_sockets()
 
     def free(self):
         from .primary_rig import remove_marker_empties
@@ -1369,54 +1606,237 @@ class PrimaryRigNode(ArmatureNodeBase, Node):
         try:
             remove_marker_empties(self)
         except Exception as exc:  # noqa: BLE001
-            print(f"[Armature Nodes] Could not clean up landmark handles: {exc}")
+            print(f"[Armature Nodes] Could not clean up marker handles: {exc}")
         self.schedule_rebuild()
 
-    # -- Landmark access -------------------------------------------------------
+    def copy(self, node):
+        """A duplicated node must not adopt the original handles.
+
+        The marker collection copies by value, but the viewport empties are
+        tagged with the source node name, so without this the copy would find
+        no handles of its own and both nodes would fight over one set. Marking
+        the copy as migrated also stops the legacy import running on it.
+        """
+        self.markers_migrated = True
+
+    # -- Marker list ----------------------------------------------------------
+
+    def marker_keys(self):
+        return [m.key for m in self.markers if m.key]
+
+    def marker_by_key(self, key):
+        for m in self.markers:
+            if m.key == key:
+                return m
+        return None
+
+    def unique_marker_key(self, base):
+        """A key not already used on this node.
+
+        Keys are stable identifiers: sockets and viewport handles are bound to
+        them, so they never change once assigned. Renaming a marker changes
+        only its label.
+        """
+        base = base or "marker"
+        taken = set(self.marker_keys())
+        if base not in taken:
+            return base
+        i = 1
+        while f"{base}.{i:03d}" in taken:
+            i += 1
+        return f"{base}.{i:03d}"
+
+    def add_marker(self, name="", position=None, rotation=None, key=None):
+        """Append one marker and give it an output socket."""
+        marker = self.markers.add()
+        marker.key = self.unique_marker_key(key or _slug(name) or "marker")
+        marker.name = name or marker.key
+        if position is not None:
+            marker.set_position(position)
+        if rotation is not None:
+            marker.set_rotation(rotation)
+        self.active_marker = len(self.markers) - 1
+        self.sync_marker_sockets()
+        self.refresh_handles()
+        return marker
+
+    def remove_marker(self, index):
+        if not 0 <= index < len(self.markers):
+            return False
+        self.markers.remove(index)
+        self.active_marker = min(self.active_marker, max(0, len(self.markers) - 1))
+        self.sync_marker_sockets()
+        self.refresh_handles()
+        return True
+
+    def clear_markers(self):
+        self.markers.clear()
+        self.active_marker = 0
+        self.sync_marker_sockets()
+        self.refresh_handles()
+
+    def load_mediapipe_preset(self, replace=True):
+        """Fill the marker list with MediaPipe's 33 pose landmarks.
+
+        Keys are the landmark keys, which is what makes the Skeleton / Rig
+        outputs and the whole retarget table resolve. Markers the user added
+        themselves are kept when ``replace`` is False.
+        """
+        from .primary_rig import LANDMARKS, LM_LABELS
+
+        if replace:
+            self.markers.clear()
+        have = set(self.marker_keys())
+        added = 0
+        for _idx, key, _label, _side, default in LANDMARKS:
+            if key in have:
+                continue
+            marker = self.markers.add()
+            marker.key = key
+            marker.name = LM_LABELS[key]
+            marker.set_position(default)
+            added += 1
+        self.markers_migrated = True
+        self.active_marker = 0
+        self.sync_marker_sockets()
+        self.refresh_handles()
+        return added
+
+    def ensure_markers(self):
+        """One-time import of landmarks stored by pre-marker-list versions.
+
+        Files saved when the 33 landmarks were fixed node properties keep
+        their values in the legacy ``lm_*`` properties. If this node has no
+        markers yet but those values were moved off their defaults, the user
+        placed them, so bring them across instead of silently starting empty.
+        """
+        if self.markers_migrated or len(self.markers):
+            return False
+        from .primary_rig import (
+            LANDMARKS,
+            LM_DEFAULTS,
+            LM_LABELS,
+            LM_PROP,
+            LM_ROT_PROP,
+            LM_USE_ROT_PROP,
+        )
+
+        placed = False
+        for key in LM_PROP:
+            current = getattr(self, LM_PROP[key], None)
+            if current is None:
+                continue
+            if (Vector(current) - Vector(LM_DEFAULTS[key])).length > 1e-6:
+                placed = True
+                break
+        self.markers_migrated = True
+        if not placed:
+            return False  # untouched defaults: the node legitimately starts empty
+
+        for _idx, key, _label, _side, default in LANDMARKS:
+            marker = self.markers.add()
+            marker.key = key
+            marker.name = LM_LABELS[key]
+            marker.set_position(getattr(self, LM_PROP[key], default))
+            marker.set_rotation(getattr(self, LM_ROT_PROP[key], (0.0, 0.0, 0.0)))
+            marker.use_rotation = bool(getattr(self, LM_USE_ROT_PROP[key], False))
+        self.sync_marker_sockets()
+        print(
+            f"[Armature Nodes] Imported 33 placed landmarks into "
+            f"'{self.name}' as markers"
+        )
+        return True
+
+    def sync_marker_sockets(self):
+        """One output socket per marker, bound by ``marker_key``.
+
+        Sockets are matched and renamed rather than rebuilt, because a link is
+        attached to the socket itself: dropping and re-adding one would break
+        every wire into a Custom Shape node. New markers append, so inserting
+        in the middle of the list leaves the socket order behind the list
+        order -- harmless, and the alternative costs links.
+        """
+        from .sockets import MarkerSocket
+
+        wanted = [(m.key, m.name or m.key) for m in self.markers if m.key]
+        wanted_keys = {k for k, _n in wanted}
+        for sock in list(self.outputs):
+            if sock.bl_idname != MarkerSocket.bl_idname:
+                continue
+            if sock.marker_key not in wanted_keys:
+                self.outputs.remove(sock)
+        existing = {
+            s.marker_key: s
+            for s in self.outputs
+            if s.bl_idname == MarkerSocket.bl_idname
+        }
+        for key, label in wanted:
+            sock = existing.get(key)
+            if sock is None:
+                sock = self.outputs.new(MarkerSocket.bl_idname, label)
+                sock.marker_key = key
+            elif sock.name != label:
+                sock.name = label
+
+    # -- Marker access --------------------------------------------------------
 
     def landmark(self, key):
-        from .primary_rig import LM_PROP
+        """Position of ``key``. Falls back to the MediaPipe default so the
+        skeleton builder never sees a hole when a landmark is missing."""
+        from .primary_rig import LM_DEFAULTS
 
-        return Vector(getattr(self, LM_PROP[key]))
+        marker = self.marker_by_key(key)
+        if marker is not None:
+            return Vector(marker.position)
+        return Vector(LM_DEFAULTS.get(key, (0.0, 0.0, 0.0)))
 
     def landmarks(self):
+        """MediaPipe landmark positions this node actually carries."""
         from .primary_rig import LM_KEYS
 
-        return {k: self.landmark(k) for k in LM_KEYS}
+        have = set(self.marker_keys())
+        return {k: self.landmark(k) for k in LM_KEYS if k in have}
+
+    def has_full_skeleton(self):
+        """True when every MediaPipe landmark is present, i.e. the preset is
+        loaded and the Skeleton / Rig outputs can produce bones."""
+        from .primary_rig import LM_KEYS
+
+        have = set(self.marker_keys())
+        return all(k in have for k in LM_KEYS)
 
     def marker_uses_rotation(self, key):
-        from .primary_rig import LM_USE_ROT_PROP
-
-        return bool(getattr(self, LM_USE_ROT_PROP[key], False))
+        marker = self.marker_by_key(key)
+        return bool(marker and marker.use_rotation)
 
     def marker_rotation(self, key):
-        from .primary_rig import LM_ROT_PROP
-
-        return Vector(getattr(self, LM_ROT_PROP[key]))
+        marker = self.marker_by_key(key)
+        if marker is None:
+            return Vector((0.0, 0.0, 0.0))
+        return Vector(marker.rotation)
 
     def marker_rotations(self):
-        """Euler per landmark, only for the landmarks with rotation enabled."""
-        from .primary_rig import LM_KEYS
-
+        """Euler per marker, only for the markers with rotation enabled."""
         return {
-            k: tuple(self.marker_rotation(k))
-            for k in LM_KEYS
-            if self.marker_uses_rotation(k)
+            m.key: tuple(m.rotation) for m in self.markers if m.key and m.use_rotation
         }
 
     def set_landmarks(self, values, rotations=None, push=True):
-        """Write several landmarks at once without per-property rebuilds."""
+        """Write several markers at once without per-property rebuilds."""
         global _syncing_landmarks
-        from .primary_rig import LM_PROP, LM_ROT_PROP
         from .tree import suspend_live_update
 
         _syncing_landmarks = True
         try:
             with suspend_live_update():
                 for key, vec in values.items():
-                    setattr(self, LM_PROP[key], tuple(vec))
+                    marker = self.marker_by_key(key)
+                    if marker is not None:
+                        marker.set_position(vec)
                 for key, euler in (rotations or {}).items():
-                    setattr(self, LM_ROT_PROP[key], tuple(euler))
+                    marker = self.marker_by_key(key)
+                    if marker is not None:
+                        marker.set_rotation(euler)
         finally:
             _syncing_landmarks = False
         if push:
@@ -1425,7 +1845,9 @@ class PrimaryRigNode(ArmatureNodeBase, Node):
     def effective_height(self):
         from .primary_rig import DEFAULT_HEIGHT
 
-        zs = [v.z for v in self.landmarks().values()]
+        zs = [m.position[2] for m in self.markers]
+        if not zs:
+            return DEFAULT_HEIGHT
         height = max(zs) - min(zs)
         return height if height > 1e-3 else DEFAULT_HEIGHT
 
@@ -1434,17 +1856,18 @@ class PrimaryRigNode(ArmatureNodeBase, Node):
         return float(self.mirror_center_x)
 
     def _mirrored(self, changes, rotations=None):
-        """Add the right-side mirrors of every left-side entry."""
+        """Add the right-side mirrors of every left-side entry. Custom markers
+        have no mirror partner, so they pass through untouched."""
         from .primary_rig import LM_MIRROR, LM_SIDE, mirror_point, mirror_rotation
 
         mid = self.center_x()
         out = dict(changes)
         rot_out = dict(rotations or {})
         for key, loc in changes.items():
-            if LM_SIDE[key] == "L":
+            if LM_SIDE.get(key) == "L" and LM_MIRROR.get(key):
                 out[LM_MIRROR[key]] = mirror_point(loc, mid)
         for key, euler in (rotations or {}).items():
-            if LM_SIDE[key] == "L":
+            if LM_SIDE.get(key) == "L" and LM_MIRROR.get(key):
                 rot_out[LM_MIRROR[key]] = mirror_rotation(euler)
         return out, rot_out
 
@@ -1452,13 +1875,14 @@ class PrimaryRigNode(ArmatureNodeBase, Node):
         """Face / finger / toe landmarks move rigidly with their anchor."""
         from .primary_rig import RIGID_GROUPS
 
+        have = set(self.marker_keys())
         out = dict(changes)
         for anchor, members in RIGID_GROUPS.items():
-            if anchor not in changes:
+            if anchor not in changes or anchor not in have:
                 continue
             delta = changes[anchor] - self.landmark(anchor)
             for m in members:
-                if m not in changes:
+                if m not in changes and m in have:
                     out[m] = self.landmark(m) + delta
         return out
 
@@ -1469,15 +1893,38 @@ class PrimaryRigNode(ArmatureNodeBase, Node):
 
         return bool(find_marker_empties(self))
 
+    def refresh_handles(self):
+        """Bring the viewport handles back in line with the marker list."""
+        from .primary_rig import (
+            ensure_marker_empties,
+            prune_marker_empties,
+            tag_viewports_redraw,
+        )
+
+        try:
+            # Prune unconditionally. markers_shown() asks whether any handle
+            # still matches a live marker, so deleting the LAST marker makes
+            # it False -- and a guard on it would strand that final empty in
+            # the scene forever.
+            prune_marker_empties(self)
+            if self.markers_shown():
+                ensure_marker_empties(self)
+            tag_viewports_redraw()
+        except Exception as exc:  # noqa: BLE001
+            print(f"[Armature Nodes] Could not refresh marker handles: {exc}")
+
     def push_landmarks_to_empties(self):
         from .primary_rig import find_marker_empties
 
         for key, obj in find_marker_empties(self).items():
-            loc = self.landmark(key)
+            marker = self.marker_by_key(key)
+            if marker is None:
+                continue
+            loc = Vector(marker.position)
             if (Vector(obj.location) - loc).length > _TRANSFORM_EPS:
                 obj.location = loc
-            if self.marker_uses_rotation(key):
-                rot = self.marker_rotation(key)
+            if marker.use_rotation:
+                rot = Vector(marker.rotation)
                 if (Vector(obj.rotation_euler) - rot).length > _TRANSFORM_EPS:
                     obj.rotation_euler = rot
 
@@ -1490,12 +1937,15 @@ class PrimaryRigNode(ArmatureNodeBase, Node):
             return False
         moved, turned = {}, {}
         for key, obj in empties.items():
+            marker = self.marker_by_key(key)
+            if marker is None:
+                continue
             loc = Vector(obj.location)
-            if (self.landmark(key) - loc).length > _TRANSFORM_EPS:
+            if (Vector(marker.position) - loc).length > _TRANSFORM_EPS:
                 moved[key] = loc
-            if self.marker_uses_rotation(key):
+            if marker.use_rotation:
                 rot = Vector(obj.rotation_euler)
-                if (self.marker_rotation(key) - rot).length > _TRANSFORM_EPS:
+                if (Vector(marker.rotation) - rot).length > _TRANSFORM_EPS:
                     turned[key] = tuple(rot)
         if not moved and not turned:
             return False
@@ -1509,54 +1959,53 @@ class PrimaryRigNode(ArmatureNodeBase, Node):
         return True
 
     def mirror_markers(self, direction="L_TO_R"):
-        from .primary_rig import (
-            LM_KEYS,
-            LM_MIRROR,
-            LM_SIDE,
-            mirror_point,
-            mirror_rotation,
-        )
+        from .primary_rig import LM_MIRROR, LM_SIDE, mirror_point, mirror_rotation
 
         src = "L" if direction == "L_TO_R" else "R"
         mid = self.center_x()
-        changes = {
-            LM_MIRROR[k]: mirror_point(self.landmark(k), mid)
-            for k in LM_KEYS
-            if LM_SIDE[k] == src
-        }
+        keys = [
+            k
+            for k in self.marker_keys()
+            if LM_SIDE.get(k) == src and LM_MIRROR.get(k)
+        ]
+        changes = {LM_MIRROR[k]: mirror_point(self.landmark(k), mid) for k in keys}
         rotations = {
             LM_MIRROR[k]: mirror_rotation(self.marker_rotation(k))
-            for k in LM_KEYS
-            if LM_SIDE[k] == src and self.marker_uses_rotation(k)
+            for k in keys
+            if self.marker_uses_rotation(k)
         }
         self.set_landmarks(changes, rotations=rotations)
 
     # -- UI -------------------------------------------------------------------
 
-    def _draw_landmark_rows(self, layout, keys):
-        from .primary_rig import LM_LABELS, LM_PROP, LM_ROT_PROP, LM_SIDE
+    def _draw_marker_row(self, layout, index, marker):
+        from .primary_rig import LM_SIDE
 
-        for key in keys:
-            enabled = not (self.symmetric and LM_SIDE[key] == "R")
-            use_rot = self.marker_uses_rotation(key)
-            row = layout.row(align=True)
-            row.enabled = enabled
-            row.prop(self, LM_PROP[key], text=LM_LABELS[key])
-            op = row.operator(
-                "armature_nodes.primary_rig_toggle_rotation",
-                text="",
-                icon="ORIENTATION_GIMBAL",
-                depress=use_rot,
-            )
-            op.marker = key
-            if use_rot:
-                sub = layout.row(align=True)
-                sub.enabled = enabled
-                sub.prop(self, LM_ROT_PROP[key], text="")
+        enabled = not (self.symmetric and LM_SIDE.get(marker.key) == "R")
+        row = layout.row(align=True)
+        row.enabled = enabled
+        row.prop(marker, "name", text="")
+        op = row.operator(
+            "armature_nodes.primary_rig_toggle_rotation",
+            text="",
+            icon="ORIENTATION_GIMBAL",
+            depress=marker.use_rotation,
+        )
+        op.marker = marker.key
+        op = row.operator("armature_nodes.skeleton_remove_marker", text="", icon="X")
+        op.index = index
+        sub = layout.row(align=True)
+        sub.enabled = enabled
+        sub.prop(marker, "position", text="")
+        if marker.use_rotation:
+            sub = layout.row(align=True)
+            sub.enabled = enabled
+            sub.prop(marker, "rotation", text="")
 
     def draw_buttons(self, context, layout):
-        from .primary_rig import GROUP_ANCHOR, PRIMARY_KEYS
+        from .primary_rig import GROUP_ANCHOR, is_landmark
 
+        self.ensure_markers()
         self.ensure_sockets()
         layout.context_pointer_set("node", self)
 
@@ -1565,7 +2014,7 @@ class PrimaryRigNode(ArmatureNodeBase, Node):
         shown = self.markers_shown()
         row.operator(
             "armature_nodes.primary_rig_toggle_markers",
-            text=("Hide" if shown else "Show") + " Landmarks",
+            text=("Hide" if shown else "Show") + " Markers",
             icon="HIDE_OFF" if shown else "HIDE_ON",
         )
         row.operator("armature_nodes.primary_rig_front_view", icon="VIEW_ORTHO")
@@ -1575,29 +2024,91 @@ class PrimaryRigNode(ArmatureNodeBase, Node):
         row.prop(self, "show_skeleton", toggle=True, icon="ARMATURE_DATA")
 
         row = layout.row(align=True)
-        row.prop(self, "show_markers", icon="TRIA_DOWN" if self.show_markers else "TRIA_RIGHT", emboss=False)
-        if self.show_markers:
-            box = layout.box()
-            self._draw_landmark_rows(box, PRIMARY_KEYS)
-            row = box.row(align=True)
-            row.prop(self, "show_detail", icon="TRIA_DOWN" if self.show_detail else "TRIA_RIGHT", emboss=False)
-            if self.show_detail:
-                self._draw_landmark_rows(box.box(), tuple(GROUP_ANCHOR))
+        row.operator("armature_nodes.skeleton_add_marker", text="Add Marker", icon="ADD")
+        row.operator(
+            "armature_nodes.skeleton_load_preset", text="MediaPipe", icon="ARMATURE_DATA"
+        )
+
+        if not self.markers:
+            layout.label(
+                text="No markers yet -- Add Marker, or load a preset", icon="INFO"
+            )
+            return
+
+        # Primary markers (everything you place yourself) above; rigid-group
+        # members (face / fingers / toes, which follow their anchor) behind a
+        # fold, so a full MediaPipe set is not 33 rows deep by default.
+        primary, detail = [], []
+        for index, marker in enumerate(self.markers):
+            if is_landmark(marker.key) and marker.key in GROUP_ANCHOR:
+                detail.append((index, marker))
+            else:
+                primary.append((index, marker))
 
         row = layout.row(align=True)
-        row.prop(self, "show_advanced", icon="TRIA_DOWN" if self.show_advanced else "TRIA_RIGHT", emboss=False)
+        row.prop(
+            self,
+            "show_markers",
+            icon="TRIA_DOWN" if self.show_markers else "TRIA_RIGHT",
+            emboss=False,
+        )
+        row.label(text=str(len(self.markers)))
+        if self.show_markers:
+            box = layout.box()
+            for index, marker in primary:
+                self._draw_marker_row(box, index, marker)
+            if detail:
+                row = box.row(align=True)
+                row.prop(
+                    self,
+                    "show_detail",
+                    icon="TRIA_DOWN" if self.show_detail else "TRIA_RIGHT",
+                    emboss=False,
+                )
+                if self.show_detail:
+                    sub = box.box()
+                    for index, marker in detail:
+                        self._draw_marker_row(sub, index, marker)
+
+        row = layout.row(align=True)
+        row.prop(
+            self,
+            "show_advanced",
+            icon="TRIA_DOWN" if self.show_advanced else "TRIA_RIGHT",
+            emboss=False,
+        )
         if self.show_advanced:
             box = layout.box()
+            if not self.has_full_skeleton():
+                box.label(text="Skeleton / Rig need the MediaPipe preset", icon="INFO")
             box.prop(self, "mirror_center_x")
             row = box.row(align=True)
-            row.operator("armature_nodes.primary_rig_mirror", text="Mirror L > R").direction = "L_TO_R"
-            row.operator("armature_nodes.primary_rig_mirror", text="Mirror R > L").direction = "R_TO_L"
+            row.operator(
+                "armature_nodes.primary_rig_mirror", text="Mirror L > R"
+            ).direction = "L_TO_R"
+            row.operator(
+                "armature_nodes.primary_rig_mirror", text="Mirror R > L"
+            ).direction = "R_TO_L"
+            box.operator(
+                "armature_nodes.skeleton_clear_markers",
+                text="Clear Markers",
+                icon="TRASH",
+            )
 
     # -- Evaluation -----------------------------------------------------------
 
     def _skeleton_bones(self):
+        """The 22-bone skeleton.
+
+        Empty unless every MediaPipe landmark is present: the bone builder
+        maps landmark keys onto named bones, so a partial set would emit a
+        half-built skeleton with bones in the wrong place rather than an
+        obvious nothing.
+        """
         from .primary_rig import primary_rig_bones
 
+        if not self.has_full_skeleton():
+            return []
         landmarks = self.landmarks()
         floor_z = min(v.z for v in landmarks.values())
         return primary_rig_bones(
@@ -1626,6 +2137,9 @@ class PrimaryRigNode(ArmatureNodeBase, Node):
         """
         return self._skeleton_bones()
 
+
+# Old name kept so existing imports and any user scripts keep working.
+PrimaryRigNode = SkeletonNode
 
 def _add_landmark_properties(cls):
     """Position, rotation and rotation-enabled properties per landmark."""
@@ -2164,6 +2678,7 @@ class ArmatureInputNode(ArmatureNodeBase, Node):
 
 
 classes = (
+    SkeletonMarker,
     BoneOverride,
     BoneNode,
     ChainNode,
@@ -2171,7 +2686,7 @@ classes = (
     ParentNode,
     DeformGroupNode,
     CustomShapeNode,
-    PrimaryRigNode,
+    SkeletonNode,
     IKConstraintNode,
     GenericConstraintNode,
     ArmatureOutputNode,
@@ -2198,6 +2713,9 @@ _NO_REBUILD_PROPS = {
     "show_overrides",
     "show_skeleton",
     "bone_overrides",  # CollectionProperty: does not accept update=
+    "markers",  # CollectionProperty: does not accept update=
+    "active_marker",
+    "markers_migrated",
     "lock_depth",
     "symmetric",
     "match_report",

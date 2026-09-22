@@ -151,8 +151,20 @@ COLOR_CENTER = (0.92, 0.92, 0.92, 1.0)
 COLOR_LINK = (0.75, 0.75, 0.75, 0.9)
 
 
+# Custom markers the user added themselves (no MediaPipe key).
+COLOR_CUSTOM = (0.95, 0.45, 0.75, 1.0)
+
+
 def side_color(key):
+    """Marker colour. A key outside the MediaPipe set is a custom marker."""
+    if key not in LM_SIDE:
+        return COLOR_CUSTOM
     return {"L": COLOR_LEFT, "R": COLOR_RIGHT}.get(LM_SIDE[key], COLOR_CENTER)
+
+
+def is_landmark(key):
+    """True when ``key`` is one of the 33 MediaPipe landmarks."""
+    return key in LM_SIDE
 
 
 # ---------------------------------------------------------------------------
@@ -408,31 +420,54 @@ def find_marker_empties(node):
     if coll is None:
         return {}
     tree_name, node_name = node.id_data.name, node.name
+    keys = set(node.marker_keys())
     found = {}
     for obj in coll.objects:
         if obj.get("an_tree") != tree_name or obj.get("an_node") != node_name:
             continue
         key = obj.get("an_marker")
-        if key in LM_PROP:
+        # Markers are user-defined now, so the node's own list is the only
+        # authority on which keys exist. A handle whose marker was deleted is
+        # not returned here; ensure_marker_empties() removes it.
+        if key in keys:
             found[key] = obj
     return found
 
 
-def ensure_marker_empties(node):
-    """Create (or refresh) one empty per landmark at the node's positions.
+def prune_marker_empties(node):
+    """Delete handles whose marker no longer exists on the node."""
+    coll = bpy.data.collections.get(MARKER_COLLECTION)
+    if coll is None:
+        return
+    tree_name, node_name = node.id_data.name, node.name
+    keys = set(node.marker_keys())
+    for obj in list(coll.objects):
+        if obj.get("an_tree") != tree_name or obj.get("an_node") != node_name:
+            continue
+        if obj.get("an_marker") not in keys:
+            bpy.data.objects.remove(obj, do_unlink=True)
 
-    Primary joints get large handles, rigid-group members (face, fingers,
-    toes) small ones, and each handle is tinted with its MediaPipe side colour
-    so it matches the drawn skeleton. Landmarks with rotation enabled are
-    drawn as axes so the orientation is visible and grabbable.
+
+def ensure_marker_empties(node):
+    """Create (or refresh) one empty per marker on ``node``.
+
+    MediaPipe landmarks keep their side colour and their large/small handle
+    sizing (rigid-group members such as face, fingers and toes are small);
+    custom markers get the marker-socket pink at the primary size. Markers
+    with rotation enabled are drawn as axes so the orientation is visible and
+    grabbable. Handles for deleted markers are removed.
     """
     coll = marker_collection(create=True)
+    prune_marker_empties(node)
     existing = find_marker_empties(node)
     h = node.effective_height()
-    for key in LM_KEYS:
+    for marker in node.markers:
+        key = marker.key
+        if not key:
+            continue
         obj = existing.get(key)
         if obj is None:
-            obj = bpy.data.objects.new(f"LM-{LM_LABELS[key]}", None)
+            obj = bpy.data.objects.new(f"LM-{marker.name or key}", None)
             obj.show_in_front = True
             obj.hide_render = True
             obj.lock_scale = (True, True, True)
@@ -444,18 +479,22 @@ def ensure_marker_empties(node):
             coll.objects.link(obj)
             existing[key] = obj
         obj.empty_display_size = (0.008 if key in GROUP_ANCHOR else 0.016) * h
-        obj.location = getattr(node, LM_PROP[key])
-        if node.marker_uses_rotation(key):
-            obj.rotation_euler = getattr(node, LM_ROT_PROP[key])
+        obj.location = tuple(marker.position)
+        if marker.use_rotation:
+            obj.rotation_euler = tuple(marker.rotation)
         apply_marker_locks(node, obj, key)
     return existing
 
 
 def apply_marker_locks(node, obj, key):
     """Lock Y (depth) for front-view adjustment, lock rotation unless this
-    landmark has rotation enabled, and, in Symmetric mode, lock right-side
-    handles entirely so they only follow the mirrored left side."""
-    mirrored = bool(node.symmetric) and LM_SIDE[key] == "R"
+    marker has rotation enabled, and, in Symmetric mode, lock right-side
+    MediaPipe handles entirely so they only follow the mirrored left side.
+
+    Symmetric mirroring is a MediaPipe-landmark feature: a custom marker has
+    no mirror partner, so it is never locked by it.
+    """
+    mirrored = bool(node.symmetric) and LM_SIDE.get(key) == "R"
     use_rot = node.marker_uses_rotation(key)
     if mirrored:
         obj.lock_location = (True, True, True)
@@ -511,27 +550,41 @@ def _draw_skeleton_overlay():
     gpu.state.depth_test_set("NONE")
     try:
         for node in nodes:
-            pos = {k: tuple(getattr(node, LM_PROP[k])) for k in LM_KEYS}
-            # Connections, coloured by side (mixed = grey).
+            pos = {m.key: tuple(m.position) for m in node.markers if m.key}
+            if not pos:
+                continue
+            # Connections, coloured by side (mixed = grey). Only drawn between
+            # two landmarks that are both present: the MediaPipe set is a
+            # preset now, so a graph may hold part of it, or none of it.
             by_color = {}
             for a, b in POSE_CONNECTIONS:
                 ka, kb = LM_BY_INDEX[a], LM_BY_INDEX[b]
+                if ka not in pos or kb not in pos:
+                    continue
                 color = side_color(ka) if LM_SIDE[ka] == LM_SIDE[kb] else COLOR_LINK
                 by_color.setdefault(color, []).extend((pos[ka], pos[kb]))
             gpu.state.line_width_set(3.0)
             for color, coords in by_color.items():
                 shader.uniform_float("color", color)
                 batch_for_shader(shader, "LINES", {"pos": coords}).draw(shader)
-            # Joints: big dots for the primary joints, small for group members.
+            # Joints: big dots for the primary joints, small for group members,
+            # and every custom marker at primary size in the marker colour.
             side_colors = {"L": COLOR_LEFT, "R": COLOR_RIGHT, "C": COLOR_CENTER}
+            custom = [pos[k] for k in pos if not is_landmark(k)]
             for size, keys in ((10.0, PRIMARY_KEYS), (5.0, tuple(GROUP_ANCHOR))):
                 gpu.state.point_size_set(size)
                 for side, color in side_colors.items():
-                    coords = [pos[k] for k in keys if LM_SIDE[k] == side]
+                    coords = [
+                        pos[k] for k in keys if k in pos and LM_SIDE[k] == side
+                    ]
                     if not coords:
                         continue
                     shader.uniform_float("color", color)
                     batch_for_shader(shader, "POINTS", {"pos": coords}).draw(shader)
+            if custom:
+                gpu.state.point_size_set(10.0)
+                shader.uniform_float("color", COLOR_CUSTOM)
+                batch_for_shader(shader, "POINTS", {"pos": custom}).draw(shader)
     finally:
         gpu.state.line_width_set(1.0)
         gpu.state.point_size_set(1.0)
@@ -576,6 +629,9 @@ class ARMATURE_OT_primary_rig_toggle_markers(Operator):
         node = _node(context)
         if node.markers_shown():
             remove_marker_empties(node)
+        elif not len(node.markers):
+            self.report({"WARNING"}, "This Skeleton node has no markers yet")
+            return {"CANCELLED"}
         else:
             ensure_marker_empties(node)
             node.show_skeleton = True
@@ -641,7 +697,7 @@ class ARMATURE_OT_primary_rig_toggle_rotation(Operator):
     bl_label = "Toggle Landmark Rotation"
     bl_options = {"REGISTER", "UNDO"}
 
-    marker: bpy.props.StringProperty(name="Landmark", default="")
+    marker: bpy.props.StringProperty(name="Marker", default="")
 
     @classmethod
     def poll(cls, context):
@@ -649,11 +705,116 @@ class ARMATURE_OT_primary_rig_toggle_rotation(Operator):
 
     def execute(self, context):
         node = _node(context)
-        if self.marker not in LM_USE_ROT_PROP:
-            self.report({"WARNING"}, "Unknown landmark")
+        marker = node.marker_by_key(self.marker)
+        if marker is None:
+            self.report({"WARNING"}, "Unknown marker")
             return {"CANCELLED"}
-        prop = LM_USE_ROT_PROP[self.marker]
-        setattr(node, prop, not getattr(node, prop))
+        marker.use_rotation = not marker.use_rotation
+        return {"FINISHED"}
+
+
+class ARMATURE_OT_skeleton_add_marker(Operator):
+    """Add one marker to this Skeleton node, at the 3D cursor"""
+
+    bl_idname = "armature_nodes.skeleton_add_marker"
+    bl_label = "Add Marker"
+    bl_options = {"REGISTER", "UNDO"}
+
+    name: bpy.props.StringProperty(name="Name", default="")
+
+    @classmethod
+    def poll(cls, context):
+        return _node(context) is not None
+
+    def execute(self, context):
+        node = _node(context)
+        scene = context.scene
+        # The 3D cursor, so a new marker lands somewhere the user chose and
+        # is visible immediately rather than piling up on the origin.
+        location = tuple(scene.cursor.location) if scene is not None else (0.0, 0.0, 0.0)
+        name = self.name or f"Marker {len(node.markers) + 1}"
+        marker = node.add_marker(name=name, position=location)
+        node.id_data.mark_dirty()
+        tag_viewports_redraw()
+        self.report({"INFO"}, f"Added marker '{marker.name}'")
+        return {"FINISHED"}
+
+
+class ARMATURE_OT_skeleton_remove_marker(Operator):
+    """Remove this marker, its output socket and its viewport handle"""
+
+    bl_idname = "armature_nodes.skeleton_remove_marker"
+    bl_label = "Remove Marker"
+    bl_options = {"REGISTER", "UNDO"}
+
+    index: bpy.props.IntProperty(name="Index", default=-1)
+
+    @classmethod
+    def poll(cls, context):
+        return _node(context) is not None
+
+    def execute(self, context):
+        node = _node(context)
+        if not node.remove_marker(self.index):
+            self.report({"WARNING"}, "No such marker")
+            return {"CANCELLED"}
+        node.id_data.mark_dirty()
+        tag_viewports_redraw()
+        return {"FINISHED"}
+
+
+class ARMATURE_OT_skeleton_load_preset(Operator):
+    """Fill this Skeleton node with MediaPipe's 33 pose landmarks.
+
+    The Skeleton and Rig outputs and the whole retarget table key off these
+    landmark names, so this preset is what turns a bag of markers back into a
+    drivable body skeleton."""
+
+    bl_idname = "armature_nodes.skeleton_load_preset"
+    bl_label = "Load MediaPipe Preset"
+    bl_options = {"REGISTER", "UNDO"}
+
+    replace: bpy.props.BoolProperty(
+        name="Replace Markers",
+        description="Delete existing markers first; off keeps them and adds only what is missing",
+        default=False,
+    )
+
+    @classmethod
+    def poll(cls, context):
+        return _node(context) is not None
+
+    def execute(self, context):
+        node = _node(context)
+        added = node.load_mediapipe_preset(replace=self.replace)
+        node.id_data.mark_dirty()
+        tag_viewports_redraw()
+        self.report({"INFO"}, f"Added {added} landmark marker(s)")
+        return {"FINISHED"}
+
+
+class ARMATURE_OT_skeleton_clear_markers(Operator):
+    """Delete every marker on this Skeleton node"""
+
+    bl_idname = "armature_nodes.skeleton_clear_markers"
+    bl_label = "Clear Markers"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        node = _node(context)
+        return node is not None and len(node.markers) > 0
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_confirm(self, event)
+
+    def execute(self, context):
+        node = _node(context)
+        count = len(node.markers)
+        node.clear_markers()
+        node.id_data.mark_dirty()
+        tag_viewports_redraw()
+        self.report({"INFO"}, f"Removed {count} marker(s)")
         return {"FINISHED"}
 
 
@@ -662,6 +823,10 @@ classes = (
     ARMATURE_OT_primary_rig_mirror,
     ARMATURE_OT_primary_rig_front_view,
     ARMATURE_OT_primary_rig_toggle_rotation,
+    ARMATURE_OT_skeleton_add_marker,
+    ARMATURE_OT_skeleton_remove_marker,
+    ARMATURE_OT_skeleton_load_preset,
+    ARMATURE_OT_skeleton_clear_markers,
 )
 
 

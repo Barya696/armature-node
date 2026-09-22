@@ -7,7 +7,12 @@ built-in shader/geometry sockets).
 
 import bpy
 from bpy.types import NodeSocket
-from bpy.props import FloatProperty, FloatVectorProperty, BoolProperty
+from bpy.props import (
+    FloatProperty,
+    FloatVectorProperty,
+    BoolProperty,
+    StringProperty,
+)
 
 
 def _on_socket_value_changed(self, context):
@@ -73,6 +78,28 @@ class PoseSocket(_SocketDrawMixin, NodeSocket):
     bl_idname = "ArmatureNodesPoseSocket"
     bl_label = "Pose"
     socket_color = (0.95, 0.85, 0.25, 1.0)
+
+
+class MarkerSocket(_SocketDrawMixin, NodeSocket):
+    """Carries ONE named marker from a Skeleton node: a world position plus an
+    optional orientation.
+
+    Deliberately not a Vector socket. A marker is an identity, not a value:
+    the wire says *which* handle in the viewport drives this bone, and the
+    consumer reads its live position through ``marker_key``. ``marker_key``
+    rather than the socket name, because renaming a marker must not break the
+    link.
+    """
+
+    bl_idname = "ArmatureNodesMarkerSocket"
+    bl_label = "Marker"
+    socket_color = (0.95, 0.45, 0.75, 1.0)
+
+    marker_key: StringProperty(
+        name="Marker Key",
+        description="Stable identifier of the marker this socket carries",
+        default="",
+    )
 
 
 class ConstraintSocket(_SocketDrawMixin, NodeSocket):
@@ -151,6 +178,7 @@ classes = (
     ChainSocket,
     ArmatureSocket,
     PoseSocket,
+    MarkerSocket,
     ConstraintSocket,
     TransformSocket,
     FloatSocket,
