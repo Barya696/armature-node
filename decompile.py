@@ -258,30 +258,28 @@ def _configure_shape_node(node, shape):
 
 
 def _decompile_rig_shapes(obj, tree):
-    """Generated rig: reference it, emit ONLY Custom Shape nodes, no bones.
+    """Existing rig: emit ONLY Custom Shape nodes, no bones.
 
-    Graph: Armature Input(rig) -> one Custom Shape node per control bone,
-    carrying that bone's full info (name, position, scale + parent, children,
-    constraints, widget mesh) -> Armature Output (Custom Shapes Only).
+    Graph: one Custom Shape node per control bone, carrying that bone's full
+    info (name, position, scale + parent, children, constraints, widget mesh)
+    -> Armature Output (Custom Shapes Only), bound to the rig by name.
 
-    The Armature Input also stores a full snapshot of the rig, so if the
-    original is deleted the graph still evaluates to the complete armature
-    (every bone, constraint and widget) and Build recreates it.
+    No Armature Input node. It used to sit in front of the Custom Shape nodes
+    and re-read the live rig on every evaluation, which made the rig -- not
+    the graph -- the source of truth: an edit on a node was overwritten by
+    the armature's current state on the next rebuild, so the graph looked
+    frozen. Each Custom Shape node already stores everything about its bone,
+    so nothing upstream is needed to drive the rig.
     """
     from .core import ShapeDef
-    from .nodes import ArmatureInputNode, CustomShapeNode, ArmatureOutputNode
+    from .nodes import CustomShapeNode, ArmatureOutputNode
 
     tree.nodes.clear()
-
-    inp = tree.nodes.new(ArmatureInputNode.bl_idname)
-    inp.source = obj
-    inp.take_snapshot(obj)
-    inp.location = (0, 0)
 
     output = tree.nodes.new(ArmatureOutputNode.bl_idname)
     output.armature_name = obj.name
     output.mode = "SHAPES_ONLY"
-    output.location = (2 * NODE_X_SPACING + 80, 0)
+    output.location = (NODE_X_SPACING + 80, 0)
 
     # Order nodes by hierarchy depth then name so parents sit above children.
     def _depth(pb):
@@ -309,15 +307,9 @@ def _decompile_rig_shapes(obj, tree):
         _configure_shape_node(node, shape)
         node.sync_bone_info(pbone)  # bone data + reads the widget's mesh
         node.label = pbone.name
-        node.location = (NODE_X_SPACING + 40, -y)
+        node.location = (0, -y)
         y += NODE_Y_SPACING
-        tree.links.new(inp.outputs["Bones"], node.inputs["Bones"])
         tree.links.new(node.outputs["Bones"], output.inputs["Bones"])
-
-    if not control_bones:
-        # Nothing shaped yet: still wire input -> output so a user can drop
-        # Custom Shape nodes in between.
-        tree.links.new(inp.outputs["Bones"], output.inputs["Bones"])
 
     # The graph now owns these controllers (not the rig itself, so deleting
     # the Output node never deletes a Rigify rig). Record them so the very

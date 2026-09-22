@@ -1862,7 +1862,18 @@ class BoneOverride(bpy.types.PropertyGroup):
 
 
 class ArmatureInputNode(ArmatureNodeBase, Node):
-    """Entry point for the reverse direction: references a source armature."""
+    """Entry point for the reverse direction: references a source armature.
+
+    NOT part of the graph decompiled from an existing rig any more, and not
+    created automatically: ``eval_bones`` re-reads the live source on every
+    evaluation, so wiring one in front of nodes that write back to that same
+    armature makes the rig the source of truth and the graph looks frozen --
+    each rebuild overwrites node edits with the armature's current state.
+
+    Add it by hand for the one job it is still needed for: retargeting, i.e.
+    driving an existing rig's controls from a Primary Rig wired into the
+    Skeleton input.
+    """
 
     bl_idname = "ArmatureNodesInputNode"
     bl_label = "Armature Input"

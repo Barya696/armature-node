@@ -222,10 +222,23 @@ obj = build_armature_from_tree(tree)   # or: bpy.ops.armature_nodes.build(tree_n
   tied to Rigify; a Rigify-generated rig qualifies, a metarig (no custom
   shapes) does not, and a hand-made rig with shaped controls qualifies too.
   Decompiling a rig emits **no Bone/Chain nodes at all**: only
-  `Armature Input(rig) -> Custom Shape (one per widget group) -> Armature
-  Output` with the output in **Custom Shapes Only** mode. Building in that
-  mode assigns shapes on the existing rig and leaves bones, constraints and
-  drivers untouched.
+  `Custom Shape (one per widget group) -> Armature Output` with the output in
+  **Custom Shapes Only** mode, bound to the rig by name. Building in that mode
+  assigns shapes on the existing rig and leaves bones, constraints and drivers
+  untouched.
+  There is deliberately **no Armature Input node** in this graph. It used to
+  feed the Custom Shape nodes and re-read the live rig on every evaluation,
+  which made the armature -- not the graph -- the source of truth: node edits
+  were overwritten on the next rebuild and the graph appeared frozen. Each
+  Custom Shape node already stores its bone in full, so it drives the rig on
+  its own. Add an Armature Input by hand (Shift+A > Armature I/O) only when
+  you want to retarget a Primary Rig onto the armature.
+  The tradeoff: the Armature Input also held a whole-rig snapshot. Without it
+  this graph stores the **control** bones only (each in its Custom Shape
+  node), so if the rig object is deleted what rebuilds from the graph is the
+  controls, not the `DEF-`/`MCH-`/`ORG-` layers. Use **Convert to Armature
+  Nodes** (the full Bone/Chain graph) for a rig the nodes must be able to
+  recreate whole.
 
 ## Deferred (per spec)
 
