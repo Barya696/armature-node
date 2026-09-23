@@ -237,161 +237,33 @@ class ARMATURE_OT_convert_rig(Operator):
         return {"FINISHED"}
 
 
-class ARMATURE_OT_refresh_shape_info(Operator):
-    """Re-read the controlled bone's parent, children, constraints and
-    head/tail from the armature into this Custom Shape node"""
+class ARMATURE_OT_bone_read_from_rig(Operator):
+    """Re-read this bone's current transform off the rig into the node"""
 
-    bl_idname = "armature_nodes.refresh_shape_info"
-    bl_label = "Refresh Bone Info"
+    bl_idname = "armature_nodes.bone_read_from_rig"
+    bl_label = "Read From Rig"
     bl_options = {"REGISTER", "UNDO"}
 
     @classmethod
     def poll(cls, context):
         node = getattr(context, "node", None)
-        return node is not None and hasattr(node, "refresh_bone_info")
+        return node is not None and hasattr(node, "read_from_rig")
 
     def execute(self, context):
         node = context.node
-        if not node.controlled_bone:
-            self.report({"WARNING"}, "Set a single bone name on the node first")
+        if not node.read_from_rig():
+            self.report({"WARNING"}, "No such bone on the rig")
             return {"CANCELLED"}
-        if not node.refresh_bone_info():
-            self.report(
-                {"WARNING"},
-                f"Bone '{node.controlled_bone}' not found on any armature "
-                "(link an Armature Input node upstream)",
-            )
-            return {"CANCELLED"}
-        return {"FINISHED"}
-
-
-class ARMATURE_OT_read_widget(Operator):
-    """Read the widget's form (mesh vertices/edges) and display settings
-    into this Custom Shape node so it can be recreated without the original"""
-
-    bl_idname = "armature_nodes.read_widget"
-    bl_label = "Read Widget Form"
-    bl_options = {"REGISTER", "UNDO"}
-
-    @classmethod
-    def poll(cls, context):
-        node = getattr(context, "node", None)
-        return node is not None and hasattr(node, "read_widget")
-
-    def execute(self, context):
-        node = context.node
-        # Best source: the controlled bone on a live armature (also captures
-        # scale/translation/rotation as currently set on the pose bone).
-        obj = node.find_armature()
-        pbone = None
-        if obj is not None and node.controlled_bone:
-            pbone = obj.pose.bones.get(node.controlled_bone)
-        if pbone is not None and pbone.custom_shape is not None:
-            ok = node.read_widget(pbone=pbone)
-        else:
-            ok = node.read_widget()
-        if not ok:
-            self.report(
-                {"WARNING"},
-                "No widget mesh to read: pick a WGTS_rig widget or object first",
-            )
-            return {"CANCELLED"}
-        from .snapshot import describe_geometry
-
-        self.report(
-            {"INFO"},
-            f"Read '{node.widget_name}': {describe_geometry(node.widget_geometry)}",
-        )
-        return {"FINISHED"}
-
-
-class ARMATURE_OT_snapshot_armature(Operator):
-    """Store a full copy of the source armature (bones, constraints, widgets)
-    on this Armature Input node so the graph survives deleting the original"""
-
-    bl_idname = "armature_nodes.snapshot_armature"
-    bl_label = "Snapshot Armature"
-    bl_options = {"REGISTER", "UNDO"}
-
-    @classmethod
-    def poll(cls, context):
-        node = getattr(context, "node", None)
-        return node is not None and hasattr(node, "take_snapshot")
-
-    def execute(self, context):
-        node = context.node
-        if not node.take_snapshot():
-            self.report({"WARNING"}, "Set a source armature first")
-            return {"CANCELLED"}
-        self.report(
-            {"INFO"},
-            f"Snapshot of '{node.snapshot_name}' stored ({len(node.snapshot)} bones)",
-        )
-        return {"FINISHED"}
-
-
-class ARMATURE_OT_copy_bone_transform(Operator):
-    """Copy this bone's world Position and Scale to the clipboard"""
-
-    bl_idname = "armature_nodes.copy_bone_transform"
-    bl_label = "Copy Position/Scale"
-
-    @classmethod
-    def poll(cls, context):
-        node = getattr(context, "node", None)
-        return node is not None and hasattr(node, "world_transform_clipboard_text")
-
-    def execute(self, context):
-        node = context.node
-        context.window_manager.clipboard = node.world_transform_clipboard_text()
-        self.report({"INFO"}, f"Copied transform of '{node.controlled_bone}'")
-        return {"FINISHED"}
-
-
-class ARMATURE_OT_paste_bone_transform(Operator):
-    """Paste a world Position/Scale from the clipboard onto this bone (pose
-    mode). Accepts the Copy format, Blender vector copies and any x, y, z"""
-
-    bl_idname = "armature_nodes.paste_bone_transform"
-    bl_label = "Paste Position/Scale"
-    bl_options = {"REGISTER", "UNDO"}
-
-    @classmethod
-    def poll(cls, context):
-        node = getattr(context, "node", None)
-        return node is not None and hasattr(node, "set_world_transform")
-
-    def execute(self, context):
-        node = context.node
-        if not node.controlled_bone:
-            self.report({"WARNING"}, "Set a single bone name on the node first")
-            return {"CANCELLED"}
-        pos, rot, scl = node.parse_world_transform_text(
-            context.window_manager.clipboard
-        )
-        if pos is None and rot is None and scl is None:
-            self.report({"WARNING"}, "Clipboard has no 'x, y, z' values to paste")
-            return {"CANCELLED"}
-        obj = node.find_armature()
-        if obj is not None and obj.mode == "EDIT":
-            self.report(
-                {"WARNING"},
-                "Position/Rotation/Scale are pose values: leave Edit mode first",
-            )
-            return {"CANCELLED"}
-        node.set_world_transform(position=pos, rotation=rot, scale=scl)
+        node.id_data.mark_dirty()
+        self.report({"INFO"}, f"Read '{node.bone}' from the rig")
         return {"FINISHED"}
 
 
 classes = (
+    ARMATURE_OT_bone_read_from_rig,
     ARMATURE_OT_build_from_nodes,
     ARMATURE_OT_decompile_to_nodes,
     ARMATURE_OT_convert_rig,
-    ARMATURE_OT_refresh_shape_info,
-    ARMATURE_OT_read_widget,
-    ARMATURE_OT_snapshot_armature,
-    ARMATURE_OT_copy_bone_transform,
-    ARMATURE_OT_paste_bone_transform,
 )
 
 

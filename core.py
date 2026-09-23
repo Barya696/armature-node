@@ -62,6 +62,19 @@ class BoneDef:
     envelope_weight: float = 1.0
     constraints: list = field(default_factory=list)  # list[ConstraintDef]
     shape: Optional[ShapeDef] = None  # control widget, applied in pose pass
+    # Pose overrides written by the Transform-category nodes. ``None`` means
+    # "leave whatever the rig has"; a tuple is a WORLD-space target applied in
+    # the pose pass, after the bones exist. Rest geometry (head/tail/roll) is
+    # never touched by those nodes -- that is what makes them non-destructive
+    # modifiers on top of an existing rig rather than an edit of it.
+    pose_location: Optional[tuple] = None
+    pose_rotation: Optional[tuple] = None  # euler XYZ, radians
+    pose_scale: Optional[tuple] = None
+    # Deltas from Transform nodes, added on top of whatever pose the bone has
+    # when no absolute target was set. They accumulate, so several Transform
+    # nodes in a row stack instead of overwriting each other.
+    pose_offset: tuple = (0.0, 0.0, 0.0)
+    pose_rotation_offset: tuple = (0.0, 0.0, 0.0)
 
 
 def unique_names(bones):
@@ -147,6 +160,35 @@ def gather_input_constraints(node, socket_name, ctx):
     return out
 
 
+def bone_roll(bone):
+    """Roll of a (non-edit) Bone, recovered from its rest matrix.
+
+    ``Bone`` has no ``roll``; only ``EditBone`` does. Reading it back out of
+    the rest matrix is what lets the Armature Input describe a rig without
+    dropping the whole armature into Edit mode first.
+    """
+    import bpy
+
+    try:
+        mat = bone.matrix_local.to_3x3()
+        return float(bpy.types.Bone.AxisRollFromMatrix(mat)[1])
+    except Exception:  # noqa: BLE001
+        return 0.0
+
+
+def select_bones(bones, pattern):
+    """The bones a modifier node acts on.
+
+    ``pattern`` is the node's Bone field: empty means every bone on the wire
+    (the Geometry Nodes convention -- no selection is the whole stream), and
+    several bones can be named at once, semicolon separated.
+    """
+    names = {n.strip() for n in pattern.split(";") if n.strip()}
+    if not names:
+        return list(bones)
+    return [b for b in bones if b.name in names]
+
+
 def copy_bone(b):
     return BoneDef(
         name=b.name,
@@ -158,6 +200,11 @@ def copy_bone(b):
         use_deform=b.use_deform,
         envelope_distance=b.envelope_distance,
         envelope_weight=b.envelope_weight,
+        pose_location=b.pose_location,
+        pose_rotation=b.pose_rotation,
+        pose_scale=b.pose_scale,
+        pose_offset=tuple(b.pose_offset),
+        pose_rotation_offset=tuple(b.pose_rotation_offset),
         constraints=[
             ConstraintDef(type=c.type, name=c.name, params=dict(c.params))
             for c in b.constraints

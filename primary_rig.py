@@ -240,14 +240,18 @@ def apply_marker_locks(node, obj, key):
 
     Symmetric mirroring is a MediaPipe-landmark feature: a custom marker has
     no mirror partner, so it is never locked by it.
+
+    Both marker-holding nodes reach here, and only the Skeleton node has the
+    Symmetric and Lock Depth toggles -- a single Marker node has neither, so
+    they are read with defaults rather than assumed to exist.
     """
-    mirrored = bool(node.symmetric) and LM_SIDE.get(key) == "R"
+    mirrored = bool(getattr(node, "symmetric", False)) and LM_SIDE.get(key) == "R"
     use_rot = node.marker_uses_rotation(key)
     if mirrored:
         obj.lock_location = (True, True, True)
         obj.lock_rotation = (True, True, True)
     else:
-        obj.lock_location = (False, bool(node.lock_depth), False)
+        obj.lock_location = (False, bool(getattr(node, "lock_depth", False)), False)
         obj.lock_rotation = (not use_rot,) * 3
     obj.empty_display_type = "ARROWS" if use_rot else "SPHERE"
     obj.hide_select = mirrored
@@ -282,7 +286,7 @@ def _overlay_nodes():
         if tree.bl_idname != TREE_IDNAME:
             continue
         for node in tree.nodes:
-            if node.bl_idname == "ArmatureNodesPrimaryRigNode" and node.show_skeleton:
+            if node.bl_idname == "ArmatureNodesSkeletonNode" and node.show_skeleton:
                 yield node
 
 
@@ -354,44 +358,59 @@ def tag_viewports_redraw():
 # ---------------------------------------------------------------------------
 
 
-def _node(context):
+# Both marker-holding nodes answer to these operators.
+_MARKER_NODES = {"ArmatureNodesSkeletonNode", "ArmatureNodesMarkerNode"}
+
+
+def _node(context, needs=None):
+    """The marker-holding node this operator was invoked from.
+
+    ``needs`` names a method the node must have, which is how the
+    Skeleton-only operators (mirror, preset) keep themselves off the single
+    Marker node without a separate poll each.
+    """
     node = getattr(context, "node", None)
-    if node is not None and node.bl_idname == "ArmatureNodesPrimaryRigNode":
-        return node
-    return None
+    if node is None or node.bl_idname not in _MARKER_NODES:
+        return None
+    if needs is not None and not hasattr(node, needs):
+        return None
+    return node
 
 
-class ARMATURE_OT_primary_rig_toggle_markers(Operator):
+class ARMATURE_OT_skeleton_toggle_markers(Operator):
     """Show the landmarks as draggable handles in the viewport (or hide them)"""
 
-    bl_idname = "armature_nodes.primary_rig_toggle_markers"
+    bl_idname = "armature_nodes.skeleton_toggle_markers"
     bl_label = "Toggle Handles"
     bl_options = {"REGISTER", "UNDO"}
 
     @classmethod
     def poll(cls, context):
-        return _node(context) is not None
+        return _node(context, getattr(cls, "_needs", None)) is not None
 
     def execute(self, context):
-        node = _node(context)
+        node = _node(context, getattr(self, "_needs", None))
         if node.markers_shown():
             remove_marker_empties(node)
         elif not len(node.markers):
-            self.report({"WARNING"}, "This Skeleton node has no markers yet")
+            self.report({"WARNING"}, "This node has no markers yet")
             return {"CANCELLED"}
         else:
             ensure_marker_empties(node)
-            node.show_skeleton = True
+            # Only the Skeleton node draws an overlay to turn back on.
+            if hasattr(node, "show_skeleton"):
+                node.show_skeleton = True
         tag_viewports_redraw()
         return {"FINISHED"}
 
 
-class ARMATURE_OT_primary_rig_mirror(Operator):
+class ARMATURE_OT_skeleton_mirror(Operator):
     """Copy the left-side landmarks to the right (or the other way round)"""
 
-    bl_idname = "armature_nodes.primary_rig_mirror"
+    bl_idname = "armature_nodes.skeleton_mirror"
     bl_label = "Mirror Landmarks"
     bl_options = {"REGISTER", "UNDO"}
+    _needs = "mirror_markers"
 
     direction: EnumProperty(
         name="Direction",
@@ -404,21 +423,21 @@ class ARMATURE_OT_primary_rig_mirror(Operator):
 
     @classmethod
     def poll(cls, context):
-        return _node(context) is not None
+        return _node(context, getattr(cls, "_needs", None)) is not None
 
     def execute(self, context):
-        node = _node(context)
+        node = _node(context, getattr(self, "_needs", None))
         node.mirror_markers(self.direction)
         node.id_data.mark_dirty()
         tag_viewports_redraw()
         return {"FINISHED"}
 
 
-class ARMATURE_OT_primary_rig_front_view(Operator):
+class ARMATURE_OT_skeleton_front_view(Operator):
     """Switch a 3D viewport to the front orthographic view for 2D landmark
     adjustment"""
 
-    bl_idname = "armature_nodes.primary_rig_front_view"
+    bl_idname = "armature_nodes.skeleton_front_view"
     bl_label = "Front View (2D)"
 
     def execute(self, context):
@@ -437,10 +456,10 @@ class ARMATURE_OT_primary_rig_front_view(Operator):
         return {"CANCELLED"}
 
 
-class ARMATURE_OT_primary_rig_toggle_rotation(Operator):
+class ARMATURE_OT_skeleton_toggle_rotation(Operator):
     """Enable or disable rotation adjustment on this landmark"""
 
-    bl_idname = "armature_nodes.primary_rig_toggle_rotation"
+    bl_idname = "armature_nodes.skeleton_toggle_rotation"
     bl_label = "Toggle Landmark Rotation"
     bl_options = {"REGISTER", "UNDO"}
 
@@ -448,10 +467,10 @@ class ARMATURE_OT_primary_rig_toggle_rotation(Operator):
 
     @classmethod
     def poll(cls, context):
-        return _node(context) is not None
+        return _node(context, getattr(cls, "_needs", None)) is not None
 
     def execute(self, context):
-        node = _node(context)
+        node = _node(context, getattr(self, "_needs", None))
         marker = node.marker_by_key(self.marker)
         if marker is None:
             self.report({"WARNING"}, "Unknown marker")
@@ -471,10 +490,15 @@ class ARMATURE_OT_skeleton_add_marker(Operator):
 
     @classmethod
     def poll(cls, context):
-        return _node(context) is not None
+        return _node(context, getattr(cls, "_needs", None)) is not None
 
     def execute(self, context):
-        node = _node(context)
+        node = _node(context, getattr(self, "_needs", None))
+        # A Marker node is one handle by definition; a second would create an
+        # empty in the scene that the node then ignores.
+        if node.bl_idname == "ArmatureNodesMarkerNode" and len(node.markers):
+            self.report({"WARNING"}, "A Marker node holds a single marker")
+            return {"CANCELLED"}
         scene = context.scene
         # The 3D cursor, so a new marker lands somewhere the user chose and
         # is visible immediately rather than piling up on the origin.
@@ -498,10 +522,10 @@ class ARMATURE_OT_skeleton_remove_marker(Operator):
 
     @classmethod
     def poll(cls, context):
-        return _node(context) is not None
+        return _node(context, getattr(cls, "_needs", None)) is not None
 
     def execute(self, context):
-        node = _node(context)
+        node = _node(context, getattr(self, "_needs", None))
         if not node.remove_marker(self.index):
             self.report({"WARNING"}, "No such marker")
             return {"CANCELLED"}
@@ -519,6 +543,7 @@ class ARMATURE_OT_skeleton_load_preset(Operator):
     bl_idname = "armature_nodes.skeleton_load_preset"
     bl_label = "Load MediaPipe Preset"
     bl_options = {"REGISTER", "UNDO"}
+    _needs = "load_mediapipe_preset"
 
     replace: bpy.props.BoolProperty(
         name="Replace Markers",
@@ -528,10 +553,10 @@ class ARMATURE_OT_skeleton_load_preset(Operator):
 
     @classmethod
     def poll(cls, context):
-        return _node(context) is not None
+        return _node(context, getattr(cls, "_needs", None)) is not None
 
     def execute(self, context):
-        node = _node(context)
+        node = _node(context, getattr(self, "_needs", None))
         added = node.load_mediapipe_preset(replace=self.replace)
         node.id_data.mark_dirty()
         tag_viewports_redraw()
@@ -548,14 +573,14 @@ class ARMATURE_OT_skeleton_clear_markers(Operator):
 
     @classmethod
     def poll(cls, context):
-        node = _node(context)
+        node = _node(context, getattr(self, "_needs", None))
         return node is not None and len(node.markers) > 0
 
     def invoke(self, context, event):
         return context.window_manager.invoke_confirm(self, event)
 
     def execute(self, context):
-        node = _node(context)
+        node = _node(context, getattr(self, "_needs", None))
         count = len(node.markers)
         node.clear_markers()
         node.id_data.mark_dirty()
@@ -565,10 +590,10 @@ class ARMATURE_OT_skeleton_clear_markers(Operator):
 
 
 classes = (
-    ARMATURE_OT_primary_rig_toggle_markers,
-    ARMATURE_OT_primary_rig_mirror,
-    ARMATURE_OT_primary_rig_front_view,
-    ARMATURE_OT_primary_rig_toggle_rotation,
+    ARMATURE_OT_skeleton_toggle_markers,
+    ARMATURE_OT_skeleton_mirror,
+    ARMATURE_OT_skeleton_front_view,
+    ARMATURE_OT_skeleton_toggle_rotation,
     ARMATURE_OT_skeleton_add_marker,
     ARMATURE_OT_skeleton_remove_marker,
     ARMATURE_OT_skeleton_load_preset,

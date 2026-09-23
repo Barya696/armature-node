@@ -1,9 +1,9 @@
 # Armature Nodes — Procedural Armature Node System
 
-A Blender addon that adds a custom, wireable node editor where a node graph
-compiles into a complete working armature (forward), and an existing armature
-decompiles into the equivalent node graph (reverse). The node tree is a real
-Blender data-block — buildable by hand in the GUI or fully programmatically.
+A Blender addon that adds a node editor where a graph edits an armature, the
+way Geometry Nodes edits a mesh. **Armature Input** hands the rig to
+**Armature Output**, and every node in between is a modifier: it reads the
+bone stream, changes the bones it selects, and passes the rest through.
 
 ## Install
 
@@ -18,216 +18,187 @@ Requires Blender 3.6+ (tested API surface targets 3.6–4.x).
 
 Blender's Python API cannot register a brand-new *space type*, so — like
 Sverchok and Animation Nodes — the addon registers a custom `NodeTree`.
-Open any **Node Editor** area and pick the **Armature Nodes** tree type from
-the editor header dropdown (armature icon), then click **New** to create a
-tree. You get the standard node editor interaction model: Shift+A add menu
-with categories (Bones, Chains, Constraints, Armature I/O), wire dragging,
-N-panel sidebar, undo, saving with the .blend.
+Open any **Node Editor** and pick **Armature Nodes** from the header dropdown,
+then click **New**. You get the standard node editor: Shift+A add menu, wire
+dragging, N-panel sidebar, undo, saving with the .blend.
 
-## Live rig workflow
+## The modifier model
 
-1. Select an armature in the 3D viewport and open an **Armature Nodes** editor.
-   The editor automatically displays that rig's bound node tree, like the
-   Shader Editor follows the active material.
-2. Edit bone, constraint, or widget values on the nodes. With **Live Update**
-   enabled, changes are applied to the real armature automatically after the
-   short debounce interval.
-3. Use **Refresh From Rig** only when you want to replace the node graph with
-   a fresh decompile of the selected rig. The graph stores snapshots of bones,
-   constraints, and widget meshes, so it can rebuild the rig if the original
-   object is deleted.
+Select an armature and open an Armature Nodes editor. The editor shows that
+rig's graph, like the Shader Editor follows the active material. That graph is
+**two nodes**:
 
-## Skeleton (marker node)
+```
+Armature Input ──────────▶ Armature Output
+   (the rig)                (write it back)
+```
 
-`Shift+A > Rigs > Skeleton` gives you a marker container. A **marker** is a
-world position (plus an optional orientation) with a stable key, drawn in the
-3D viewport as a draggable handle in the `MRKS_rig` collection. The node holds
-and shapes markers and nothing else: no mesh analysis, no auto placement, no
-snapping.
+Not one node per bone. The rig *is* the input, so there is nothing to
+reconstruct — exactly like opening Geometry Nodes on a mesh gives you Group
+Input → Group Output and not a node per vertex.
 
-A new node comes with **MediaPipe's 33 pose landmarks already loaded** (nose,
-eyes, ears, mouth, shoulders, elbows, wrists, pinky / index / thumb, hips,
-knees, ankles, heels, foot index) — the useful starting point for a body. They
-are only a preset: rename them, delete the ones you do not want, add as many
-of your own as the rig needs.
+To change something, drop a node onto the wire:
 
-- **Add Marker** appends one at the 3D cursor, so it lands where you put it
-  rather than piling up on the origin.
-- **MediaPipe** reloads the preset. It adds only what is missing, unless you
-  tick *Replace Markers* in the operator panel.
-- **Clear Markers** (under *Advanced*) empties the node.
-- Each marker has a name, a position, an **X** to delete it, and a gimbal
-  button that switches it from position-only to position + rotation.
+```
+Armature Input ──▶ Position ──▶ Custom Shape ──▶ Armature Output
+                   Bone: hand.L   Bone: hand.L
+```
 
-**Every marker gets its own output socket**, named after it. Drag from that
-socket into a Custom Shape node's **Marker** input to place that bone — see
-*Markers into Custom Shape* below. Renaming a marker renames its socket and
-keeps the wire: links attach to the socket, not to its name.
+Every modifier node has a **Bone** field. Leave it empty and the node affects
+every bone on the wire; name one (or several, semicolon separated) and it
+affects only those. When the graph has a rig to look at, the field is a
+searchable dropdown of that rig's real bone names.
 
-1. **Show Markers / Front View**: creates one handle per marker (tinted with
-   its MediaPipe side colour, or marker-pink for one you added) and switches
-   the viewport to front orthographic. With **Lock Depth (2D)** on, handles
-   only move in X/Z. With **Symmetric** on, right-side *MediaPipe* handles are
-   locked and follow the left side mirrored across *Mirror X*; markers you
-   added yourself have no mirror partner and are unaffected. Face, finger and
-   toe landmarks move rigidly with their anchor (nose, wrist, ankle). Dragging
-   a handle writes back into the node instantly.
-2. **Rotation per marker**: every marker is position-only by default. The
-   gimbal button switches one marker to position + rotation — its handle
-   becomes an axis gizmo you can rotate, and an Euler field appears on the
-   node. A marker's rotation supplies the **roll** of the bone placed there,
-   and the **twist** when driving a rig (which two points alone can never
-   recover — a forearm's twist, for instance).
+The graph stays the size of your edits, not the size of the rig.
 
-### Markers into Custom Shape
+## Node categories
 
-The Custom Shape node has a **Marker** input. Wire a marker into it and that
-bone is **posed** at the marker: dragging the handle moves the control exactly
-as grabbing it in Pose mode would, and the custom shape follows because
-Blender draws a widget at the posed bone.
+### Armature I/O
 
-Markers drive the pose **only**. The rest skeleton stays whatever the graph
-built — a marker never edits Head/Tail, so it cannot deform the rig's
-proportions or fight an Edit-mode change. Concretely:
+- **Armature Input** — nothing in, Bone out. Reads every bone of the chosen
+  armature: rest geometry, parenting, deform flags and existing widgets. It
+  re-reads the live rig on every evaluation, which is what makes the stack a
+  stack: the nodes downstream are the change, so the rig is the base state.
+- **Armature Output** — Bone in, nothing out. Leaving *Armature* blank targets
+  the Input's source, which is the normal case. Two modes:
+  - **Modify** (default) — writes shapes and pose onto the existing rig; its
+    bones, constraints and drivers are left alone. Safe on a Rigify rig.
+  - **Full Rig** — the graph owns the armature and rebuilds its bones, so
+    nodes can add and remove them.
 
-- **Location** is always taken from the marker.
-- **Rotation** only when that marker has rotation enabled (the gimbal button);
-  otherwise the control keeps the orientation it had.
-- **Scale** is never touched, so a scaled control stays scaled.
+### Marker
 
-The node needs a bone name in its *Bone* field: without one there is no single
-bone to pose, and nothing moves. While a marker is wired the node's *Pose*
-Position/Rotation/Scale fields go read-only and are labelled **Pose (marker)**,
-since the marker owns them and a typed edit would be overwritten on the next
-rebuild. The *Rest* Head/Tail fields stay editable.
+A marker is a world position with a stable key, drawn as a draggable empty in
+the `MRKS_rig` collection. Placing things by dragging a handle beats typing
+coordinates, which is the only reason markers exist.
 
-Posing runs as `marker_pose_pass()` at the end of every build, after the bones
-exist and are in place — a bone's pose matrix resolves against its parent's
-evaluated transform, so it cannot run earlier. The pass writes only when a
-value actually differs, so it settles in one iteration instead of rewriting
-the same matrix forever.
+- **Marker** — one handle. Inputs Parent and Constraints, outputs a Bone whose
+  head sits at the handle and which runs along *Direction* for *Length*.
+- **Skeleton** — a bundle of markers, **one output socket each**: the
+  Principled BSDF of markers. Each output is a position, so it wires into
+  anything that takes one — a Position node, a Snap offset, a Custom Shape
+  offset. It produces no bones itself.
 
-### The node has no bone output
+  A new Skeleton node arrives with MediaPipe's 33 pose landmarks loaded (nose,
+  eyes, ears, mouth, shoulders, elbows, wrists, pinky / index / thumb, hips,
+  knees, ankles, heels, foot index) — a 1.8 m T-pose body to drag onto the
+  character. They are a preset: rename them, delete what you do not want, add
+  your own with **Add Marker** (which drops one at the 3D cursor).
 
-Markers are the *only* output. Earlier versions also had a **Skeleton** socket
-(a 22-bone body built from the landmark positions), a **Rig** socket (the same
-thing as a pose, for retargeting onto a Rigify rig) and a **Parent** input
-that re-rooted that skeleton. All three are gone, along with the entire
-retarget subsystem they fed — the skeleton-to-Rigify match table, FK/IK drive
-modes, bone overrides and `retarget.py`. Bones come from the Custom Shape
-nodes the markers are wired into, and a marker poses its control directly, so
-none of that indirection is needed.
+  **Show Markers / Front View** creates the handles and switches to front
+  orthographic. **Lock Depth (2D)** keeps handles in X/Z. **Symmetric** locks
+  right-side MediaPipe landmarks and mirrors them from the left across
+  *Mirror X*; markers you added have no mirror partner and are unaffected.
+  Face, finger and toe landmarks move rigidly with their anchor.
 
-Those sockets are stripped from older saved nodes on sight, along with their
-links.
+  Every marker is position-only until its gimbal button is pressed, which
+  turns the handle into a rotatable axis gizmo.
 
-## Programmatic use (zero UI)
+### Bone
+
+- **Bone** — **one** bone from the rig, posed. Pick any bone (DEF, MCH, ORG or
+  a control — it makes no difference) and the node reads that bone's current
+  world transform off the rig. Editing the values poses it.
+
+  Pose only: rest geometry is never touched. Each of Location / Rotation /
+  Scale has its own checkbox, so a node can move a bone without also pinning
+  its rotation — an unchecked component is left exactly as the rig has it.
+
+  The read happens **on selection**, not continuously: in a modifier stack the
+  bone's position is an *output* of the graph, so a live read-back would race
+  the pose the node writes. The refresh button re-reads on demand.
+
+  Its Parent and Constraints inputs are rest/pose-stack data, so they only
+  reach the armature when the Output is in **Full Rig** mode.
+- **Chain** — generates N connected bones from a start, direction, length and
+  an optional per-segment curve. Inputs Parent and Tip Constraints.
+
+### Transform
+
+All four write the **pose**, never rest geometry — so they cannot change the
+proportions of a rig they are layered onto, and a custom shape follows because
+Blender draws widgets at the posed bone. A component the graph does not set
+keeps whatever the rig already has.
+
+- **Position** — set the selected bones' world position (Set Position).
+- **Rotation** — set their world orientation.
+- **Transform** — *offset* translation and rotation, so several Transform
+  nodes stack, plus an optional absolute scale.
+- **Snap** — put the selected bones on a mesh. Snap To picks what "on" means:
+  - **Origin** — the target object's own origin
+  - **Bounding Box** — centre of its bounds
+  - **Median** — mean of its vertices
+  - **Volume** — volume centroid, the centre of mass of a solid. Unlike the
+    median this ignores how densely the mesh is subdivided.
+  - **Surface** — closest point on the surface to the bone
+
+  plus an offset applied after the snap.
+
+### Shape
+
+- **Custom Shape** — assigns a control widget from a Rigify-style preset, the
+  `WGTS_rig` library, or any mesh object, with scale / rotation / wire width
+  and a *Control Only* toggle that clears Deform. Its **Offset** input is a
+  vector like Set Position: wire a marker into it and the widget follows the
+  handle.
+
+### Constraint
+
+- **IK Constraint** and **Constraint** (copy/limit/track/stretch) — wired into
+  the Constraints input of a Bone, Chain or Marker node.
+
+## Execution model
+
+1. **Evaluate** — walk back from the Armature Output, memoized per node, into
+   a list of `BoneDef`. Duplicate names are resolved last-write-wins so a
+   downstream modifier beats an upstream one.
+2. **Edit-mode pass** (Full Rig only) — create and place bones, set parenting.
+3. **Pose-mode pass** — constraints and custom shapes.
+4. **Pose-transform pass** — apply what the Transform nodes wrote. Runs last
+   because a pose matrix resolves against the parent's *evaluated* transform;
+   bones are handled parent-first with a view-layer flush per depth level, or
+   children would inherit stale parents. It writes only on a real difference,
+   so it settles in one pass instead of rewriting the same matrix forever.
+
+Live Update re-runs this after a short debounce whenever a node value, link or
+marker changes. Dragging a marker handle in the viewport writes back into its
+node, which marks the tree dirty, which re-poses the rig.
+
+## Architecture
+
+| File | Responsibility |
+| --- | --- |
+| `core.py` | `BoneDef` / `ConstraintDef` / `ShapeDef`, eval context and memoization, bone selection |
+| `sockets.py` | Bone (the stream), Constraint, Vector sockets |
+| `tree.py` | `ArmatureNodeTree` data-block, dirty tracking, live update |
+| `nodes.py` | Every node type |
+| `primary_rig.py` | Marker handles and locks, viewport overlay, MediaPipe preset table, marker operators |
+| `widgets.py` | `WGTS_rig` widget library and Rigify-style preset generation |
+| `build.py` | Forward compile: evaluate → edit pass → pose pass → pose-transform pass |
+| `decompile.py` | Reverse: the two-node stack that targets a rig |
+| `operators.py` | Build, decompile, convert |
+| `ui.py` | Shift+A categories, header buttons, N-panel sidebar |
+| `sync.py` | Editor follows the active armature; marker handles read back |
+
+## Programmatic use
+
+The tree is a normal data-block, so the whole system is scriptable with no UI:
 
 ```python
 import bpy
 
-tree = bpy.data.node_groups.new("MyRig", "ArmatureNodeTreeType")
-chain = tree.nodes.new("ArmatureNodesChainNode")
-chain.prefix, chain.count, chain.bone_length = "spine", 5, 0.3
+tree = bpy.data.node_groups.new("Rig Nodes", "ArmatureNodeTreeType")
+src = tree.nodes.new("ArmatureNodesInputNode")
+src.source = bpy.data.objects["rig"]
+
+move = tree.nodes.new("ArmatureNodesPositionNode")
+move.bone = "hand.L"
+move.inputs["Position"].default_value = (0.3, 0.0, 1.2)
+
 out = tree.nodes.new("ArmatureNodesOutputNode")
-out.armature_name = "SpineRig"
-tree.links.new(chain.outputs["Chain"], out.inputs["Bones"])
 
-from armature_nodes.build import build_armature_from_tree
-obj = build_armature_from_tree(tree)   # or: bpy.ops.armature_nodes.build(tree_name="MyRig")
+tree.links.new(src.outputs["Bone"], move.inputs["Bone"])
+tree.links.new(move.outputs["Bone"], out.inputs["Bone"])
+
+bpy.ops.armature_nodes.build()
 ```
-
-## Architecture
-
-| File | Contents |
-| --- | --- |
-| `core.py` | `BoneDef` / `ConstraintDef` intermediate model, eval context, memoization |
-| `sockets.py` | Bone, Chain, Marker, Constraint sockets |
-| `tree.py` | `ArmatureNodeTree` data-block, dirty tracking, optional live update |
-| `nodes.py` | Bone, Chain, Mirror, Parent, Deform Group, Custom Shape, Skeleton, IK / generic constraint, Armature Output / Input nodes |
-| `primary_rig.py` | Marker empties and locks, viewport overlay, MediaPipe landmark preset tables, marker operators |
-| `widgets.py` | `WGTS_rig` widget library: finds/creates the hidden collection, lists `WGT-rig_*` meshes, generates Rigify-style presets (circle, cube, sphere, bone, diamond, root, gear, ...) |
-| `build.py` | Forward compile: topological eval → edit-mode pass → pose-mode pass → marker pose pass, in-place rebuild by name, single undo step |
-| `decompile.py` | Reverse: bone walk, chain-pattern collapsing, constraint node emission, depth-grid layout |
-| `operators.py` | `armature_nodes.build`, `armature_nodes.decompile` |
-| `ui.py` | Shift+A categories, header buttons, N-panel sidebar |
-
-### Execution model notes
-
-- **Marker posing** is a third pass at the end of the build: every Custom
-  Shape node with a marker wired in poses its control. It runs last because a
-  pose matrix resolves against the parent's *evaluated* transform, so the
-  bones have to exist and be placed first. It writes only on a real
-  difference, so it settles in one pass.
-- **Forward** is two-pass because Blender requires it: edit bones first,
-  pose-bone constraints second. Rebuilds match by bone name and update the
-  existing armature object in place instead of duplicating.
-- **Live update** is on by default; disable it per-tree in the sidebar. It
-  defers rebuilds through `bpy.app.timers` because the tree `update()`
-  callback runs in a restricted context.
-- **Every editable value reaches the rebuild, not just node properties.**
-  Most bone/chain/constraint values in this system are set the Shader-Editor
-  way: as the default_value of an unconnected input socket, not a property on
-  the node itself. `nodes.py` injects a rebuild-triggering `update` callback
-  into every node property at register time, but a `NodeSocket` is a
-  different class hierarchy that injection never reaches -- so
-  `FloatSocket`/`VectorSocket`/`BoolSocket`'s `default_value` carry their own
-  `update` callback (`sockets.py`), and typing into any unconnected socket
-  rebuilds exactly like changing a property on the node does.
-- **Deletion is a change like any other.** Every node's `free()` schedules a
-  rebuild, because `NodeTree.update()` is not a dependable deletion signal; a
-  4 Hz topology watcher in `sync.py` catches removals done from Python. A
-  graph that no longer produces bones tears its armature down instead of
-  freezing it, and an armature the graph *generated* (tagged `an_owner_tree` /
-  `an_owner_node` at creation) is removed with the node that owned it.
-  Armatures the graph did not create are never deleted. Removal is queued and
-  run on the debounce timer, since `free()` is too restricted a context to
-  delete data-blocks in.
-- **Reverse** is a one-shot operator into a *new* tree (never clobbers an
-  existing graph). Straight, evenly spaced, connected runs of 3+ bones with
-  no mid-run constraints collapse into a single Chain node; everything else
-  becomes individual Bone nodes. Constraints on a chain tip become nodes
-  wired into `Tip Constraints`.
-- **Custom shapes** (Shift+A > Bones > Custom Shape) mark bones as controls.
-  Wire any bone/chain output through it. Three sources: **Preset** generates a
-  per-bone `WGT-rig_<bone>` wire mesh into the `WGTS_rig` collection (excluded
-  from the view layer, exactly like Rigify); **WGTS_rig** picks one existing
-  widget from that collection for all incoming bones; **Object** uses any
-  mesh. Scale / translation / rotation, wire width, and "scale to bone
-  length" map 1:1 onto Blender's pose-bone custom-shape settings, and
-  *Control Only* switches Deform off. Decompile reads `custom_shape` back
-  and groups bones sharing a widget + transform into a single node; each
-  node's *Bones* filter lists exactly which bones receive the shape.
-  The **Position / Scale** fields at the top of a node are the controlled
-  bone's **world-space** transform (armature object transform x current pose,
-  measured from the world origin, not the bone's own origin). They are live:
-  grabbing, posing or animating the bone in the viewport updates the node,
-  and typing a value moves/scales the bone to match. The widget's own
-  bone-relative *Offset / Widget Scale / Rotation* live in the Widget section.
-- **Rigs** are any armature that has control bones: bones carrying a
-  `custom_shape` that live in a visible bone collection / layer. This is not
-  tied to Rigify; a Rigify-generated rig qualifies, a metarig (no custom
-  shapes) does not, and a hand-made rig with shaped controls qualifies too.
-  Decompiling a rig emits **no Bone/Chain nodes at all**: only
-  `Custom Shape (one per widget group) -> Armature Output` with the output in
-  **Custom Shapes Only** mode, bound to the rig by name. Building in that mode
-  assigns shapes on the existing rig and leaves bones, constraints and drivers
-  untouched.
-  There is deliberately **no Armature Input node** in this graph. It used to
-  feed the Custom Shape nodes and re-read the live rig on every evaluation,
-  which made the armature -- not the graph -- the source of truth: node edits
-  were overwritten on the next rebuild and the graph appeared frozen. Each
-  Custom Shape node already stores its bone in full, so it drives the rig on
-  its own. An Armature Input is still available by hand (Shift+A > Armature
-  I/O) for the one case it suits: pulling an existing armature's bones INTO a
-  graph that builds a different rig.
-  The tradeoff: the Armature Input also held a whole-rig snapshot. Without it
-  this graph stores the **control** bones only (each in its Custom Shape
-  node), so if the rig object is deleted what rebuilds from the graph is the
-  controls, not the `DEF-`/`MCH-`/`ORG-` layers. Use **Convert to Armature
-  Nodes** (the full Bone/Chain graph) for a rig the nodes must be able to
-  recreate whole.
-
-## Deferred (per spec)
-
-No MCP bridge, no continuous bidirectional sync, no anatomical validation.

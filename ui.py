@@ -21,44 +21,52 @@ class ArmatureNodeCategory(NodeCategory):
 
 NODE_CATEGORIES = [
     ArmatureNodeCategory(
-        "ARMATURE_NODES_BONES",
-        "Bones",
+        "ARMATURE_NODES_IO",
+        "Armature I/O",
+        items=[
+            NodeItem("ArmatureNodesInputNode"),
+            NodeItem("ArmatureNodesOutputNode"),
+        ],
+    ),
+    ArmatureNodeCategory(
+        "ARMATURE_NODES_MARKER",
+        "Marker",
+        items=[
+            NodeItem("ArmatureNodesMarkerNode"),
+            NodeItem("ArmatureNodesSkeletonNode"),
+        ],
+    ),
+    ArmatureNodeCategory(
+        "ARMATURE_NODES_BONE",
+        "Bone",
         items=[
             NodeItem("ArmatureNodesBoneNode"),
-            NodeItem("ArmatureNodesParentNode"),
-            NodeItem("ArmatureNodesDeformGroupNode"),
+            NodeItem("ArmatureNodesChainNode"),
+        ],
+    ),
+    ArmatureNodeCategory(
+        "ARMATURE_NODES_TRANSFORM",
+        "Transform",
+        items=[
+            NodeItem("ArmatureNodesPositionNode"),
+            NodeItem("ArmatureNodesRotationNode"),
+            NodeItem("ArmatureNodesTransformNode"),
+            NodeItem("ArmatureNodesSnapNode"),
+        ],
+    ),
+    ArmatureNodeCategory(
+        "ARMATURE_NODES_SHAPE",
+        "Shape",
+        items=[
             NodeItem("ArmatureNodesCustomShapeNode"),
         ],
     ),
     ArmatureNodeCategory(
-        "ARMATURE_NODES_CHAINS",
-        "Chains",
-        items=[
-            NodeItem("ArmatureNodesChainNode"),
-            NodeItem("ArmatureNodesMirrorNode"),
-        ],
-    ),
-    ArmatureNodeCategory(
-        "ARMATURE_NODES_RIGS",
-        "Rigs",
-        items=[
-            NodeItem("ArmatureNodesPrimaryRigNode"),
-        ],
-    ),
-    ArmatureNodeCategory(
         "ARMATURE_NODES_CONSTRAINTS",
-        "Constraints",
+        "Constraint",
         items=[
             NodeItem("ArmatureNodesIKConstraintNode"),
             NodeItem("ArmatureNodesGenericConstraintNode"),
-        ],
-    ),
-    ArmatureNodeCategory(
-        "ARMATURE_NODES_IO",
-        "Armature I/O",
-        items=[
-            NodeItem("ArmatureNodesOutputNode"),
-            NodeItem("ArmatureNodesInputNode"),
         ],
     ),
 ]

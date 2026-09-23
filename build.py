@@ -44,7 +44,7 @@ def evaluate_tree(tree, strict=True):
     if not bones:
         if strict:
             raise RuntimeError("Armature Output node has no bones wired into it")
-        return output.armature_name or "Armature", []
+        return output.target_name(), []
 
     # Deduplicate: shared lineages (a parent emitted through several branches)
     # may appear multiple times. Keep the LAST occurrence of each name so
@@ -56,7 +56,7 @@ def evaluate_tree(tree, strict=True):
             order.append(b.name)
         by_name[b.name] = b
     bones = [by_name[n] for n in order]
-    return output.armature_name or "Armature", unique_names(bones)
+    return output.target_name(), unique_names(bones)
 
 
 OWNER_TREE_KEY = "an_owner_tree"
@@ -362,32 +362,92 @@ def _shapes_only_pass(obj, bone_defs):
     return applied
 
 
-def marker_pose_pass(tree, obj):
-    """Pose every controller whose Custom Shape node has a marker wired in.
+def pose_transform_pass(obj, bone_defs):
+    """Apply the pose written by the Transform-category nodes.
 
-    Runs after the bones exist and are in place, because posing a bone writes
-    a matrix resolved against its parent's evaluated transform. Markers drive
-    the POSE only: rest geometry stays whatever the graph built, and moving a
-    marker moves the control the way grabbing it in Pose mode would.
+    Runs after the bones exist and are placed, because a pose matrix resolves
+    against the parent's *evaluated* transform -- a child posed before its
+    parent would inherit a stale matrix. Bones are handled parent-first with a
+    view-layer flush per depth level for the same reason.
 
-    A Custom Shape node with no marker wired in is skipped, so this costs
-    nothing on graphs that do not use markers.
+    Everything here is world space and pose only: rest geometry is never
+    touched, so a stack layered onto an existing rig cannot change its
+    proportions. A component the graph did not set keeps whatever the rig has.
+
+    Returns the number of bones moved.
     """
-    if obj is None or obj.type != "ARMATURE":
+    from mathutils import Euler, Matrix, Vector
+
+    if obj is None or obj.type != "ARMATURE" or obj.pose is None:
         return 0
+    targeted = [
+        b
+        for b in bone_defs
+        if b.pose_location is not None
+        or b.pose_rotation is not None
+        or b.pose_scale is not None
+        or any(b.pose_offset)
+        or any(b.pose_rotation_offset)
+    ]
+    if not targeted:
+        return 0
+
+    def depth(pbone):
+        d, parent = 0, pbone.parent
+        while parent is not None:
+            d += 1
+            parent = parent.parent
+        return d
+
+    pairs = []
+    for bdef in targeted:
+        pbone = obj.pose.bones.get(bdef.name)
+        if pbone is not None:
+            pairs.append((depth(pbone), bdef, pbone))
+    pairs.sort(key=lambda p: p[0])
+
+    view_layer = getattr(bpy.context, "view_layer", None)
+    world_inv = obj.matrix_world.inverted_safe()
     applied = 0
-    for node in tree.nodes:
-        if node.bl_idname != "ArmatureNodesCustomShapeNode":
-            continue
-        try:
-            if node.apply_marker_pose(obj=obj):
-                applied += 1
-        except Exception as exc:  # noqa: BLE001
-            print(f"[Armature Nodes] Marker pose failed on '{node.name}': {exc}")
-    if applied:
-        view_layer = getattr(bpy.context, "view_layer", None)
-        if view_layer is not None:
+    level = None
+    for d, bdef, pbone in pairs:
+        if level is not None and d != level and view_layer is not None:
             view_layer.update()
+        level = d
+
+        current = obj.matrix_world @ pbone.matrix
+        cur_loc, cur_rot, cur_scale = current.decompose()
+
+        base_loc = Vector(bdef.pose_location) if bdef.pose_location else cur_loc
+        loc = base_loc + Vector(bdef.pose_offset)
+
+        if bdef.pose_rotation is not None:
+            base_rot = Vector(bdef.pose_rotation)
+        else:
+            base_rot = Vector(cur_rot.to_euler("XYZ"))
+        rot = Euler(tuple(base_rot + Vector(bdef.pose_rotation_offset)), "XYZ")
+
+        scale = Vector(bdef.pose_scale) if bdef.pose_scale else cur_scale
+
+        if (
+            (cur_loc - loc).length < 1e-5
+            and (Vector(cur_rot.to_euler("XYZ")) - Vector(rot)).length < 1e-5
+            and (cur_scale - scale).length < 1e-5
+        ):
+            continue  # already there: keep the pass idempotent
+        target = (
+            Matrix.Translation(loc)
+            @ rot.to_matrix().to_4x4()
+            @ Matrix.Diagonal(scale).to_4x4()
+        )
+        try:
+            pbone.matrix = world_inv @ target
+        except (AttributeError, ValueError) as exc:
+            print(f"[Armature Nodes] Could not pose '{pbone.name}': {exc}")
+            continue
+        applied += 1
+    if view_layer is not None:
+        view_layer.update()
     return applied
 
 
@@ -429,14 +489,14 @@ def build_armature_from_tree(tree, strict=False):
         # Nothing feeds the output any more. A generated rig goes away with
         # its source; a rig the user owns (shapes-only, or an object the graph
         # did not create) is left untouched.
-        if getattr(output, "mode", "FULL") != "SHAPES_ONLY":
+        if getattr(output, "mode", "MODIFY") != "MODIFY":
             for obj in owned_objects(tree.name, output.name):
                 from .tree import queue_object_removal
 
                 queue_object_removal(obj.name)
         else:
-            # The last Custom Shape node is gone: strip every controller the
-            # graph had put on the rig, but leave Rigify's bones alone.
+            # The stack no longer produces anything: strip every controller
+            # the graph had put on the rig, but leave its own bones alone.
             obj = bpy.data.objects.get(name)
             if obj is not None and obj.type == "ARMATURE" and obj.get(SHAPED_BONES_KEY):
                 remembered = _remember_mode()
@@ -461,21 +521,30 @@ def build_armature_from_tree(tree, strict=False):
     if not has_live_source and existing is not None and not bound_here:
         name = _unique_armature_name(name)
         output.armature_name = name
-    elif bound_here and existing.get(OWNER_TREE_KEY) != tree.name:
+    elif (
+        bound_here
+        and getattr(output, "mode", "MODIFY") != "MODIFY"
+        and existing.get(OWNER_TREE_KEY) != tree.name
+    ):
+        # Only a Full Rig output owns its armature. In Modify mode the rig is
+        # the user's -- it existed before the graph did. Tagging it here would
+        # make deleting the Output node delete their rig, which is exactly
+        # what the Output's free() promises never to do.
         tag_owner(existing, tree, output)
     remembered = _remember_mode()
     _ensure_object_mode()
 
-    if getattr(output, "mode", "FULL") == "SHAPES_ONLY":
+    if getattr(output, "mode", "MODIFY") == "MODIFY":
         obj = bpy.data.objects.get(name)
         if obj is not None and obj.type == "ARMATURE":
             _shapes_only_pass(obj, bone_defs)
-            marker_pose_pass(tree, obj)
+            pose_transform_pass(obj, bone_defs)
             tree.is_dirty = False
             _restore_mode(obj, remembered)
             return obj
-        # The armature this graph was decompiled from is gone. The nodes
-        # carry the full bone/constraint/widget data, so rebuild it in full.
+        # The rig this stack targets is gone. Whatever the graph still
+        # produces on its own (Bone, Chain and Marker nodes) is built as a
+        # new armature rather than silently doing nothing.
         print(
             f"[Armature Nodes] '{name}' not found; rebuilding it from the "
             f"graph ({len(bone_defs)} bones)"
@@ -486,7 +555,7 @@ def build_armature_from_tree(tree, strict=False):
         tag_owner(obj, tree, output)
     _edit_mode_pass(obj, bone_defs)
     _pose_mode_pass(obj, bone_defs)
-    marker_pose_pass(tree, obj)
+    pose_transform_pass(obj, bone_defs)
     tree.is_dirty = False
     _restore_mode(obj, remembered)
     return obj

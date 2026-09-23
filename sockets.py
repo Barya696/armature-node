@@ -1,59 +1,52 @@
 """Custom NodeSocket subclasses for the Armature node tree.
 
-Each socket carries a kind of data and has a distinct wire colour. They are
-all pure connection points: values are edited on the nodes themselves, not in
-the sockets, so none of them defines a ``default_value``.
+Three socket types, deliberately:
+
+* **Bone** -- the stream. Carries a list of ``BoneDef``: the whole armature as
+  it stands at that point in the graph, exactly like Geometry Nodes passes
+  geometry from node to node. Everything between Armature Input and Armature
+  Output reads this, changes some of it, and passes it on.
+* **Constraint** -- a constraint definition, wired into a bone-producing node.
+* **Vector** -- a position / rotation / offset value. Unlinked, the socket is
+  itself the value field (the Shader and Geometry Editor convention), so a
+  node with no wire into it still has something to work with.
 """
 
 import bpy
 from bpy.types import NodeSocket
-from bpy.props import StringProperty
+from bpy.props import FloatVectorProperty, StringProperty
+
+
+def _on_socket_value_changed(self, context):
+    """Typing into an unconnected socket's default_value must rebuild too.
+
+    Node-level properties get their ``update`` callback injected by
+    ``nodes.py`` at register time, but a NodeSocket is a different bpy_struct
+    hierarchy that injection never touches -- without this a typed vector
+    would change silently and the armature would never follow.
+    """
+    tree = getattr(self, "id_data", None)
+    if tree is not None and hasattr(tree, "mark_dirty"):
+        tree.mark_dirty()
 
 
 class _SocketDrawMixin:
     def draw(self, context, layout, node, text):
-        layout.label(text=text)
+        if self.is_output or self.is_linked or not hasattr(self, "default_value"):
+            layout.label(text=text)
+        else:
+            layout.prop(self, "default_value", text=text)
 
     def draw_color(self, context, node):
         return self.socket_color
 
 
 class BoneSocket(_SocketDrawMixin, NodeSocket):
-    """Carries a single bone definition (head, tail, roll, parent link)."""
+    """The bone stream: every bone in the armature at this point in the graph."""
 
     bl_idname = "ArmatureNodesBoneSocket"
     bl_label = "Bone"
     socket_color = (0.95, 0.60, 0.20, 1.0)
-
-
-class ChainSocket(_SocketDrawMixin, NodeSocket):
-    """Carries an ordered list of bones (e.g. an arm or leg chain)."""
-
-    bl_idname = "ArmatureNodesChainSocket"
-    bl_label = "Chain"
-    socket_color = (0.25, 0.70, 0.95, 1.0)
-
-
-class MarkerSocket(_SocketDrawMixin, NodeSocket):
-    """Carries ONE named marker from a Skeleton node: a world position plus an
-    optional orientation.
-
-    Deliberately not a Vector socket. A marker is an identity, not a value:
-    the wire says *which* handle in the viewport drives this bone, and the
-    consumer reads its live position through ``marker_key``. ``marker_key``
-    rather than the socket name, because renaming a marker must not break the
-    link.
-    """
-
-    bl_idname = "ArmatureNodesMarkerSocket"
-    bl_label = "Marker"
-    socket_color = (0.95, 0.45, 0.75, 1.0)
-
-    marker_key: StringProperty(
-        name="Marker Key",
-        description="Stable identifier of the marker this socket carries",
-        default="",
-    )
 
 
 class ConstraintSocket(_SocketDrawMixin, NodeSocket):
@@ -64,11 +57,57 @@ class ConstraintSocket(_SocketDrawMixin, NodeSocket):
     socket_color = (0.70, 0.40, 0.95, 1.0)
 
 
+class VectorSocket(_SocketDrawMixin, NodeSocket):
+    """A position, rotation or offset.
+
+    ``marker_key`` is set when the vector comes from a Skeleton node output,
+    naming which marker it is. Consumers read the marker's live position
+    through it, so dragging the handle in the viewport moves whatever the wire
+    feeds. It stays empty on an ordinary vector.
+    """
+
+    bl_idname = "ArmatureNodesVectorSocket"
+    bl_label = "Vector"
+    socket_color = (0.39, 0.39, 0.78, 1.0)
+
+    default_value: FloatVectorProperty(
+        name="Vector",
+        size=3,
+        default=(0.0, 0.0, 0.0),
+        subtype="TRANSLATION",
+        update=_on_socket_value_changed,
+    )
+    marker_key: StringProperty(
+        name="Marker Key",
+        description="Marker this socket reads its position from, when it has one",
+        default="",
+    )
+
+    def get_value(self):
+        """The vector on this socket: from the link if there is one, from a
+        marker when the link names one, otherwise the typed default."""
+        if self.is_linked and self.links:
+            link = self.links[0]
+            from_sock = link.from_socket
+            key = getattr(from_sock, "marker_key", "")
+            node = link.from_node
+            if key and hasattr(node, "marker_by_key"):
+                marker = node.marker_by_key(key)
+                if marker is not None:
+                    return tuple(marker.position)
+            if hasattr(from_sock, "default_value"):
+                v = from_sock.default_value
+                try:
+                    return (float(v[0]), float(v[1]), float(v[2]))
+                except (TypeError, IndexError):
+                    pass
+        return tuple(self.default_value)
+
+
 classes = (
     BoneSocket,
-    ChainSocket,
-    MarkerSocket,
     ConstraintSocket,
+    VectorSocket,
 )
 
 

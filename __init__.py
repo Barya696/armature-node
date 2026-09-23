@@ -30,7 +30,6 @@ _SUBMODULES = (
     "core",
     "sockets",
     "tree",
-    "snapshot",
     "primary_rig",
     "nodes",
     "build",

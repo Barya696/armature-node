@@ -17,6 +17,9 @@ from bpy.app.handlers import persistent
 
 from .core import TREE_IDNAME
 
+# Nodes that own draggable marker handles.
+_MARKER_NODES = ("ArmatureNodesSkeletonNode", "ArmatureNodesMarkerNode")
+
 # Owner token for msgbus subscriptions.
 _MSGBUS_OWNER = object()
 # Name of the armature the editors were last synced to.
@@ -53,7 +56,7 @@ def tree_for_armature(obj, create=True):
         if candidate.bl_idname != TREE_IDNAME:
             continue
         for node in candidate.nodes:
-            if node.bl_idname == "ArmatureNodesOutputNode" and node.armature_name == obj.name:
+            if node.bl_idname == "ArmatureNodesOutputNode" and node.target_name() == obj.name:
                 obj.armature_nodes_tree = candidate
                 return candidate
 
@@ -212,7 +215,7 @@ def _deferred_sync():
     try:
         sync_editors_to_active()
         watch_tree_topology()  # catches node/link removals update() misses
-        sync_node_transforms()  # catches edits that emit no depsgraph event
+        sync_marker_handles()  # catches drags that emit no depsgraph event
     except Exception as exc:  # noqa: BLE001
         print(f"[Armature Nodes] Editor sync failed: {exc}")
     return 0.25
@@ -241,7 +244,7 @@ def armature_for_tree(tree):
             if is_armature(src):
                 return src
         elif node.bl_idname == "ArmatureNodesOutputNode" and fallback is None:
-            fallback = bpy.data.objects.get(node.armature_name)
+            fallback = bpy.data.objects.get(node.target_name())
     return fallback if is_armature(fallback) else None
 
 
@@ -262,42 +265,28 @@ def _trees_to_track():
     return list(trees.values())
 
 
-def sync_node_transforms():
-    """Push every controlled bone's world position/scale into its Custom
-    Shape node so the values are dynamic: moving, posing or animating the
-    bone (or the armature object itself) updates the node immediately."""
+def sync_marker_handles():
+    """Read dragged marker handles back into their nodes.
+
+    The viewport is the editor for a marker: you grab its empty and the node
+    follows. Custom Shape nodes no longer mirror their bone's transform --
+    in the modifier model the bone's position is an *output* of the graph, so
+    reading it back would be a loop.
+    """
     from .tree import is_updating
 
     if is_updating():
-        return  # a rebuild is mid-flight; pose matrices are not trustworthy
+        return  # a rebuild is mid-flight; matrices are not trustworthy
     changed = False
     for tree in _trees_to_track():
-        # Primary Rig markers are dragged as empties in the viewport; read
-        # them back into the node. This needs no armature (the rig may not
-        # be generated yet), so it runs before the armature lookup below.
         for node in tree.nodes:
-            if node.bl_idname != "ArmatureNodesPrimaryRigNode":
+            if node.bl_idname not in _MARKER_NODES:
                 continue
             try:
                 if node.sync_from_empties():
                     changed = True
             except Exception as exc:  # noqa: BLE001
                 print(f"[Armature Nodes] Marker sync failed on '{node.name}': {exc}")
-        obj = armature_for_tree(tree)
-        if obj is None:
-            continue
-        for node in tree.nodes:
-            if node.bl_idname != "ArmatureNodesCustomShapeNode":
-                continue
-            try:
-                # Pose mode: world Position/Scale. Edit mode: rest Head/Tail.
-                # Each sync is a no-op in the mode it does not belong to.
-                if node.sync_world_transform(obj=obj):
-                    changed = True
-                if node.sync_rest_transform(obj=obj):
-                    changed = True
-            except Exception as exc:  # noqa: BLE001
-                print(f"[Armature Nodes] Transform sync failed on '{node.name}': {exc}")
     if changed:
         for _space, area in _armature_node_spaces():
             area.tag_redraw()
@@ -312,9 +301,9 @@ def _on_depsgraph_update(scene, depsgraph=None):
     # nodes only write when a value actually differs, so this settles after
     # one pass and does not loop.
     try:
-        sync_node_transforms()
+        sync_marker_handles()
     except Exception as exc:  # noqa: BLE001
-        print(f"[Armature Nodes] Transform sync failed: {exc}")
+        print(f"[Armature Nodes] Marker sync failed: {exc}")
 
 
 @persistent
@@ -322,9 +311,9 @@ def _on_frame_change(scene, depsgraph=None):
     # Playback/scrubbing does not always emit depsgraph_update_post; keep the
     # node values following the animated bones.
     try:
-        sync_node_transforms()
+        sync_marker_handles()
     except Exception as exc:  # noqa: BLE001
-        print(f"[Armature Nodes] Transform sync failed: {exc}")
+        print(f"[Armature Nodes] Marker sync failed: {exc}")
 
 
 @persistent
