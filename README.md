@@ -1,9 +1,9 @@
 # Armature Nodes — Procedural Armature Node System
 
 A Blender addon that adds a node editor where a graph edits an armature, the
-way Geometry Nodes edits a mesh. **Armature Input** hands the rig to
-**Armature Output**, and every node in between is a modifier: it reads the
-bone stream, changes the bones it selects, and passes the rest through.
+way Geometry Nodes edits a mesh. **Armature Input** puts the whole rig on the
+wire, **Armature Output** writes it back, and every node in between is a
+modifier: one value in, one value out, changing only what it selects.
 
 ## Install
 
@@ -44,6 +44,19 @@ Armature Input ──▶ Position ──▶ Custom Shape ──▶ Armature Outp
                    Bone: hand.L   Bone: hand.L
 ```
 
+### One value on the wire
+
+The **Rig** socket carries the *entire armature* — every bone, its rest
+geometry, parenting, deform flags, constraints, widgets, and any pose the
+graph has written so far. Not one bone: one rig.
+
+- **Armature Input** emits the rig **unmodified**.
+- Every node in between takes that whole rig in and returns a **modified
+  copy**. On the Bone node the incoming rig arrives on the socket called
+  *Parent* — the node upstream is what its bone hangs off — but it is the same
+  whole-rig value every other node receives.
+- **Armature Output** takes the last one and writes it back.
+
 Every modifier node has a **Bone** field. Leave it empty and the node affects
 every bone on the wire; name one (or several, semicolon separated) and it
 affects only those. When the graph has a rig to look at, the field is a
@@ -51,16 +64,49 @@ searchable dropdown of that rig's real bone names.
 
 The graph stays the size of your edits, not the size of the rig.
 
+### The rig stores its own baseline
+
+The Armature Output writes back to the same object the Input reads, so a live
+read would feed the graph its own results. A stack that turns Deform off, or
+replaces a widget, would see the changed value on the next evaluation and
+could never get back to the original.
+
+So the unmodified rig is serialised once and stored **on the armature object**
+as a custom property (`an_baseline`), the first time a graph is bound to it.
+Every evaluation starts from that same base state, which is what makes the
+stack behave like modifiers:
+
+- Deleting a node genuinely undoes it, instead of leaving its effect baked in.
+- Unplugging the Armature Input cannot lose anything — the record is on the
+  rig, not in the wire.
+- An empty graph is **not** a teardown. It means "no modifications defined",
+  so the rig is left exactly alone. (It used to strip every widget, which
+  leaves a Rigify rig looking precisely like a metarig, and no replug could
+  undo it.)
+
+Only rest data is stored — bones, hierarchy, deform flags, constraints and
+custom shapes. Pose is deliberately excluded: posing is what the graph does,
+and a baseline that remembered it would fight the Transform nodes.
+
+The refresh button on the Armature Input re-captures, for when you have edited
+the armature itself. It asks first, because it captures whatever the rig looks
+like *now* — including anything the graph has already applied.
+
 ## Node categories
 
 ### Armature I/O
 
-- **Armature Input** — nothing in, Bone out. Reads every bone of the chosen
-  armature: rest geometry, parenting, deform flags and existing widgets. It
-  re-reads the live rig on every evaluation, which is what makes the stack a
-  stack: the nodes downstream are the change, so the rig is the base state.
-- **Armature Output** — Bone in, nothing out. Leaving *Armature* blank targets
-  the Input's source, which is the normal case. Two modes:
+- **Armature Input** — nothing in, **Rig** out. Holds everything about the
+  chosen armature: every bone's rest geometry, parenting, deform flags,
+  constraints and existing custom shapes. It emits that rig **unmodified**.
+
+  It does *not* read the live armature. The record lives **on the rig itself**
+  (see *The rig stores its own baseline*), and this node inherits from it.
+- **Armature Output** — **Rig** in, nothing out. It is the display end of the
+  graph: it writes the rig back *and* shows the markers of every Marker and
+  Skeleton node feeding it, which its **Markers** toggle turns off for the
+  whole graph at once. Leaving *Armature* blank targets the Input's source,
+  which is the normal case. Two modes:
   - **Modify** (default) — writes shapes and pose onto the existing rig; its
     bones, constraints and drivers are left alone. Safe on a Rigify rig.
   - **Full Rig** — the graph owns the armature and rebuilds its bones, so
@@ -68,12 +114,18 @@ The graph stays the size of your edits, not the size of the rig.
 
 ### Marker
 
-A marker is a world position with a stable key, drawn as a draggable empty in
-the `MRKS_rig` collection. Placing things by dragging a handle beats typing
-coordinates, which is the only reason markers exist.
+A marker is a world position with a stable key, drawn as a glowing sphere and
+a draggable empty in the `MRKS_rig` collection. Placing things by dragging a
+handle beats typing coordinates, which is the only reason markers exist.
 
-- **Marker** — one handle. Inputs Parent and Constraints, outputs a Bone whose
-  head sits at the handle and which runs along *Direction* for *Length*.
+Markers are displayed **through the Armature Output they feed**, the way a
+value in Geometry Nodes only matters once it reaches the output. An
+unconnected Marker node draws nothing; wire it in and it appears. Each node's
+own **Handles** toggle still wins, for hiding one marker without unwiring it.
+
+- **Marker** — one handle, as a position. Its **Position** output wires into a
+  Bone node and dragging the handle moves that bone. It produces no bones and
+  sits outside the Rig stream, the way a value node does in Geometry Nodes.
 - **Skeleton** — a bundle of markers, **one output socket each**: the
   Principled BSDF of markers. Each output is a position, so it wires into
   anything that takes one — a Position node, a Snap offset, a Custom Shape
@@ -108,8 +160,8 @@ coordinates, which is the only reason markers exist.
   bone's position is an *output* of the graph, so a live read-back would race
   the pose the node writes. The refresh button re-reads on demand.
 
-  Its Parent and Constraints inputs are rest/pose-stack data, so they only
-  reach the armature when the Output is in **Full Rig** mode.
+  The incoming rig arrives on its **Parent** input. Its Constraints input is
+  pose-stack data, so it only reaches the armature in **Full Rig** mode.
 - **Chain** — generates N connected bones from a start, direction, length and
   an optional per-segment curve. Inputs Parent and Tip Constraints.
 
@@ -149,6 +201,8 @@ keeps whatever the rig already has.
 
 ## Execution model
 
+0. **Baseline** — the Armature Input emits the rig's stored unmodified state,
+   capturing it from the object on first use.
 1. **Evaluate** — walk back from the Armature Output, memoized per node, into
    a list of `BoneDef`. Duplicate names are resolved last-write-wins so a
    downstream modifier beats an upstream one.
@@ -169,7 +223,8 @@ node, which marks the tree dirty, which re-poses the rig.
 | File | Responsibility |
 | --- | --- |
 | `core.py` | `BoneDef` / `ConstraintDef` / `ShapeDef`, eval context and memoization, bone selection |
-| `sockets.py` | Bone (the stream), Constraint, Vector sockets |
+| `baseline.py` | The rig's stored record of its unmodified state, kept on the armature object |
+| `sockets.py` | Rig (the whole armature, the stream), Constraint, Vector sockets |
 | `tree.py` | `ArmatureNodeTree` data-block, dirty tracking, live update |
 | `nodes.py` | Every node type |
 | `primary_rig.py` | Marker handles and locks, viewport overlay, MediaPipe preset table, marker operators |
@@ -197,8 +252,8 @@ move.inputs["Position"].default_value = (0.3, 0.0, 1.2)
 
 out = tree.nodes.new("ArmatureNodesOutputNode")
 
-tree.links.new(src.outputs["Bone"], move.inputs["Bone"])
-tree.links.new(move.outputs["Bone"], out.inputs["Bone"])
+tree.links.new(src.outputs["Rig"], move.inputs["Rig"])
+tree.links.new(move.outputs["Rig"], out.inputs["Rig"])
 
 bpy.ops.armature_nodes.build()
 ```

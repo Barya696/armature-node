@@ -30,6 +30,13 @@ def decompile_armature_to_tree(obj, tree, shapes_only=False, full=False):
       bones, so nodes can add and remove them.
     """
     from .nodes import ArmatureInputNode, ArmatureOutputNode
+    from . import baseline
+
+    # Record what the rig is before any graph runs against it. Taken here
+    # because this is the one moment the armature is guaranteed unmodified by
+    # this tree; everything downstream reads the stored copy, never the object.
+    if not baseline.has_baseline(obj):
+        baseline.store(obj)
 
     tree.nodes.clear()
 
@@ -42,7 +49,7 @@ def decompile_armature_to_tree(obj, tree, shapes_only=False, full=False):
     output.mode = "FULL" if full else "MODIFY"
     output.location = (NODE_X_SPACING, 0)
 
-    tree.links.new(source.outputs["Bone"], output.inputs["Bone"])
+    tree.links.new(source.outputs["Rig"], output.inputs["Rig"])
 
     if hasattr(obj, "armature_nodes_tree"):
         obj.armature_nodes_tree = tree

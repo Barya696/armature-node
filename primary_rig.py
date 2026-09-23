@@ -281,8 +281,44 @@ def _shader():
         return gpu.shader.from_builtin("3D_UNIFORM_COLOR")
 
 
+def _reaches_output(node, seen=None):
+    """True when following this node's output links arrives at an Armature
+    Output whose marker display is on."""
+    if seen is None:
+        seen = set()
+    if node.name in seen:
+        return False  # graphs can rejoin; never walk a node twice
+    seen.add(node.name)
+    for sock in node.outputs:
+        for link in sock.links:
+            if not link.is_valid:
+                continue
+            nxt = link.to_node
+            if nxt.bl_idname == "ArmatureNodesOutputNode":
+                if getattr(nxt, "show_markers", True):
+                    return True
+                continue  # this output hides markers; another may not
+            if _reaches_output(nxt, seen):
+                return True
+    return False
+
+
+def marker_node_visible(node):
+    """Whether a marker node's handles belong in the viewport.
+
+    A marker is displayed *through* the Armature Output it feeds, the way a
+    value in Geometry Nodes only matters once it reaches the output. So an
+    unconnected Marker node draws nothing, and turning Show Markers off on the
+    Output hides every marker in that graph at once. The node's own Handles
+    toggle still wins, for hiding one marker without unwiring it.
+    """
+    if not getattr(node, "show_handles", True):
+        return False
+    return _reaches_output(node)
+
+
 def _overlay_nodes():
-    """Every marker-holding node whose handles are on.
+    """Every marker-holding node currently displayed.
 
     Both the Skeleton node and the single Marker node draw here -- a Marker
     node that drew nothing was invisible in the viewport, which defeats the
@@ -296,7 +332,7 @@ def _overlay_nodes():
         for node in tree.nodes:
             if node.bl_idname not in MARKER_NODE_IDNAMES:
                 continue
-            if getattr(node, "show_handles", True):
+            if marker_node_visible(node):
                 yield node
 
 
@@ -485,10 +521,17 @@ class ARMATURE_OT_skeleton_toggle_markers(Operator):
         # empties: the flag is what the overlay and the periodic re-create
         # both read, so toggling anything else would be undone a tick later.
         node.show_handles = not node.show_handles
-        if node.show_handles:
+        if not node.show_handles:
+            remove_marker_empties(node)
+        elif marker_node_visible(node):
             ensure_marker_empties(node)
         else:
-            remove_marker_empties(node)
+            # Creating them here would only have them removed again on the
+            # next sync tick, which reads as a flicker rather than an answer.
+            self.report(
+                {"WARNING"},
+                "Wire this node into an Armature Output to see its markers",
+            )
         tag_viewports_redraw()
         return {"FINISHED"}
 

@@ -494,15 +494,12 @@ def build_armature_from_tree(tree, strict=False):
                 from .tree import queue_object_removal
 
                 queue_object_removal(obj.name)
-        else:
-            # The stack no longer produces anything: strip every controller
-            # the graph had put on the rig, but leave its own bones alone.
-            obj = bpy.data.objects.get(name)
-            if obj is not None and obj.type == "ARMATURE" and obj.get(SHAPED_BONES_KEY):
-                remembered = _remember_mode()
-                _ensure_object_mode()
-                _shapes_only_pass(obj, [])
-                _restore_mode(obj, remembered)
+        # Modify mode deliberately does NOTHING here. An empty stream means
+        # the graph defines no modifications -- most often because the
+        # Armature Input is unplugged or its source is unset -- not that the
+        # rig should be dismantled. Stripping it used to leave a Rigify rig
+        # with no widgets at all, which looks exactly like a metarig, and no
+        # replug could undo it because the shapes were gone from the object.
         tree.is_dirty = False
         return None
     # A copied node graph must never overwrite the source rig. The original

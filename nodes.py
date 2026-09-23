@@ -45,7 +45,7 @@ from .core import (
     select_bones,
     copy_bone,
 )
-from .sockets import BoneSocket, ConstraintSocket, VectorSocket
+from .sockets import RigSocket, ConstraintSocket, VectorSocket
 from .widgets import PRESET_ITEMS as _widget_preset_items
 from .widgets import widget_enum_items as _widget_enum_items
 
@@ -134,15 +134,26 @@ def _bone_select_prop():
 
 
 class _ModifierNodeBase(ArmatureNodeBase):
-    """A node that reads the bone stream, changes a selection, passes it on."""
+    """A node that reads the rig, changes a selection, passes it on.
+
+    One value in, one value out: the whole rig. A node never receives a single
+    bone -- it receives the armature as it stands at that point in the graph
+    and returns a modified copy, which is what lets nodes be reordered and
+    dropped onto the wire like modifiers.
+    """
+
+    #: Name of the input socket carrying the incoming rig. The Bone node calls
+    #: it Parent -- the node upstream is what its bone hangs off -- but it is
+    #: the same whole-rig value every other node receives.
+    stream_input = "Rig"
 
     def init(self, context):
-        self.inputs.new(BoneSocket.bl_idname, "Bone")
-        self.outputs.new(BoneSocket.bl_idname, "Bone")
+        self.inputs.new(RigSocket.bl_idname, self.stream_input)
+        self.outputs.new(RigSocket.bl_idname, "Rig")
         self.width = 200
 
     def stream(self, ctx):
-        return [copy_bone(b) for b in gather_input_bones(self, "Bone", ctx)]
+        return [copy_bone(b) for b in gather_input_bones(self, self.stream_input, ctx)]
 
     def selected(self, bones):
         return select_bones(bones, self.bone)
@@ -519,15 +530,18 @@ def _poll_armature_object(self, obj):
 
 
 class ArmatureInputNode(ArmatureNodeBase, Node):
-    """Head of the stack: the rig as it is now.
+    """Head of the stack: the rig as it was before the graph touched it.
 
-    Reads every bone of ``source`` -- rest geometry, parenting, deform flags
-    and existing widgets -- and puts them on the wire. Nothing upstream, by
-    design: this IS the upstream.
+    It does **not** read the live armature. The Output writes back to that same
+    object, so a live read would feed the graph its own results -- a stack that
+    turns Deform off, or replaces a widget, would see the changed value next
+    evaluation and could never get back to the original.
 
-    It re-reads the live armature on every evaluation, which is exactly right
-    for a modifier stack: the nodes downstream are the change, so the rig is
-    the base state, not something the graph has to remember.
+    Instead the unmodified rig is stored on the armature object itself (see
+    ``baseline.py``) and this node inherits from that. Every evaluation starts
+    from the same base state, so deleting a node genuinely undoes it, and
+    unplugging this node cannot lose anything -- the record lives on the rig,
+    not in the wire.
     """
 
     bl_idname = "ArmatureNodesInputNode"
@@ -539,50 +553,32 @@ class ArmatureInputNode(ArmatureNodeBase, Node):
     )
 
     def init(self, context):
-        self.outputs.new(BoneSocket.bl_idname, "Bone")
-        self.width = 200
+        self.outputs.new(RigSocket.bl_idname, "Rig")
+        self.width = 220
 
     def draw_buttons(self, context, layout):
+        from . import baseline
+
+        layout.context_pointer_set("node", self)
         layout.prop(self, "source", text="")
-        if self.source is None:
+        obj = self.source
+        if obj is None:
             layout.label(text="Pick the rig to modify", icon="INFO")
+            return
+        stored = baseline.load(obj)
+        row = layout.row(align=True)
+        if stored:
+            row.label(text=f"Stored: {len(stored)} bones", icon="CHECKMARK")
+        else:
+            row.label(text="Captured on first use", icon="INFO")
+        row.operator(
+            "armature_nodes.capture_baseline", text="", icon="FILE_REFRESH"
+        )
 
     def eval_bones(self, ctx):
-        from .core import ShapeDef, bone_roll
+        from . import baseline
 
-        obj = self.source
-        if obj is None or obj.type != "ARMATURE":
-            return []
-        pose = obj.pose
-        bones = []
-        for b in obj.data.bones:
-            bdef = BoneDef(
-                name=b.name,
-                head=tuple(b.head_local),
-                tail=tuple(b.tail_local),
-                roll=bone_roll(b),
-                parent=b.parent.name if b.parent else None,
-                use_connect=b.use_connect,
-                use_deform=b.use_deform,
-                envelope_distance=b.envelope_distance,
-                envelope_weight=b.envelope_weight,
-            )
-            # Carry existing widgets, so a stack that only adds a Position
-            # node does not strip every control shape off the rig.
-            pbone = pose.bones.get(b.name) if pose else None
-            if pbone is not None and pbone.custom_shape is not None:
-                bdef.shape = ShapeDef(
-                    widget=pbone.custom_shape.name,
-                    preset="NONE",
-                    scale=tuple(pbone.custom_shape_scale_xyz),
-                    translation=tuple(pbone.custom_shape_translation),
-                    rotation=tuple(pbone.custom_shape_rotation_euler),
-                    wire_width=getattr(pbone, "custom_shape_wire_width", 1.0),
-                    scale_to_bone_length=pbone.use_custom_shape_bone_size,
-                    show_wire=b.show_wire,
-                )
-            bones.append(bdef)
-        return bones
+        return baseline.bone_defs(self.source)
 
 
 class ArmatureOutputNode(ArmatureNodeBase, Node):
@@ -616,8 +612,18 @@ class ArmatureOutputNode(ArmatureNodeBase, Node):
         default="MODIFY",
     )
 
+    show_markers: BoolProperty(
+        name="Markers",
+        description=(
+            "Draw the markers of every Marker and Skeleton node feeding this "
+            "output in the 3D viewport"
+        ),
+        default=True,
+        update=lambda self, ctx: _redraw_viewports(),
+    )
+
     def init(self, context):
-        self._multi_input(BoneSocket.bl_idname, "Bone")
+        self._multi_input(RigSocket.bl_idname, "Rig")
         self.width = 200
 
     def target_name(self):
@@ -632,6 +638,7 @@ class ArmatureOutputNode(ArmatureNodeBase, Node):
         layout.prop(self, "armature_name", text="")
         if not self.armature_name:
             layout.label(text=f"-> {self.target_name()}", icon="ARMATURE_DATA")
+        layout.prop(self, "show_markers", toggle=True, icon="EMPTY_AXIS")
 
     def free(self):
         """Deleting the Output deletes what it generated.
@@ -651,7 +658,7 @@ class ArmatureOutputNode(ArmatureNodeBase, Node):
         self.schedule_rebuild()
 
     def eval_bones(self, ctx):
-        return gather_input_bones(self, "Bone", ctx)
+        return gather_input_bones(self, "Rig", ctx)
 
 
 # ---------------------------------------------------------------------------
@@ -728,10 +735,12 @@ class BoneNode(_ModifierNodeBase, Node):
     use_scale: BoolProperty(name="Scale", default=False)
     synced: BoolProperty(default=False, options={"HIDDEN"})
 
+    #: The incoming rig arrives on Parent for this node.
+    stream_input = "Parent"
+
     def init(self, context):
         super().init(context)
         self.inputs.new(VectorSocket.bl_idname, "Position")
-        self.inputs.new(BoneSocket.bl_idname, "Parent")
         self._multi_input(ConstraintSocket.bl_idname, "Constraints")
         self.width = 220
 
@@ -824,7 +833,6 @@ class BoneNode(_ModifierNodeBase, Node):
         bones = self.stream(ctx)
         if not self.bone:
             return bones
-        parents = gather_input_bones(self, "Parent", ctx)
         constraints = gather_input_constraints(self, "Constraints", ctx)
         driven = self.driven_position()
         for b in bones:
@@ -838,10 +846,8 @@ class BoneNode(_ModifierNodeBase, Node):
                 b.pose_rotation = tuple(self.bone_rotation)
             if self.use_scale:
                 b.pose_scale = tuple(self.bone_scale)
-            # Re-parenting and constraints are rest/pose-stack data, so they
-            # only reach the armature when the Output is in Full Rig mode.
-            if parents:
-                b.parent = parents[-1].name
+            # Constraints are pose-stack data, so they only reach the
+            # armature when the Output is in Full Rig mode.
             if constraints:
                 b.constraints = list(b.constraints) + constraints
             break
@@ -870,9 +876,9 @@ class ChainNode(ArmatureNodeBase, Node):
     )
 
     def init(self, context):
-        self.inputs.new(BoneSocket.bl_idname, "Parent")
+        self.inputs.new(RigSocket.bl_idname, "Parent")
         self._multi_input(ConstraintSocket.bl_idname, "Tip Constraints")
-        self.outputs.new(BoneSocket.bl_idname, "Bone")
+        self.outputs.new(RigSocket.bl_idname, "Rig")
 
     def draw_buttons(self, context, layout):
         layout.prop(self, "prefix", text="")
@@ -1718,6 +1724,7 @@ _NO_REBUILD_PROPS = {
     "show_detail",
     "show_advanced",
     "show_handles",
+    "show_markers",
     "markers",  # CollectionProperty: does not accept update=
     "lock_depth",
     "symmetric",

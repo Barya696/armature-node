@@ -2,7 +2,7 @@
 
 Three socket types, deliberately:
 
-* **Bone** -- the stream. Carries a list of ``BoneDef``: the whole armature as
+* **Rig** -- the stream. Carries a list of ``BoneDef``: the whole armature as
   it stands at that point in the graph, exactly like Geometry Nodes passes
   geometry from node to node. Everything between Armature Input and Armature
   Output reads this, changes some of it, and passes it on.
@@ -41,11 +41,21 @@ class _SocketDrawMixin:
         return self.socket_color
 
 
-class BoneSocket(_SocketDrawMixin, NodeSocket):
-    """The bone stream: every bone in the armature at this point in the graph."""
+class RigSocket(_SocketDrawMixin, NodeSocket):
+    """The whole rig.
+
+    Carries every bone of the armature -- rest geometry, parenting, deform
+    flags, constraints, widgets and any pose the graph has written so far --
+    as a list of ``BoneDef``. One value, not one bone: the Armature Input puts
+    the unmodified rig on the wire, each node in between returns a modified
+    copy, and the Armature Output writes the last one back.
+
+    The bl_idname still says Bone because saved files reference it by that
+    name; renaming it would silently drop every link in an existing graph.
+    """
 
     bl_idname = "ArmatureNodesBoneSocket"
-    bl_label = "Bone"
+    bl_label = "Rig"
     socket_color = (0.95, 0.60, 0.20, 1.0)
 
 
@@ -105,10 +115,14 @@ class VectorSocket(_SocketDrawMixin, NodeSocket):
 
 
 classes = (
-    BoneSocket,
+    RigSocket,
     ConstraintSocket,
     VectorSocket,
 )
+
+
+# The socket was called Bone before it carried the whole rig.
+BoneSocket = RigSocket
 
 
 def register():

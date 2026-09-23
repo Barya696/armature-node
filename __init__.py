@@ -28,6 +28,7 @@ bl_info = {
 # classes.
 _SUBMODULES = (
     "core",
+    "baseline",
     "sockets",
     "tree",
     "primary_rig",
