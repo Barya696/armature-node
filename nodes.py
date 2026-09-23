@@ -304,6 +304,29 @@ class MarkerHolderMixin:
     lock, mirror and overlay code stay ignorant of which node it is serving.
     """
 
+    def sync_marker_sockets(self):
+        """One Vector output per marker, bound by ``marker_key``.
+
+        Sockets are matched and renamed rather than rebuilt, because a link is
+        attached to the socket itself: dropping and re-adding one would break
+        every wire. New markers append, so inserting in the middle of the list
+        leaves socket order behind list order -- harmless, and the alternative
+        costs links.
+        """
+        wanted = [(m.key, m.name or m.key) for m in self.markers if m.key]
+        wanted_keys = {k for k, _n in wanted}
+        for sock in list(self.outputs):
+            if sock.marker_key not in wanted_keys:
+                self.outputs.remove(sock)
+        existing = {s.marker_key: s for s in self.outputs}
+        for key, label in wanted:
+            sock = existing.get(key)
+            if sock is None:
+                sock = self.outputs.new(VectorSocket.bl_idname, label)
+                sock.marker_key = key
+            elif sock.name != label:
+                sock.name = label
+
     def marker_keys(self):
         return [m.key for m in self.markers if m.key]
 
@@ -707,9 +730,33 @@ class BoneNode(_ModifierNodeBase, Node):
 
     def init(self, context):
         super().init(context)
+        self.inputs.new(VectorSocket.bl_idname, "Position")
         self.inputs.new(BoneSocket.bl_idname, "Parent")
         self._multi_input(ConstraintSocket.bl_idname, "Constraints")
         self.width = 220
+
+    def driven_position(self):
+        """The world position wired into this node, or None when nothing is.
+
+        A linked Marker wins over the node's own Location field: the whole
+        point of wiring one in is that the handle is now the control.
+        """
+        sock = self.inputs.get("Position")
+        if sock is None or not sock.is_linked:
+            return None
+        return sock.get_value()
+
+    def linked_marker(self):
+        """(node, marker) driving the Position input, or (None, None)."""
+        sock = self.inputs.get("Position")
+        if sock is None or not sock.is_linked or not sock.links:
+            return None, None
+        link = sock.links[0]
+        key = getattr(link.from_socket, "marker_key", "")
+        node = link.from_node
+        if not key or not hasattr(node, "marker_by_key"):
+            return None, None
+        return node, node.marker_by_key(key)
 
     def read_from_rig(self):
         """Copy the selected bone's current world transform onto this node."""
@@ -730,6 +777,14 @@ class BoneNode(_ModifierNodeBase, Node):
             self.synced = True
         finally:
             _syncing_bone_read = False
+        # Move the marker onto the bone rather than the other way round. A
+        # marker wired in sits wherever it was dropped, so without this the
+        # bone would jump to the handle the moment it is selected; now the
+        # handle lands on the bone and you drag from there.
+        marker_node, marker = self.linked_marker()
+        if marker is not None:
+            marker.set_position(loc)
+            marker_node.push_markers_to_empties()
         return True
 
     def draw_buttons(self, context, layout):
@@ -749,6 +804,9 @@ class BoneNode(_ModifierNodeBase, Node):
             return
         if not self.synced:
             layout.label(text="Not read from the rig yet", icon="INFO")
+        driven = self.driven_position() is not None
+        if driven:
+            layout.label(text="Location driven by a marker", icon="EMPTY_AXIS")
         for flag, prop in (
             ("use_location", "location"),
             ("use_rotation", "rotation"),
@@ -757,7 +815,9 @@ class BoneNode(_ModifierNodeBase, Node):
             row = layout.row(align=True)
             row.prop(self, flag, text="")
             sub = row.column(align=True)
-            sub.enabled = getattr(self, flag)
+            # A wired marker owns the location, so showing the field editable
+            # would invite an edit that the next rebuild throws away.
+            sub.enabled = getattr(self, flag) and not (driven and prop == "location")
             sub.prop(self, prop, text="")
 
     def eval_bones(self, ctx):
@@ -766,10 +826,13 @@ class BoneNode(_ModifierNodeBase, Node):
             return bones
         parents = gather_input_bones(self, "Parent", ctx)
         constraints = gather_input_constraints(self, "Constraints", ctx)
+        driven = self.driven_position()
         for b in bones:
             if b.name != self.bone:
                 continue
-            if self.use_location:
+            if driven is not None:
+                b.pose_location = tuple(driven)
+            elif self.use_location:
                 b.pose_location = tuple(self.location)
             if self.use_rotation:
                 b.pose_rotation = tuple(self.rotation)
@@ -859,11 +922,16 @@ class ChainNode(ArmatureNodeBase, Node):
 
 
 class MarkerNode(MarkerHolderMixin, ArmatureNodeBase, Node):
-    """One draggable handle in the viewport that defines a bone.
+    """One draggable handle in the viewport, as a position.
 
-    The marker is the bone's head; the bone runs from there along *Direction*
-    for *Length*. Placing a bone by dragging a handle beats typing head and
-    tail coordinates, which is the whole reason this node exists.
+    Wire its *Position* output into a Bone node and dragging the handle moves
+    that bone -- any bone, whatever its role. Placing a control by grabbing a
+    glowing point in the viewport beats typing world coordinates, which is the
+    only reason markers exist.
+
+    It produces no bones and sits outside the Bone stream, the way a value
+    node does in Geometry Nodes: it is a position, and what consumes it
+    decides what that position means.
     """
 
     bl_idname = "ArmatureNodesMarkerNode"
@@ -871,29 +939,20 @@ class MarkerNode(MarkerHolderMixin, ArmatureNodeBase, Node):
     bl_icon = "EMPTY_AXIS"
 
     markers: bpy.props.CollectionProperty(type=SkeletonMarker)
-    bone_name: StringProperty(name="Name", default="marker")
-    length: FloatProperty(name="Length", default=0.25, min=1e-4)
-    direction: FloatVectorProperty(
-        name="Direction", size=3, default=(0, 0, 1), subtype="XYZ"
+    show_handles: BoolProperty(
+        name="Handles",
+        description="Show this marker in the 3D viewport",
+        default=True,
+        update=lambda self, ctx: self.refresh_handles(),
     )
-    use_deform: BoolProperty(name="Deform", default=True)
 
     def init(self, context):
-        self.inputs.new(BoneSocket.bl_idname, "Parent")
-        self._multi_input(ConstraintSocket.bl_idname, "Constraints")
-        self.outputs.new(BoneSocket.bl_idname, "Bone")
-        self.width = 200
+        self.width = 180
         self.add_marker(name="Marker")
 
     @property
     def marker(self):
         return self.markers[0] if len(self.markers) else None
-
-    def sync_marker_sockets(self):
-        """The Marker node has no per-marker socket: it outputs the bone it
-        builds, not the position. Present so the shared marker code can call
-        it unconditionally."""
-        return
 
     def draw_buttons(self, context, layout):
         layout.context_pointer_set("node", self)
@@ -904,12 +963,8 @@ class MarkerNode(MarkerHolderMixin, ArmatureNodeBase, Node):
             )
             return
         row = layout.row(align=True)
-        shown = self.markers_shown()
-        row.operator(
-            "armature_nodes.skeleton_toggle_markers",
-            text=("Hide" if shown else "Show") + " Handle",
-            icon="HIDE_OFF" if shown else "HIDE_ON",
-        )
+        row.prop(self, "show_handles", text="", icon="HIDE_OFF" if self.show_handles else "HIDE_ON")
+        row.prop(marker, "name", text="")
         op = row.operator(
             "armature_nodes.skeleton_toggle_rotation",
             text="",
@@ -917,38 +972,9 @@ class MarkerNode(MarkerHolderMixin, ArmatureNodeBase, Node):
             depress=marker.use_rotation,
         )
         op.marker = marker.key
-        layout.prop(self, "bone_name", text="")
         layout.prop(marker, "position", text="")
         if marker.use_rotation:
             layout.prop(marker, "rotation", text="")
-        col = layout.column(align=True)
-        col.prop(self, "direction")
-        col.prop(self, "length")
-        layout.prop(self, "use_deform")
-
-    def eval_bones(self, ctx):
-        parents = gather_input_bones(self, "Parent", ctx)
-        constraints = gather_input_constraints(self, "Constraints", ctx)
-        marker = self.marker
-        if marker is None:
-            return [copy_bone(b) for b in parents]
-        head = Vector(marker.position)
-        direction = Vector(self.direction)
-        if direction.length < 1e-8:
-            direction = Vector((0.0, 0.0, 1.0))
-        tail = head + direction.normalized() * self.length
-        bone = BoneDef(
-            name=self.bone_name or self.name,
-            head=tuple(head),
-            tail=tuple(tail),
-            use_deform=self.use_deform,
-            constraints=constraints,
-        )
-        if marker.use_rotation:
-            bone.roll = float(Vector(marker.rotation).y)
-        if parents:
-            bone.parent = parents[-1].name
-        return [copy_bone(b) for b in parents] + [bone]
 
 
 class SkeletonNode(MarkerHolderMixin, ArmatureNodeBase, Node):
@@ -991,11 +1017,11 @@ class SkeletonNode(MarkerHolderMixin, ArmatureNodeBase, Node):
         description="World X of the mirror plane used by Symmetric mode",
         default=0.0,
     )
-    show_skeleton: BoolProperty(
-        name="Draw",
-        description="Draw the markers in the 3D viewport",
+    show_handles: BoolProperty(
+        name="Handles",
+        description="Show these markers in the 3D viewport",
         default=True,
-        update=lambda self, ctx: _redraw_viewports(),
+        update=lambda self, ctx: self.refresh_handles(),
     )
     show_markers: BoolProperty(name="Markers", default=True)
     show_detail: BoolProperty(name="Face / Hands / Feet", default=False)
@@ -1040,29 +1066,6 @@ class SkeletonNode(MarkerHolderMixin, ArmatureNodeBase, Node):
         self.sync_marker_sockets()
         self.refresh_handles()
         return added
-
-    def sync_marker_sockets(self):
-        """One Vector output per marker, bound by ``marker_key``.
-
-        Sockets are matched and renamed rather than rebuilt, because a link is
-        attached to the socket itself: dropping and re-adding one would break
-        every wire. New markers append, so inserting in the middle of the list
-        leaves socket order behind list order -- harmless, and the alternative
-        costs links.
-        """
-        wanted = [(m.key, m.name or m.key) for m in self.markers if m.key]
-        wanted_keys = {k for k, _n in wanted}
-        for sock in list(self.outputs):
-            if sock.marker_key not in wanted_keys:
-                self.outputs.remove(sock)
-        existing = {s.marker_key: s for s in self.outputs}
-        for key, label in wanted:
-            sock = existing.get(key)
-            if sock is None:
-                sock = self.outputs.new(VectorSocket.bl_idname, label)
-                sock.marker_key = key
-            elif sock.name != label:
-                sock.name = label
 
     # -- Symmetry and rigid groups (MediaPipe landmarks only) -----------------
 
@@ -1155,7 +1158,7 @@ class SkeletonNode(MarkerHolderMixin, ArmatureNodeBase, Node):
         row = col.row(align=True)
         row.prop(self, "lock_depth", toggle=True)
         row.prop(self, "symmetric", toggle=True)
-        row.prop(self, "show_skeleton", toggle=True, icon="ARMATURE_DATA")
+        row.prop(self, "show_handles", toggle=True, icon="HIDE_OFF")
 
         row = layout.row(align=True)
         row.operator("armature_nodes.skeleton_add_marker", text="Add Marker", icon="ADD")
@@ -1714,7 +1717,7 @@ _NO_REBUILD_PROPS = {
     "show_markers",
     "show_detail",
     "show_advanced",
-    "show_skeleton",
+    "show_handles",
     "markers",  # CollectionProperty: does not accept update=
     "lock_depth",
     "symmetric",

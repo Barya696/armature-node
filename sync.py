@@ -277,12 +277,24 @@ def sync_marker_handles():
 
     if is_updating():
         return  # a rebuild is mid-flight; matrices are not trustworthy
+    from .primary_rig import ensure_marker_empties
+
     changed = False
     for tree in _trees_to_track():
         for node in tree.nodes:
             if node.bl_idname not in _MARKER_NODES:
                 continue
             try:
+                # A marker is meant to be visible. Create its handle whenever
+                # one is missing -- on a new node, on file load, or after the
+                # empty was deleted by hand -- unless the node says otherwise.
+                if (
+                    getattr(node, "show_handles", True)
+                    and len(node.markers)
+                    and not node.markers_shown()
+                ):
+                    ensure_marker_empties(node)
+                    changed = True
                 if node.sync_from_empties():
                     changed = True
             except Exception as exc:  # noqa: BLE001

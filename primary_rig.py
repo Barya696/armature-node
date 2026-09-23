@@ -31,6 +31,8 @@ except ImportError:  # outside Blender (unit tests)
 
 
 MARKER_COLLECTION = "MRKS_rig"
+# Node types that own draggable marker handles.
+MARKER_NODE_IDNAMES = ("ArmatureNodesSkeletonNode", "ArmatureNodesMarkerNode")
 DEFAULT_HEIGHT = 1.8
 
 # ---------------------------------------------------------------------------
@@ -280,14 +282,106 @@ def _shader():
 
 
 def _overlay_nodes():
+    """Every marker-holding node whose handles are on.
+
+    Both the Skeleton node and the single Marker node draw here -- a Marker
+    node that drew nothing was invisible in the viewport, which defeats the
+    point of a marker.
+    """
     from .core import TREE_IDNAME
 
     for tree in bpy.data.node_groups:
         if tree.bl_idname != TREE_IDNAME:
             continue
         for node in tree.nodes:
-            if node.bl_idname == "ArmatureNodesSkeletonNode" and node.show_skeleton:
+            if node.bl_idname not in MARKER_NODE_IDNAMES:
+                continue
+            if getattr(node, "show_handles", True):
                 yield node
+
+
+# Round, soft-edged points. The builtin UNIFORM_COLOR shader draws points as
+# hard squares, which read as debug gizmos rather than markers; this discards
+# outside the radius and falls the alpha off towards the edge, so a stack of
+# additively blended sizes bloom into a glowing sphere.
+_GLOW_VERT = """
+uniform mat4 ModelViewProjectionMatrix;
+uniform float pointSize;
+in vec3 pos;
+void main()
+{
+    gl_Position = ModelViewProjectionMatrix * vec4(pos, 1.0);
+    gl_PointSize = pointSize;
+}
+"""
+
+_GLOW_FRAG = """
+uniform vec4 color;
+out vec4 fragColor;
+void main()
+{
+    vec2 d = gl_PointCoord - vec2(0.5);
+    float r = length(d) * 2.0;
+    if (r > 1.0) {
+        discard;
+    }
+    float falloff = pow(1.0 - r, 1.5);
+    fragColor = vec4(color.rgb, color.a * falloff);
+}
+"""
+
+_glow_shader = None
+_glow_failed = False
+
+
+def _glow():
+    """The round-point shader, or None when this build will not compile it.
+
+    Custom GLSL is not guaranteed across Blender's GPU backends, so a failure
+    here is not fatal: the caller falls back to square builtin points rather
+    than losing the whole overlay.
+    """
+    global _glow_shader, _glow_failed
+
+    if _glow_shader is not None or _glow_failed:
+        return _glow_shader
+    try:
+        _glow_shader = gpu.types.GPUShader(_GLOW_VERT, _GLOW_FRAG)
+    except Exception as exc:  # noqa: BLE001
+        _glow_failed = True
+        print(f"[Armature Nodes] Glow shader unavailable, using flat points: {exc}")
+    return _glow_shader
+
+
+# Halo rings drawn under the core, biggest and faintest first.
+_GLOW_LAYERS = ((26.0, 0.10), (18.0, 0.16), (12.0, 0.30))
+_CORE_SIZE = 7.0
+
+
+def _draw_glow_points(coords, color, scale=1.0):
+    """One glowing sphere per position."""
+    if not coords:
+        return
+    shader = _glow()
+    if shader is None:  # fallback: flat square points, still colour-coded
+        flat = _shader()
+        gpu.state.point_size_set(_CORE_SIZE * scale * 1.6)
+        flat.uniform_float("color", color)
+        batch_for_shader(flat, "POINTS", {"pos": coords}).draw(flat)
+        return
+    batch = batch_for_shader(shader, "POINTS", {"pos": coords})
+    shader.bind()
+    gpu.state.blend_set("ADDITIVE")
+    for size, alpha in _GLOW_LAYERS:
+        shader.uniform_float("pointSize", size * scale)
+        shader.uniform_float("color", (color[0], color[1], color[2], alpha))
+        batch.draw(shader)
+    # Opaque core on top, so the marker still reads as a solid point against
+    # a bright background where additive blending washes out.
+    gpu.state.blend_set("ALPHA")
+    shader.uniform_float("pointSize", _CORE_SIZE * scale)
+    shader.uniform_float("color", (color[0], color[1], color[2], 1.0))
+    batch.draw(shader)
 
 
 def _draw_skeleton_overlay():
@@ -296,7 +390,7 @@ def _draw_skeleton_overlay():
     nodes = list(_overlay_nodes())
     if not nodes:
         return
-    shader = _shader()
+    flat = _shader()
     gpu.state.blend_set("ALPHA")
     gpu.state.depth_test_set("NONE")
     try:
@@ -304,9 +398,9 @@ def _draw_skeleton_overlay():
             pos = {m.key: tuple(m.position) for m in node.markers if m.key}
             if not pos:
                 continue
-            # Connections, coloured by side (mixed = grey). Only drawn between
-            # two landmarks that are both present: the MediaPipe set is a
-            # preset now, so a graph may hold part of it, or none of it.
+            # Skeleton bones, coloured by side (mixed = grey). Only drawn
+            # between two landmarks that are both present: the MediaPipe set
+            # is a preset, so a graph may hold part of it, or none of it.
             by_color = {}
             for a, b in POSE_CONNECTIONS:
                 ka, kb = LM_BY_INDEX[a], LM_BY_INDEX[b]
@@ -314,28 +408,22 @@ def _draw_skeleton_overlay():
                     continue
                 color = side_color(ka) if LM_SIDE[ka] == LM_SIDE[kb] else COLOR_LINK
                 by_color.setdefault(color, []).extend((pos[ka], pos[kb]))
-            gpu.state.line_width_set(3.0)
-            for color, coords in by_color.items():
-                shader.uniform_float("color", color)
-                batch_for_shader(shader, "LINES", {"pos": coords}).draw(shader)
-            # Joints: big dots for the primary joints, small for group members,
-            # and every custom marker at primary size in the marker colour.
+            if by_color:
+                gpu.state.line_width_set(3.0)
+                flat.bind()
+                for color, coords in by_color.items():
+                    flat.uniform_float("color", color)
+                    batch_for_shader(flat, "LINES", {"pos": coords}).draw(flat)
+
+            # Glowing spheres. Rigid-group members (face, fingers, toes) are
+            # drawn smaller so the joints you actually place stand out.
             side_colors = {"L": COLOR_LEFT, "R": COLOR_RIGHT, "C": COLOR_CENTER}
-            custom = [pos[k] for k in pos if not is_landmark(k)]
-            for size, keys in ((10.0, PRIMARY_KEYS), (5.0, tuple(GROUP_ANCHOR))):
-                gpu.state.point_size_set(size)
+            for scale, keys in ((1.0, PRIMARY_KEYS), (0.55, tuple(GROUP_ANCHOR))):
                 for side, color in side_colors.items():
-                    coords = [
-                        pos[k] for k in keys if k in pos and LM_SIDE[k] == side
-                    ]
-                    if not coords:
-                        continue
-                    shader.uniform_float("color", color)
-                    batch_for_shader(shader, "POINTS", {"pos": coords}).draw(shader)
-            if custom:
-                gpu.state.point_size_set(10.0)
-                shader.uniform_float("color", COLOR_CUSTOM)
-                batch_for_shader(shader, "POINTS", {"pos": custom}).draw(shader)
+                    coords = [k for k in keys if k in pos and LM_SIDE[k] == side]
+                    _draw_glow_points([pos[k] for k in coords], color, scale)
+            custom = [pos[k] for k in pos if not is_landmark(k)]
+            _draw_glow_points(custom, COLOR_CUSTOM)
     finally:
         gpu.state.line_width_set(1.0)
         gpu.state.point_size_set(1.0)
@@ -359,7 +447,7 @@ def tag_viewports_redraw():
 
 
 # Both marker-holding nodes answer to these operators.
-_MARKER_NODES = {"ArmatureNodesSkeletonNode", "ArmatureNodesMarkerNode"}
+_MARKER_NODES = set(MARKER_NODE_IDNAMES)
 
 
 def _node(context, needs=None):
@@ -390,16 +478,17 @@ class ARMATURE_OT_skeleton_toggle_markers(Operator):
 
     def execute(self, context):
         node = _node(context, getattr(self, "_needs", None))
-        if node.markers_shown():
-            remove_marker_empties(node)
-        elif not len(node.markers):
+        if not len(node.markers):
             self.report({"WARNING"}, "This node has no markers yet")
             return {"CANCELLED"}
-        else:
+        # Flip the node's own flag rather than just adding or removing the
+        # empties: the flag is what the overlay and the periodic re-create
+        # both read, so toggling anything else would be undone a tick later.
+        node.show_handles = not node.show_handles
+        if node.show_handles:
             ensure_marker_empties(node)
-            # Only the Skeleton node draws an overlay to turn back on.
-            if hasattr(node, "show_skeleton"):
-                node.show_skeleton = True
+        else:
+            remove_marker_empties(node)
         tag_viewports_redraw()
         return {"FINISHED"}
 
