@@ -706,21 +706,21 @@ class BoneNode(_ModifierNodeBase, Node):
         default="",
         update=_on_bone_selected,
     )
-    location: FloatVectorProperty(
+    bone_location: FloatVectorProperty(
         name="Location",
         description="World position of the bone",
         size=3,
         default=(0.0, 0.0, 0.0),
         subtype="TRANSLATION",
     )
-    rotation: FloatVectorProperty(
+    bone_rotation: FloatVectorProperty(
         name="Rotation",
         description="World orientation of the bone, as an XYZ Euler",
         size=3,
         default=(0.0, 0.0, 0.0),
         subtype="EULER",
     )
-    scale: FloatVectorProperty(
+    bone_scale: FloatVectorProperty(
         name="Scale", size=3, default=(1.0, 1.0, 1.0), subtype="XYZ"
     )
     use_location: BoolProperty(name="Location", default=True)
@@ -771,9 +771,9 @@ class BoneNode(_ModifierNodeBase, Node):
         loc, rot, scale = (obj.matrix_world @ pbone.matrix).decompose()
         _syncing_bone_read = True
         try:
-            self.location = tuple(loc)
-            self.rotation = tuple(rot.to_euler("XYZ"))
-            self.scale = tuple(scale)
+            self.bone_location = tuple(loc)
+            self.bone_rotation = tuple(rot.to_euler("XYZ"))
+            self.bone_scale = tuple(scale)
             self.synced = True
         finally:
             _syncing_bone_read = False
@@ -808,16 +808,16 @@ class BoneNode(_ModifierNodeBase, Node):
         if driven:
             layout.label(text="Location driven by a marker", icon="EMPTY_AXIS")
         for flag, prop in (
-            ("use_location", "location"),
-            ("use_rotation", "rotation"),
-            ("use_scale", "scale"),
+            ("use_location", "bone_location"),
+            ("use_rotation", "bone_rotation"),
+            ("use_scale", "bone_scale"),
         ):
             row = layout.row(align=True)
             row.prop(self, flag, text="")
             sub = row.column(align=True)
             # A wired marker owns the location, so showing the field editable
             # would invite an edit that the next rebuild throws away.
-            sub.enabled = getattr(self, flag) and not (driven and prop == "location")
+            sub.enabled = getattr(self, flag) and not (driven and prop == "bone_location")
             sub.prop(self, prop, text="")
 
     def eval_bones(self, ctx):
@@ -833,11 +833,11 @@ class BoneNode(_ModifierNodeBase, Node):
             if driven is not None:
                 b.pose_location = tuple(driven)
             elif self.use_location:
-                b.pose_location = tuple(self.location)
+                b.pose_location = tuple(self.bone_location)
             if self.use_rotation:
-                b.pose_rotation = tuple(self.rotation)
+                b.pose_rotation = tuple(self.bone_rotation)
             if self.use_scale:
-                b.pose_scale = tuple(self.scale)
+                b.pose_scale = tuple(self.bone_scale)
             # Re-parenting and constraints are rest/pose-stack data, so they
             # only reach the armature when the Output is in Full Rig mode.
             if parents:
@@ -1745,9 +1745,33 @@ def _inject_live_update(cls):
             keywords["update"] = _on_node_prop_changed
 
 
+def _check_reserved_names(cls):
+    """Warn when a node property shadows one of Blender's own Node members.
+
+    Registration succeeds either way, which is what makes this worth checking:
+    a node that declares ``location`` overrides the node's position in the
+    editor, so it registers cleanly and then Blender's own add-node operator
+    dies setting ``node.location``, and the node can never be moved. Nothing
+    else catches it -- the failure surfaces as a ValueError from Blender's
+    code, with no hint that an addon property is the cause.
+    """
+    node_rna = getattr(Node, "bl_rna", None)
+    if node_rna is None:  # not running inside Blender
+        return
+    reserved = set(node_rna.properties.keys()) - {"bl_idname"}
+    clashes = sorted(set(getattr(cls, "__annotations__", {})) & reserved)
+    if clashes:
+        print(
+            f"[Armature Nodes] {cls.__name__} declares {', '.join(clashes)}, "
+            f"which shadow bpy.types.Node properties. Rename them "
+            f"(e.g. 'location' -> 'bone_location') or the node will misbehave."
+        )
+
+
 def register():
     for cls in classes:
         if issubclass(cls, Node):
+            _check_reserved_names(cls)
             _inject_live_update(cls)
         bpy.utils.register_class(cls)
 
