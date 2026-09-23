@@ -34,7 +34,6 @@ from .sockets import (
     ChainSocket,
     ConstraintSocket,
     MarkerSocket,
-    PoseSocket,
 )
 from .widgets import PRESET_ITEMS as _widget_preset_items
 from .widgets import widget_enum_items as _widget_enum_items
@@ -547,29 +546,56 @@ class CustomShapeNode(ArmatureNodeBase, Node):
             return Vector(marker.position), rotation
         return None
 
-    def _place_on_marker(self, bone, head, rotation=None):
-        """Move ``bone`` so its head sits on the marker.
+    def apply_marker_pose(self, obj=None):
+        """Pose the controlled bone at its wired marker.
 
-        The head-to-tail offset is carried along, so the bone keeps the length
-        and direction it already had and only moves. An oriented marker also
-        turns that offset and supplies the roll, which is what lets a single
-        marker fully place a control.
+        Markers drive the POSE, never the rest skeleton: the bone keeps the
+        rest geometry the graph built for it and is moved the way grabbing it
+        in Pose mode would. Blender draws a custom shape at the posed bone, so
+        the controller follows on its own -- no widget maths needed here.
+
+        Location always; orientation only when the marker has rotation
+        enabled, otherwise the control keeps the orientation it had. Scale is
+        never touched, so a scaled control stays scaled.
+
+        Returns True when the bone actually moved, which keeps the build pass
+        idempotent -- it settles instead of rewriting the same matrix forever.
         """
-        from mathutils import Euler
-        from .primary_rig import roll_from_marker
+        from mathutils import Matrix, Euler
 
-        offset = Vector(bone.tail) - Vector(bone.head)
-        if offset.length < _TRANSFORM_EPS:
-            # Blender rejects zero-length bones; give it something to keep.
-            offset = Vector((0.0, 0.0, 0.1))
-        if rotation is not None:
-            offset = Euler(tuple(rotation), "XYZ").to_matrix() @ offset
-        head = Vector(head)
-        tail = head + offset
-        bone.head = tuple(head)
-        bone.tail = tuple(tail)
-        if rotation is not None:
-            bone.roll = roll_from_marker(head, tail, tuple(rotation))
+        placed = self.linked_marker()
+        if placed is None:
+            return False
+        obj, pbone = self._pose_bone(obj)
+        if pbone is None or obj.mode == "EDIT":
+            return False
+        target_loc, rotation = placed
+        target_loc = Vector(target_loc)
+
+        world = obj.matrix_world @ pbone.matrix
+        cur_loc, cur_rot, cur_scale = world.decompose()
+        if rotation is None:
+            target_rot = cur_rot.to_matrix().to_4x4()
+            rot_differs = False
+        else:
+            target_rot = Euler(tuple(rotation), "XYZ").to_matrix().to_4x4()
+            rot_differs = (
+                Vector(cur_rot.to_euler("XYZ")) - Vector(rotation)
+            ).length > _TRANSFORM_EPS
+        if (cur_loc - target_loc).length < _TRANSFORM_EPS and not rot_differs:
+            return False
+
+        new_world = (
+            Matrix.Translation(target_loc)
+            @ target_rot
+            @ Matrix.Diagonal(cur_scale).to_4x4()
+        )
+        try:
+            pbone.matrix = obj.matrix_world.inverted_safe() @ new_world
+        except (AttributeError, ValueError) as exc:
+            print(f"[Armature Nodes] Could not pose '{pbone.name}': {exc}")
+            return False
+        return True
 
     def filtered_names(self):
         return {n.strip() for n in self.bone_filter.split(";") if n.strip()}
@@ -1071,31 +1097,32 @@ class CustomShapeNode(ArmatureNodeBase, Node):
         obj = self.find_armature() if self.controlled_bone else None
         in_edit = obj is not None and obj.mode == "EDIT"
 
-        # Pose mode: world-space Position/Scale of the posed bone.
+        # Pose mode: world-space Position/Scale of the posed bone. A wired
+        # marker owns the position, so the fields are shown read-only rather
+        # than letting an edit be silently overwritten on the next rebuild.
+        driven = self.linked_marker() is not None
         pose_col = box.column(align=True)
-        pose_col.label(text="Pose (world)", icon="POSE_HLT")
-        pose_col.enabled = bool(self.controlled_bone) and not in_edit
+        pose_col.label(
+            text="Pose (marker)" if driven else "Pose (world)",
+            icon="EMPTY_AXIS" if driven else "POSE_HLT",
+        )
+        pose_col.enabled = bool(self.controlled_bone) and not in_edit and not driven
         pose_col.prop(self, "world_position", text="Position")
         pose_col.prop(self, "world_rotation", text="Rotation")
         pose_col.prop(self, "world_scale", text="Scale")
 
-        # Edit mode: rest Head/Tail of the bone in armature space. A wired
-        # marker owns these, so they are shown read-only rather than letting
-        # an edit be silently overwritten on the next rebuild.
-        driven = self.linked_marker() is not None
+        # Edit mode: rest Head/Tail of the bone in armature space. Markers
+        # never touch these -- they pose the bone, they do not rebuild it.
         rest_col = box.column(align=True)
-        rest_col.label(
-            text="Rest (marker)" if driven else "Rest (edit)",
-            icon="EMPTY_AXIS" if driven else "EDITMODE_HLT",
-        )
-        rest_col.enabled = bool(self.controlled_bone) and not driven
+        rest_col.label(text="Rest (edit)", icon="EDITMODE_HLT")
+        rest_col.enabled = bool(self.controlled_bone)
         rest_col.prop(self, "bone_head", text="Head")
         rest_col.prop(self, "bone_tail", text="Tail")
 
         if driven and not self.controlled_bone:
-            box.label(text="Set a bone name for the marker to place", icon="ERROR")
+            box.label(text="Set a bone name for the marker to pose", icon="ERROR")
         elif driven:
-            box.label(text="Head follows the wired marker", icon="EMPTY_AXIS")
+            box.label(text="Posed by the wired marker", icon="EMPTY_AXIS")
 
         if self.controlled_bone:
             if obj is None:
@@ -1232,19 +1259,6 @@ class CustomShapeNode(ArmatureNodeBase, Node):
             else:
                 bones.append(own)
 
-        # A wired marker places the bone: the head goes to the marker and the
-        # tail follows rigidly. Applied after the stored rest values above, so
-        # the marker wins over what was decompiled -- which is the point of
-        # wiring one in. Without a bone filter there is no single bone to
-        # place, so nothing is moved.
-        placed = self.linked_marker()
-        if placed is not None:
-            head, rotation = placed
-            targets = names or ({own.name} if own is not None else set())
-            for b in bones:
-                if b.name in targets:
-                    self._place_on_marker(b, head, rotation)
-
         # What the widget IS depends on Source, so a change of Source or
         # Preset always resolves to a different form (otherwise the stored
         # decompiled name + captured geometry would win forever and the node
@@ -1292,19 +1306,6 @@ class CustomShapeNode(ArmatureNodeBase, Node):
 _syncing_landmarks = False
 
 
-def _on_landmark_changed(self, context):
-    """A landmark was typed on the node: move its handle and rebuild."""
-    if _syncing_landmarks:
-        return
-    from .primary_rig import tag_viewports_redraw
-
-    self.push_landmarks_to_empties()
-    tag_viewports_redraw()
-    tree = self.id_data
-    if tree is not None and hasattr(tree, "mark_dirty"):
-        tree.mark_dirty()
-
-
 def _on_marker_lock_changed(self, context):
     """Lock Depth / Symmetric toggled: re-apply locks to the handles."""
     from .primary_rig import apply_marker_locks, find_marker_empties, tag_viewports_redraw
@@ -1316,71 +1317,10 @@ def _on_marker_lock_changed(self, context):
     tag_viewports_redraw()
 
 
-def _on_marker_rotation_toggled(self, context):
-    """Rotation enabled/disabled on one landmark: re-lock and redraw its
-    handle, then rebuild (roll and retarget twist both change)."""
-    from .primary_rig import apply_marker_locks, find_marker_empties, tag_viewports_redraw
-
-    for key, obj in find_marker_empties(self).items():
-        apply_marker_locks(self, obj, key)
-        if self.marker_uses_rotation(key):
-            obj.rotation_euler = self.marker_rotation(key)
-    tag_viewports_redraw()
-    tree = self.id_data
-    if tree is not None and hasattr(tree, "mark_dirty"):
-        tree.mark_dirty()
-
-
 def _on_overlay_changed(self, context):
     from .primary_rig import tag_viewports_redraw
 
     tag_viewports_redraw()
-
-
-def _landmark_prop(key):
-    from .primary_rig import LM_DEFAULTS, LM_INDEX, LM_LABELS
-
-    return FloatVectorProperty(
-        name=LM_LABELS[key],
-        description=(
-            f"MediaPipe landmark {LM_INDEX[key]} ({LM_LABELS[key]}), world space. "
-            "Drag its handle in the viewport or type a value here."
-        ),
-        size=3,
-        subtype="TRANSLATION",
-        default=LM_DEFAULTS[key],
-        update=_on_landmark_changed,
-    )
-
-
-def _landmark_rotation_prop(key):
-    from .primary_rig import LM_LABELS
-
-    return FloatVectorProperty(
-        name=f"{LM_LABELS[key]} Rotation",
-        description=(
-            f"Orientation of the {LM_LABELS[key]} landmark. Supplies the roll "
-            "of the bone starting here and its twist when retargeting"
-        ),
-        size=3,
-        subtype="EULER",
-        default=(0.0, 0.0, 0.0),
-        update=_on_landmark_changed,
-    )
-
-
-def _landmark_use_rotation_prop(key):
-    from .primary_rig import LM_LABELS
-
-    return BoolProperty(
-        name=f"{LM_LABELS[key]} Rotation",
-        description=(
-            "Adjust this landmark's rotation as well as its position. Off by "
-            "default: the handle is position-only until this is enabled"
-        ),
-        default=False,
-        update=_on_marker_rotation_toggled,
-    )
 
 
 def _slug(text):
@@ -1434,7 +1374,7 @@ def _on_marker_name_changed(self, context):
 
 def _on_marker_use_rotation_changed(self, context):
     """Rotation enabled/disabled on one marker: re-lock and redraw its handle,
-    then rebuild (roll and retarget twist both change)."""
+    then rebuild -- an oriented marker also turns the control it poses."""
     from .primary_rig import (
         apply_marker_locks,
         find_marker_empties,
@@ -1481,8 +1421,8 @@ class SkeletonMarker(bpy.types.PropertyGroup):
     rotation: FloatVectorProperty(
         name="Rotation",
         description=(
-            "Orientation of the marker. Supplies the roll of a bone placed "
-            "here and its twist when retargeting"
+            "Orientation of the marker. When enabled, a Custom Shape node "
+            "wired to this marker also takes its rotation from it"
         ),
         size=3,
         default=(0.0, 0.0, 0.0),
@@ -1528,20 +1468,15 @@ class SkeletonNode(ArmatureNodeBase, Node):
     """Marker skeleton: any number of named, draggable markers.
 
     A marker is a world position (plus an optional orientation) with a stable
-    key, drawn in the viewport as a grabbable handle. Markers are user-defined
-    -- the node starts empty and you add as many as the rig needs. Each one
-    gets its own output socket, so a marker can be wired straight into a
-    Custom Shape node to place that bone.
+    key, drawn in the viewport as a grabbable handle. The node's output IS its
+    markers: one socket each, wired straight into a Custom Shape node's Marker
+    input to place that bone. There is no bone output -- the node holds and
+    shapes markers, and Custom Shape nodes turn them into rig.
 
-    MediaPipe's 33 pose landmarks are a *preset*, not the node's structure:
-    loading it creates 33 markers whose keys match the landmark names, which
-    is what the Skeleton / Rig outputs and the retarget table key off. Without
-    it the node is still perfectly usable for hand-placed markers; only the
-    two skeleton outputs need the preset's landmarks to produce anything.
-
-    Outputs: one *Marker* socket per marker, plus *Skeleton* (the 22 bones
-    themselves, wire into an Armature Output) and *Rig* (the same skeleton as
-    a pose, wire into an Armature Input to drive an existing rig).
+    A new node starts with MediaPipe's 33 pose landmarks loaded, because that
+    is the useful starting point for a body. They are only a preset: rename
+    them, delete the ones you do not want, and add as many of your own as the
+    rig needs.
     """
 
     bl_idname = "ArmatureNodesPrimaryRigNode"  # unchanged: saved files use it
@@ -1550,7 +1485,6 @@ class SkeletonNode(ArmatureNodeBase, Node):
 
     markers: bpy.props.CollectionProperty(type=SkeletonMarker)
     active_marker: IntProperty(name="Active Marker", default=0)
-    markers_migrated: BoolProperty(default=False, options={"HIDDEN"})
 
     lock_depth: BoolProperty(
         name="Lock Depth (2D)",
@@ -1583,21 +1517,31 @@ class SkeletonNode(ArmatureNodeBase, Node):
     show_advanced: BoolProperty(name="Advanced", default=False)
 
     def init(self, context):
-        self.inputs.new(BoneSocket.bl_idname, "Parent")
-        self.outputs.new(ChainSocket.bl_idname, "Skeleton")
-        self.outputs.new(PoseSocket.bl_idname, "Rig")
         self.width = 320
+        # The 33 MediaPipe landmarks are the default body: a new node is
+        # immediately useful, and unwanted markers are deleted rather than
+        # 33 of them added by hand.
+        self.load_mediapipe_preset()
 
     def ensure_sockets(self):
-        """Migrate nodes saved before the Skeleton / Rig split, then bring the
-        per-marker sockets in line with the marker list."""
-        old = self.outputs.get("Bones")
-        if old is not None and self.outputs.get("Skeleton") is None:
-            old.name = "Skeleton"
-        if self.outputs.get("Skeleton") is None:
-            self.outputs.new(ChainSocket.bl_idname, "Skeleton")
-        if self.outputs.get("Rig") is None:
-            self.outputs.new(PoseSocket.bl_idname, "Rig")
+        """Drop the bone sockets older versions had, then bring the per-marker
+        sockets in line with the marker list.
+
+        *Skeleton* and *Rig* used to emit a 22-bone body built from the
+        MediaPipe landmarks, and *Parent* re-rooted it. The node's output is
+        its markers now, so those go on sight -- along with their links, which
+        no longer mean anything. The bl_idname check matters: a marker is free
+        to be called "Skeleton", and its socket must survive.
+        """
+        from .sockets import MarkerSocket
+
+        for name in ("Skeleton", "Rig", "Bones"):
+            sock = self.outputs.get(name)
+            if sock is not None and sock.bl_idname != MarkerSocket.bl_idname:
+                self.outputs.remove(sock)
+        parent = self.inputs.get("Parent")
+        if parent is not None:
+            self.inputs.remove(parent)
         self.sync_marker_sockets()
 
     def free(self):
@@ -1608,16 +1552,6 @@ class SkeletonNode(ArmatureNodeBase, Node):
         except Exception as exc:  # noqa: BLE001
             print(f"[Armature Nodes] Could not clean up marker handles: {exc}")
         self.schedule_rebuild()
-
-    def copy(self, node):
-        """A duplicated node must not adopt the original handles.
-
-        The marker collection copies by value, but the viewport empties are
-        tagged with the source node name, so without this the copy would find
-        no handles of its own and both nodes would fight over one set. Marking
-        the copy as migrated also stops the legacy import running on it.
-        """
-        self.markers_migrated = True
 
     # -- Marker list ----------------------------------------------------------
 
@@ -1678,9 +1612,9 @@ class SkeletonNode(ArmatureNodeBase, Node):
     def load_mediapipe_preset(self, replace=True):
         """Fill the marker list with MediaPipe's 33 pose landmarks.
 
-        Keys are the landmark keys, which is what makes the Skeleton / Rig
-        outputs and the whole retarget table resolve. Markers the user added
-        themselves are kept when ``replace`` is False.
+        A body laid out at 1.8 m in a T-pose, ready to be dragged onto the
+        character. Markers the user added themselves are kept when ``replace``
+        is False.
         """
         from .primary_rig import LANDMARKS, LM_LABELS
 
@@ -1696,56 +1630,10 @@ class SkeletonNode(ArmatureNodeBase, Node):
             marker.name = LM_LABELS[key]
             marker.set_position(default)
             added += 1
-        self.markers_migrated = True
         self.active_marker = 0
         self.sync_marker_sockets()
         self.refresh_handles()
         return added
-
-    def ensure_markers(self):
-        """One-time import of landmarks stored by pre-marker-list versions.
-
-        Files saved when the 33 landmarks were fixed node properties keep
-        their values in the legacy ``lm_*`` properties. If this node has no
-        markers yet but those values were moved off their defaults, the user
-        placed them, so bring them across instead of silently starting empty.
-        """
-        if self.markers_migrated or len(self.markers):
-            return False
-        from .primary_rig import (
-            LANDMARKS,
-            LM_DEFAULTS,
-            LM_LABELS,
-            LM_PROP,
-            LM_ROT_PROP,
-            LM_USE_ROT_PROP,
-        )
-
-        placed = False
-        for key in LM_PROP:
-            current = getattr(self, LM_PROP[key], None)
-            if current is None:
-                continue
-            if (Vector(current) - Vector(LM_DEFAULTS[key])).length > 1e-6:
-                placed = True
-                break
-        self.markers_migrated = True
-        if not placed:
-            return False  # untouched defaults: the node legitimately starts empty
-
-        for _idx, key, _label, _side, default in LANDMARKS:
-            marker = self.markers.add()
-            marker.key = key
-            marker.name = LM_LABELS[key]
-            marker.set_position(getattr(self, LM_PROP[key], default))
-            marker.set_rotation(getattr(self, LM_ROT_PROP[key], (0.0, 0.0, 0.0)))
-            marker.use_rotation = bool(getattr(self, LM_USE_ROT_PROP[key], False))
-        self.sync_marker_sockets()
-        print(
-            f"[Armature Nodes] Imported 33 placed landmarks into "
-            f"'{self.name}' as markers"
-        )
-        return True
 
     def sync_marker_sockets(self):
         """One output socket per marker, bound by ``marker_key``.
@@ -1790,21 +1678,6 @@ class SkeletonNode(ArmatureNodeBase, Node):
             return Vector(marker.position)
         return Vector(LM_DEFAULTS.get(key, (0.0, 0.0, 0.0)))
 
-    def landmarks(self):
-        """MediaPipe landmark positions this node actually carries."""
-        from .primary_rig import LM_KEYS
-
-        have = set(self.marker_keys())
-        return {k: self.landmark(k) for k in LM_KEYS if k in have}
-
-    def has_full_skeleton(self):
-        """True when every MediaPipe landmark is present, i.e. the preset is
-        loaded and the Skeleton / Rig outputs can produce bones."""
-        from .primary_rig import LM_KEYS
-
-        have = set(self.marker_keys())
-        return all(k in have for k in LM_KEYS)
-
     def marker_uses_rotation(self, key):
         marker = self.marker_by_key(key)
         return bool(marker and marker.use_rotation)
@@ -1814,12 +1687,6 @@ class SkeletonNode(ArmatureNodeBase, Node):
         if marker is None:
             return Vector((0.0, 0.0, 0.0))
         return Vector(marker.rotation)
-
-    def marker_rotations(self):
-        """Euler per marker, only for the markers with rotation enabled."""
-        return {
-            m.key: tuple(m.rotation) for m in self.markers if m.key and m.use_rotation
-        }
 
     def set_landmarks(self, values, rotations=None, push=True):
         """Write several markers at once without per-property rebuilds."""
@@ -2005,7 +1872,6 @@ class SkeletonNode(ArmatureNodeBase, Node):
     def draw_buttons(self, context, layout):
         from .primary_rig import GROUP_ANCHOR, is_landmark
 
-        self.ensure_markers()
         self.ensure_sockets()
         layout.context_pointer_set("node", self)
 
@@ -2079,8 +1945,6 @@ class SkeletonNode(ArmatureNodeBase, Node):
         )
         if self.show_advanced:
             box = layout.box()
-            if not self.has_full_skeleton():
-                box.label(text="Skeleton / Rig need the MediaPipe preset", icon="INFO")
             box.prop(self, "mirror_center_x")
             row = box.row(align=True)
             row.operator(
@@ -2095,63 +1959,15 @@ class SkeletonNode(ArmatureNodeBase, Node):
                 icon="TRASH",
             )
 
-    # -- Evaluation -----------------------------------------------------------
-
-    def _skeleton_bones(self):
-        """The 22-bone skeleton.
-
-        Empty unless every MediaPipe landmark is present: the bone builder
-        maps landmark keys onto named bones, so a partial set would emit a
-        half-built skeleton with bones in the wrong place rather than an
-        obvious nothing.
-        """
-        from .primary_rig import primary_rig_bones
-
-        if not self.has_full_skeleton():
-            return []
-        landmarks = self.landmarks()
-        floor_z = min(v.z for v in landmarks.values())
-        return primary_rig_bones(
-            landmarks,
-            self.effective_height(),
-            floor_z,
-            rotations=self.marker_rotations(),
-        )
-
-    def eval_bones(self, ctx):
-        """Skeleton output: the marker skeleton, optionally re-rooted."""
-        parents = gather_input_bones(self, "Parent", ctx)
-        bones = self._skeleton_bones()
-        if parents:
-            root = parents[-1].name
-            for b in bones:
-                if b.parent is None:
-                    b.parent = root
-        return [copy_bone(b) for b in parents] + bones
-
-    def eval_pose(self, ctx):
-        """Rig output: the skeleton as a pose to drive an existing rig with.
-
-        No parent re-rooting here -- the rig owns its own hierarchy; only the
-        bone transforms are handed over.
-        """
-        return self._skeleton_bones()
+    # No eval_bones / eval_pose: this node produces markers, not bones.
+    # The bones come from the Custom Shape nodes the markers are wired
+    # into, which is the whole point of the marker sockets.
 
 
 # Old name kept so existing imports and any user scripts keep working.
 PrimaryRigNode = SkeletonNode
 
-def _add_landmark_properties(cls):
-    """Position, rotation and rotation-enabled properties per landmark."""
-    from .primary_rig import LM_KEYS, LM_PROP, LM_ROT_PROP, LM_USE_ROT_PROP
 
-    for key in LM_KEYS:
-        cls.__annotations__[LM_PROP[key]] = _landmark_prop(key)
-        cls.__annotations__[LM_ROT_PROP[key]] = _landmark_rotation_prop(key)
-        cls.__annotations__[LM_USE_ROT_PROP[key]] = _landmark_use_rotation_prop(key)
-
-
-_add_landmark_properties(PrimaryRigNode)
 
 # ---------------------------------------------------------------------------
 # Constraints
@@ -2331,50 +2147,6 @@ def _poll_armature_object(self, obj):
     return obj.type == "ARMATURE"
 
 
-def _skeleton_bone_items(self, context):
-    """Every bone the marker skeleton can emit, for the override dropdown."""
-    from .primary_rig import skeleton_key_map
-
-    items = [("", "Skeleton Bone...", "")]
-    for name in sorted(skeleton_key_map()):
-        items.append((name, name, f"Override the control matched to {name}"))
-    return items
-
-
-def _on_override_changed(self, context):
-    tree = self.id_data
-    if tree is not None and hasattr(tree, "mark_dirty"):
-        tree.mark_dirty()
-
-
-class BoneOverride(bpy.types.PropertyGroup):
-    """One manual skeleton-bone -> control-bone pairing.
-
-    Takes priority over the automatic match table for that bone, whether or
-    not the automatic match found something: the table's first choice is not
-    always the control you want driven.
-    """
-
-    skeleton_bone: EnumProperty(
-        name="Skeleton Bone",
-        description="Marker-skeleton bone whose match is being overridden",
-        items=_skeleton_bone_items,
-        update=_on_override_changed,
-    )
-    target_bone: StringProperty(
-        name="Control Bone",
-        description="Bone on the rig to drive instead of the automatic match",
-        default="",
-        update=_on_override_changed,
-    )
-    enabled: BoolProperty(
-        name="Enabled",
-        description="Use this override",
-        default=True,
-        update=_on_override_changed,
-    )
-
-
 class ArmatureInputNode(ArmatureNodeBase, Node):
     """Entry point for the reverse direction: references a source armature.
 
@@ -2384,9 +2156,9 @@ class ArmatureInputNode(ArmatureNodeBase, Node):
     armature makes the rig the source of truth and the graph looks frozen --
     each rebuild overwrites node edits with the armature's current state.
 
-    Add it by hand for the one job it is still needed for: retargeting, i.e.
-    driving an existing rig's controls from a Primary Rig wired into the
-    Skeleton input.
+    It is still the way to pull an existing armature's bones INTO a graph
+    that builds a different rig, which is the one case where re-reading the
+    source is what you want.
     """
 
     bl_idname = "ArmatureNodesInputNode"
@@ -2410,48 +2182,19 @@ class ArmatureInputNode(ArmatureNodeBase, Node):
         default=False,
     )
 
-    retarget_mode: EnumProperty(
-        name="Drive Mode",
-        description=(
-            "Which control chain the marker skeleton drives. FK maps one "
-            "skeleton bone onto one FK control; IK drives the hand/foot IK "
-            "controls and places the elbow/knee pole targets"
-        ),
-        items=(
-            ("FK", "FK", "Drive the FK controls (upper_arm_fk, thigh_fk, ...)"),
-            ("IK", "IK", "Drive the IK controls and pole targets"),
-        ),
-        default="FK",
-    )
-    retarget_enabled: BoolProperty(
-        name="Drive Rig",
-        description=(
-            "Apply the wired-in marker skeleton to this rig's controls on "
-            "every update"
-        ),
-        default=True,
-    )
-    retarget_switch_ikfk: BoolProperty(
-        name="Set IK/FK Switch",
-        description=(
-            "Also set Rigify's IK/FK slider on each limb so the driven chain "
-            "is the one the rig follows"
-        ),
-        default=True,
-    )
-    bone_overrides: bpy.props.CollectionProperty(type=BoneOverride)
-    show_overrides: BoolProperty(name="Bone Overrides", default=False)
-    match_report: StringProperty(name="Match", default="", options={"HIDDEN"})
-
     def init(self, context):
         self.outputs.new(ChainSocket.bl_idname, "Bones")
-        self.inputs.new(PoseSocket.bl_idname, "Skeleton")
         self.width = 220
 
     def ensure_sockets(self):
-        """Migrate nodes saved before the Skeleton input existed."""
-        if self.inputs.get("Skeleton") is None:
-            self.inputs.new(PoseSocket.bl_idname, "Skeleton")
+        """Drop the Skeleton input that drove the retarget.
+
+        Retargeting a marker skeleton onto a rig is gone: markers drive
+        controls directly through the Custom Shape nodes they are wired into.
+        """
+        sock = self.inputs.get("Skeleton")
+        if sock is not None:
+            self.inputs.remove(sock)
 
     @property
     def snapshot(self):
@@ -2469,113 +2212,10 @@ class ArmatureInputNode(ArmatureNodeBase, Node):
         self.snapshot_name = obj.name
         return True
 
-    # -- Retarget (Skeleton input -> this rig's controls) ---------------------
-
-    @property
-    def overrides(self):
-        """skeleton bone name -> control bone name, for the enabled rows."""
-        return {
-            ov.skeleton_bone: ov.target_bone
-            for ov in self.bone_overrides
-            if ov.enabled and ov.skeleton_bone and ov.target_bone
-        }
-
-    def add_override(self, skeleton_bone="", target_bone=""):
-        item = self.bone_overrides.add()
-        if skeleton_bone:
-            item.skeleton_bone = skeleton_bone
-        item.target_bone = target_bone
-        return item
-
-    def fill_overrides_from_matches(self, ctx):
-        """Create a row for every bone the auto-match resolved, so any of them
-        can be re-pointed -- not just the ones that failed."""
-        from .retarget import match_bones
-
-        obj = self.source
-        bones = self.pose_bones_in(ctx)
-        if obj is None or not bones:
-            return 0
-        existing = {ov.skeleton_bone for ov in self.bone_overrides}
-        matches, _unmatched = match_bones(obj, bones, self.retarget_mode, {})
-        added = 0
-        for bdef, pbone, _key in matches:
-            if bdef.name in existing:
-                continue
-            self.add_override(bdef.name, pbone.name)
-            added += 1
-        return added
-
-    def pose_bones_in(self, ctx):
-        """BoneDefs from every Primary Rig wired into the Skeleton input."""
-        sock = self.inputs.get("Skeleton")
-        if sock is None:
-            return []
-        bones = []
-        for link in sock.links:
-            if not link.is_valid:
-                continue
-            node = link.from_node
-            if hasattr(node, "eval_pose"):
-                bones.extend(node.eval_pose(ctx))
-        return bones
-
-    def apply_retarget(self, ctx):
-        """Drive ``self.source`` from the wired-in marker skeleton.
-
-        This is what makes the Rig output the default rigging path: it runs
-        automatically at the end of every build / live update, with no
-        operator to press.
-        """
-        from .retarget import apply_pose
-
-        if not self.retarget_enabled:
-            return 0
-        obj = self.source
-        if obj is None or obj.type != "ARMATURE":
-            return 0
-        bones = self.pose_bones_in(ctx)
-        if not bones:
-            return 0
-        applied, unmatched = apply_pose(
-            obj,
-            bones,
-            mode=self.retarget_mode,
-            overrides=self.overrides,
-            set_switches=self.retarget_switch_ikfk,
-        )
-        report = f"{applied}/{applied + len(unmatched)} bones"
-        if unmatched:
-            report += " | unmatched: " + ", ".join(unmatched)
-        if self.match_report != report:
-            self.match_report = report
-        return applied
-
     def draw_buttons(self, context, layout):
         self.ensure_sockets()
         layout.context_pointer_set("node", self)
         layout.prop(self, "source")
-        sock = self.inputs.get("Skeleton")
-        if sock is not None and sock.is_linked:
-            box = layout.box()
-            row = box.row(align=True)
-            row.prop(self, "retarget_enabled", text="")
-            row.prop(self, "retarget_mode", expand=True)
-            box.prop(self, "retarget_switch_ikfk")
-            if self.match_report:
-                icon = "ERROR" if "unmatched" in self.match_report else "CHECKMARK"
-                box.label(text=self.match_report.split(" | ")[0], icon=icon)
-                if "unmatched" in self.match_report:
-                    col = box.column(align=True)
-                    col.scale_y = 0.8
-                    for name in self.match_report.split("unmatched: ")[1].split(", "):
-                        row = col.row(align=True)
-                        row.label(text=name, icon="DOT")
-                        op = row.operator(
-                            "armature_nodes.add_bone_override", text="", icon="ADD"
-                        )
-                        op.skeleton_bone = name.split(" (")[0]
-            self._draw_overrides(box)
         snap = self.snapshot
         row = layout.row(align=True)
         if snap:
@@ -2587,39 +2227,6 @@ class ArmatureInputNode(ArmatureNodeBase, Node):
             row.label(text="No snapshot stored", icon="INFO")
         if snap and self.source:
             layout.prop(self, "use_snapshot")
-
-    def _draw_overrides(self, layout):
-        row = layout.row(align=True)
-        row.prop(
-            self,
-            "show_overrides",
-            icon="TRIA_DOWN" if self.show_overrides else "TRIA_RIGHT",
-            emboss=False,
-        )
-        row.label(text=str(len(self.bone_overrides)) if self.bone_overrides else "")
-        if not self.show_overrides:
-            return
-        box = layout.box()
-        obj = self.source
-        for index, ov in enumerate(self.bone_overrides):
-            row = box.row(align=True)
-            row.prop(ov, "enabled", text="")
-            sub = row.row(align=True)
-            sub.enabled = ov.enabled
-            sub.prop(ov, "skeleton_bone", text="")
-            if obj is not None and obj.type == "ARMATURE":
-                # Searchable dropdown of the rig's actual bones.
-                sub.prop_search(ov, "target_bone", obj.data, "bones", text="")
-            else:
-                sub.prop(ov, "target_bone", text="")
-            row.operator(
-                "armature_nodes.remove_bone_override", text="", icon="X"
-            ).index = index
-        row = box.row(align=True)
-        row.operator("armature_nodes.add_bone_override", text="Add", icon="ADD")
-        row.operator(
-            "armature_nodes.fill_bone_overrides", text="Fill From Matches", icon="COPYDOWN"
-        )
 
     def copy(self, node):
         """When Blender copies/pastes this node, retain the serialized rig but
@@ -2679,7 +2286,6 @@ class ArmatureInputNode(ArmatureNodeBase, Node):
 
 classes = (
     SkeletonMarker,
-    BoneOverride,
     BoneNode,
     ChainNode,
     MirrorNode,
@@ -2710,15 +2316,11 @@ _NO_REBUILD_PROPS = {
     "show_markers",
     "show_detail",
     "show_advanced",
-    "show_overrides",
     "show_skeleton",
-    "bone_overrides",  # CollectionProperty: does not accept update=
     "markers",  # CollectionProperty: does not accept update=
     "active_marker",
-    "markers_migrated",
     "lock_depth",
     "symmetric",
-    "match_report",
 }
 
 

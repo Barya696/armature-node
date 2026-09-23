@@ -45,14 +45,17 @@ world position (plus an optional orientation) with a stable key, drawn in the
 and shapes markers and nothing else: no mesh analysis, no auto placement, no
 snapping.
 
-The node **starts empty**. Add as many markers as the rig needs:
+A new node comes with **MediaPipe's 33 pose landmarks already loaded** (nose,
+eyes, ears, mouth, shoulders, elbows, wrists, pinky / index / thumb, hips,
+knees, ankles, heels, foot index) — the useful starting point for a body. They
+are only a preset: rename them, delete the ones you do not want, add as many
+of your own as the rig needs.
 
 - **Add Marker** appends one at the 3D cursor, so it lands where you put it
   rather than piling up on the origin.
-- **MediaPipe** loads the 33-landmark preset (nose, eyes, ears, mouth,
-  shoulders, elbows, wrists, pinky / index / thumb, hips, knees, ankles,
-  heels, foot index) as 33 markers. This is a *preset*, not the node's
-  structure — but see *What the preset is for* below.
+- **MediaPipe** reloads the preset. It adds only what is missing, unless you
+  tick *Replace Markers* in the operator panel.
+- **Clear Markers** (under *Advanced*) empties the node.
 - Each marker has a name, a position, an **X** to delete it, and a gimbal
   button that switches it from position-only to position + rotation.
 
@@ -79,101 +82,44 @@ keeps the wire: links attach to the socket, not to its name.
 ### Markers into Custom Shape
 
 The Custom Shape node has a **Marker** input. Wire a marker into it and that
-bone's head snaps to the marker; the tail follows rigidly, so the bone keeps
-the length and direction it already had and only moves. If the marker has
-rotation enabled, the bone is turned with it and takes its roll from it — one
-marker then fully places the control.
+bone is **posed** at the marker: dragging the handle moves the control exactly
+as grabbing it in Pose mode would, and the custom shape follows because
+Blender draws a widget at the posed bone.
 
-The node needs a bone name in its *Bone* field for this: without one there is
-no single bone to place, and nothing moves. While a marker is wired the node's
-*Rest* Head/Tail fields go read-only and are labelled **Rest (marker)**, since
-the marker owns them and a typed edit would be overwritten on the next
-rebuild.
+Markers drive the pose **only**. The rest skeleton stays whatever the graph
+built — a marker never edits Head/Tail, so it cannot deform the rig's
+proportions or fight an Edit-mode change. Concretely:
 
-### What the preset is for
+- **Location** is always taken from the marker.
+- **Rotation** only when that marker has rotation enabled (the gimbal button);
+  otherwise the control keeps the orientation it had.
+- **Scale** is never touched, so a scaled control stays scaled.
 
-The **Skeleton** and **Rig** outputs, and the whole retarget match table, key
-off the MediaPipe landmark *names*. So those two outputs produce bones only
-when every one of the 33 landmarks is present — i.e. when the preset is
-loaded. A partial set emits nothing rather than a half-built skeleton with
-bones in the wrong places, and the node says so under *Advanced*.
+The node needs a bone name in its *Bone* field: without one there is no single
+bone to pose, and nothing moves. While a marker is wired the node's *Pose*
+Position/Rotation/Scale fields go read-only and are labelled **Pose (marker)**,
+since the marker owns them and a typed edit would be overwritten on the next
+rebuild. The *Rest* Head/Tail fields stay editable.
 
-Markers you add yourself are never part of that skeleton. They exist to be
-wired into Custom Shape nodes, which is a separate job and needs no preset.
+Posing runs as `marker_pose_pass()` at the end of every build, after the bones
+exist and are in place — a bone's pose matrix resolves against its parent's
+evaluated transform, so it cannot run earlier. The pass writes only when a
+value actually differs, so it settles in one iteration instead of rewriting
+the same matrix forever.
 
-### The two skeleton outputs
+### The node has no bone output
 
-- **Skeleton** → wire into an **Armature Output**. The marker skeleton as-is:
-  22 bones (hips, 3 spine bones, neck, head, shoulders, arms, hands, thighs,
-  shins, feet, toes), no rig matching involved. The optional *Parent* input
-  re-roots the whole skeleton under an existing bone.
-- **Rig** → wire into the **Skeleton** input of an **Armature Input** node
-  (added by hand: `Shift+A > Armature I/O > Armature Input`)
-  that points at a generated Rigify rig. The skeleton's bones are matched to
-  that rig's controls by name and the controls are posed to follow the
-  markers. This happens automatically on every update once the link exists —
-  there is no button. Bone names are Blender/Rigify metarig style
-  (`upper_arm.L`, `thigh.R`).
+Markers are the *only* output. Earlier versions also had a **Skeleton** socket
+(a 22-bone body built from the landmark positions), a **Rig** socket (the same
+thing as a pose, for retargeting onto a Rigify rig) and a **Parent** input
+that re-rooted that skeleton. All three are gone, along with the entire
+retarget subsystem they fed — the skeleton-to-Rigify match table, FK/IK drive
+modes, bone overrides and `retarget.py`. Bones come from the Custom Shape
+nodes the markers are wired into, and a marker poses its control directly, so
+none of that indirection is needed.
 
-### Bone matching (skeleton → Rigify rig)
-
-The match targets **control bones**, not `DEF-`/`ORG-`. In a generated rig
-every `DEF-` bone carries a Copy Transforms / Stretch To constraint from
-`ORG-`/`MCH-`, and `ORG-` bones are themselves constrained to the controls, so
-a pose written into either layer is overwritten on the next depsgraph
-evaluation. Controls are the only unconstrained, writable layer. `ORG-` and
-`DEF-` names are kept only as fallbacks, for hand-made or non-Rigify rigs
-where the control names are absent.
-
-FK is the default drive mode: one FK control per skeleton bone, unambiguous.
-IK is opt-in on the Armature Input node; there the hands and feet drive the
-`*_ik` controls and the elbow / knee markers place the pole targets. Either
-way the node can flip Rigify's IK/FK slider so the driven chain is the one
-the rig follows.
-
-| Skeleton bone | Control (first match wins) | Fallbacks |
-| --- | --- | --- |
-| `hips` | `torso` (location + rotation) | `hips`, `ORG-spine`, `DEF-spine` |
-| `spine` | `tweak_spine.001` | `spine_fk.001`, `ORG-spine.001`, `DEF-spine.001` |
-| `spine.001` | `tweak_spine.002` | `spine_fk.002`, `ORG-spine.002`, `DEF-spine.002` |
-| `spine.002` | `chest` | `tweak_spine.003`, `ORG-spine.003`, `DEF-spine.003` |
-| `neck` | `neck` | `tweak_spine.004`, `ORG-spine.004`, `DEF-spine.004` |
-| `head` | `head` | `tweak_spine.005`, `ORG-spine.005`, `DEF-spine.005` |
-| `shoulder.{L,R}` | `shoulder.{S}` | `ORG-shoulder.{S}`, `DEF-shoulder.{S}` |
-| `upper_arm.{L,R}` | `upper_arm_fk.{S}` *(IK: `upper_arm_ik.{S}`)* | `ORG-upper_arm.{S}`, `DEF-upper_arm.{S}` |
-| `forearm.{L,R}` | `forearm_fk.{S}` *(IK: pole `upper_arm_ik_target.{S}`)* | `ORG-forearm.{S}`, `DEF-forearm.{S}` |
-| `hand.{L,R}` | `hand_fk.{S}` *(IK: `hand_ik.{S}`, location + rotation)* | `ORG-hand.{S}`, `DEF-hand.{S}` |
-| `thigh.{L,R}` | `thigh_fk.{S}` *(IK: `thigh_ik.{S}`)* | `ORG-thigh.{S}`, `DEF-thigh.{S}` |
-| `shin.{L,R}` | `shin_fk.{S}` *(IK: pole `thigh_ik_target.{S}`)* | `ORG-shin.{S}`, `DEF-shin.{S}` |
-| `foot.{L,R}` | `foot_fk.{S}` *(IK: `foot_ik.{S}`)* | `ORG-foot.{S}`, `DEF-foot.{S}` |
-| `toe.{L,R}` | `toe_fk.{S}` | `toe.{S}` (pre-0.6.3 rigs), `ORG-toe.{S}`, `DEF-toe.{S}` |
-| `thumb.{L,R}` (optional) | `thumb.01.{S}` | `ORG-thumb.01.{S}`, `DEF-thumb.01.{S}` |
-
-Never driven: `root`, `foot_heel_ik.*`, the finger controls
-(`f_index.*`, `f_middle.*`, `f_ring.*`, `f_pinky.*`, `palm.*`) and face
-controls. Three MediaPipe points per hand cannot solve per-phalanx rotations,
-so fingers stay with the animator; add them by hand through the node's
-override map if you need them.
-
-Only `hips` (and, in IK mode, the hand / foot / pole controls) drives
-*location* — everything else is rotation-only, so the rig keeps its own
-proportions instead of being stretched onto the markers. Control scale is
-preserved. Poses are applied parent-before-child with a view-layer flush per
-hierarchy level, which Blender requires or children inherit stale parents.
-
-The Armature Input node reports `22/22 bones` and lists any skeleton bone it
-could not match, so a rig with non-standard names tells you exactly what to
-override.
-
-**Manual overrides.** Any pairing can be re-pointed, not just the failures:
-the *Bone Overrides* list on the Armature Input node takes a skeleton bone and
-a control bone (searchable against the rig's actual bone list) and wins over
-the table for that bone. *Fill From Matches* writes out a row per resolved
-bone so you can edit the whole mapping, *Add* starts an empty row, and each
-unmatched bone in the report has a `+` that pre-fills a row for it. A row can
-be disabled with its checkbox without deleting it. An override naming a bone
-the rig does not have is reported as unmatched rather than quietly falling
-back to the automatic choice — a manual mapping is a decision, not a hint.
+Those sockets are stripped from older saved nodes on sight, along with their
+links.
 
 ## Programmatic use (zero UI)
 
@@ -196,23 +142,23 @@ obj = build_armature_from_tree(tree)   # or: bpy.ops.armature_nodes.build(tree_n
 | File | Contents |
 | --- | --- |
 | `core.py` | `BoneDef` / `ConstraintDef` intermediate model, eval context, memoization |
-| `sockets.py` | Bone, Chain, Armature, Pose, Constraint, Transform, Float, Vector, Bool sockets |
+| `sockets.py` | Bone, Chain, Marker, Constraint sockets |
 | `tree.py` | `ArmatureNodeTree` data-block, dirty tracking, optional live update |
 | `nodes.py` | Bone, Chain, Mirror, Parent, Deform Group, Custom Shape, Skeleton, IK / generic constraint, Armature Output / Input nodes |
-| `primary_rig.py` | Marker empties and locks, viewport overlay, MediaPipe landmark tables (the Skeleton node preset), skeleton generation |
-| `retarget.py` | Skeleton bone -> Rigify control mapping table, name matching with fallbacks, pose application (FK / IK) |
+| `primary_rig.py` | Marker empties and locks, viewport overlay, MediaPipe landmark preset tables, marker operators |
 | `widgets.py` | `WGTS_rig` widget library: finds/creates the hidden collection, lists `WGT-rig_*` meshes, generates Rigify-style presets (circle, cube, sphere, bone, diamond, root, gear, ...) |
-| `build.py` | Forward compile: topological eval → edit-mode pass → pose-mode pass, in-place rebuild by name, single undo step |
+| `build.py` | Forward compile: topological eval → edit-mode pass → pose-mode pass → marker pose pass, in-place rebuild by name, single undo step |
 | `decompile.py` | Reverse: bone walk, chain-pattern collapsing, constraint node emission, depth-grid layout |
 | `operators.py` | `armature_nodes.build`, `armature_nodes.decompile` |
 | `ui.py` | Shift+A categories, header buttons, N-panel sidebar |
 
 ### Execution model notes
 
-- **Retarget** is a third pass at the end of the build: every Armature
-  Input node with something wired into its Skeleton input drives its rig's
-  controls. A graph that *only* retargets (Skeleton -> Armature Input,
-  no Armature Output) is valid and skips the compile entirely.
+- **Marker posing** is a third pass at the end of the build: every Custom
+  Shape node with a marker wired in poses its control. It runs last because a
+  pose matrix resolves against the parent's *evaluated* transform, so the
+  bones have to exist and be placed first. It writes only on a real
+  difference, so it settles in one pass.
 - **Forward** is two-pass because Blender requires it: edit bones first,
   pose-bone constraints second. Rebuilds match by bone name and update the
   existing armature object in place instead of duplicating.
@@ -272,8 +218,9 @@ obj = build_armature_from_tree(tree)   # or: bpy.ops.armature_nodes.build(tree_n
   which made the armature -- not the graph -- the source of truth: node edits
   were overwritten on the next rebuild and the graph appeared frozen. Each
   Custom Shape node already stores its bone in full, so it drives the rig on
-  its own. Add an Armature Input by hand (Shift+A > Armature I/O) only when
-  you want to retarget a Skeleton node onto the armature.
+  its own. An Armature Input is still available by hand (Shift+A > Armature
+  I/O) for the one case it suits: pulling an existing armature's bones INTO a
+  graph that builds a different rig.
   The tradeoff: the Armature Input also held a whole-rig snapshot. Without it
   this graph stores the **control** bones only (each in its Custom Shape
   node), so if the rig object is deleted what rebuilds from the graph is the

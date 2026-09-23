@@ -1,29 +1,26 @@
-"""Primary Rig: MediaPipe Pose landmarks -> marker skeleton.
+"""Skeleton node support: marker handles, locks and the viewport overlay.
 
-The node works with the 33-point MediaPipe Pose topology (nose, eyes, ears,
-mouth, shoulders, elbows, wrists, pinky / index / thumb, hips, knees, ankles,
-heels, foot index) connected by the standard ``POSE_CONNECTIONS`` skeleton,
-which is drawn live in the viewport with MediaPipe's colours (left = orange,
-right = cyan).
+Markers are user-defined: a world position, optionally oriented, with a stable
+key. Each is drawn as a draggable empty in the ``MRKS_rig`` collection and,
+for the MediaPipe ones, joined by the standard ``POSE_CONNECTIONS`` skeleton
+in MediaPipe's colours (left = orange, right = cyan); markers you add
+yourself are drawn in the marker colour.
+
+The 33-point MediaPipe Pose topology below (nose, eyes, ears, mouth,
+shoulders, elbows, wrists, pinky / index / thumb, hips, knees, ankles, heels,
+foot index) is a **preset**, loaded into a new Skeleton node so it starts with
+a usable body. Nothing here depends on it being complete.
 
 Scope: **markers only**. There is no mesh analysis, no auto placement and no
-snapping -- the landmarks are placed by hand (dragged in the viewport or typed
-on the node) and the node turns them into a skeleton. Each landmark can also
-carry a rotation, enabled individually per landmark, which feeds bone roll and
-the retarget twist.
-
-Two consumers:
-
-* ``Skeleton`` output -- the marker skeleton as BoneDefs, wired into an
-  Armature Output node like any other chain.
-* ``Rig`` output -- the same skeleton handed to an Armature Input node, which
-  matches it onto a Rigify rig's controls (see ``retarget.py``).
+snapping -- markers are placed by hand (dragged in the viewport or typed on
+the node). Turning a marker into rig is the Custom Shape node's job: wire a
+marker into one and it poses that control.
 """
 
 import bpy
 from bpy.props import EnumProperty
 from bpy.types import Operator
-from mathutils import Matrix, Vector
+from mathutils import Vector
 
 try:
     import gpu
@@ -32,7 +29,6 @@ except ImportError:  # outside Blender (unit tests)
     gpu = None
     batch_for_shader = None
 
-from .core import BoneDef
 
 MARKER_COLLECTION = "MRKS_rig"
 DEFAULT_HEIGHT = 1.8
@@ -80,19 +76,10 @@ LANDMARKS = (
     (32, "foot_index_r", "Foot Index.R", "R", (-0.115, -0.18, 0.02)),
 )
 LM_KEYS = tuple(lm[1] for lm in LANDMARKS)
-LM_INDEX = {lm[1]: lm[0] for lm in LANDMARKS}
 LM_BY_INDEX = {lm[0]: lm[1] for lm in LANDMARKS}
 LM_LABELS = {lm[1]: lm[2] for lm in LANDMARKS}
 LM_SIDE = {lm[1]: lm[3] for lm in LANDMARKS}
 LM_DEFAULTS = {lm[1]: lm[4] for lm in LANDMARKS}
-LM_PROP = {lm[1]: f"lm_{lm[1]}" for lm in LANDMARKS}
-# Per-landmark rotation: an Euler value plus the toggle that enables it.
-# Rotation is OFF by default everywhere -- markers are position-only until a
-# landmark is explicitly switched to position+rotation.
-LM_ROT_PROP = {lm[1]: f"lmrot_{lm[1]}" for lm in LANDMARKS}
-LM_USE_ROT_PROP = {lm[1]: f"lmuse_{lm[1]}" for lm in LANDMARKS}
-LEFT_KEYS = tuple(k for k in LM_KEYS if LM_SIDE[k] == "L")
-RIGHT_KEYS = tuple(k for k in LM_KEYS if LM_SIDE[k] == "R")
 LM_MIRROR = {}
 for _k in LM_KEYS:
     if _k.endswith("_l"):
@@ -101,10 +88,6 @@ for _k in LM_KEYS:
         LM_MIRROR[_k] = _k[:-2] + "_l"
     else:
         LM_MIRROR[_k] = None
-
-# Backwards-compatible aliases used by the node class.
-MARKER_KEYS, MARKER_LABELS, MARKER_PROP = LM_KEYS, LM_LABELS, LM_PROP
-MARKER_MIRROR, MARKER_DEFAULTS = LM_MIRROR, LM_DEFAULTS
 
 # mp.solutions.pose.POSE_CONNECTIONS
 POSE_CONNECTIONS = (
@@ -128,23 +111,6 @@ RIGID_GROUPS = {
 GROUP_ANCHOR = {m: a for a, members in RIGID_GROUPS.items() for m in members}
 # The joints you actually place; everything else is a rigid-group member.
 PRIMARY_KEYS = tuple(k for k in LM_KEYS if k not in GROUP_ANCHOR)
-
-REGIONS = (
-    ("BODY", "Body", "Shoulders, hips, elbows, wrists, knees, ankles, nose"),
-    ("FACE", "Face", "Eyes, ears, mouth"),
-    ("HANDS", "Hands", "Pinky, index, thumb"),
-    ("FEET", "Feet", "Heels, foot index"),
-    ("ALL", "All", "Every landmark"),
-)
-REGION_KEYS = {
-    "BODY": PRIMARY_KEYS,
-    "FACE": RIGID_GROUPS["nose"],
-    "HANDS": RIGID_GROUPS["wrist_l"] + RIGID_GROUPS["wrist_r"],
-    "FEET": RIGID_GROUPS["ankle_l"] + RIGID_GROUPS["ankle_r"],
-    "ALL": LM_KEYS,
-}
-
-# MediaPipe drawing colours (RGBA 0..1).
 COLOR_LEFT = (1.0, 0.54, 0.0, 1.0)
 COLOR_RIGHT = (0.0, 0.85, 0.9, 1.0)
 COLOR_CENTER = (0.92, 0.92, 0.92, 1.0)
@@ -167,124 +133,6 @@ def is_landmark(key):
     return key in LM_SIDE
 
 
-# ---------------------------------------------------------------------------
-# Bone naming
-# ---------------------------------------------------------------------------
-
-# Blender / Rigify-metarig naming is the only scheme: the retarget table in
-# retarget.py keys off these names.
-BONE_NAMES = {
-    "hips": "hips",
-    "spine": "spine",
-    "spine1": "spine.001",
-    "spine2": "spine.002",
-    "neck": "neck",
-    "head": "head",
-    "shoulder": "shoulder.{S}",
-    "upper_arm": "upper_arm.{S}",
-    "forearm": "forearm.{S}",
-    "hand": "hand.{S}",
-    "thumb": "thumb.{S}",
-    "thigh": "thigh.{S}",
-    "shin": "shin.{S}",
-    "foot": "foot.{S}",
-    "toe": "toe.{S}",
-}
-
-# The landmark whose rotation (when enabled) supplies a bone's roll / twist.
-# Keyed by skeleton bone key; ``{s}`` is the lowercase side.
-ROLL_SOURCE = {
-    "head": "nose",
-    "shoulder": "shoulder_{s}",
-    "upper_arm": "shoulder_{s}",
-    "forearm": "elbow_{s}",
-    "hand": "wrist_{s}",
-    "thumb": "wrist_{s}",
-    "thigh": "hip_{s}",
-    "shin": "knee_{s}",
-    "foot": "ankle_{s}",
-    "toe": "foot_index_{s}",
-}
-
-
-def bone_name(key, side=None):
-    """Skeleton bone name for a bone key (and side)."""
-    s = "L" if side == "L" else "R"
-    return BONE_NAMES[key].format(S=s)
-
-
-def skeleton_key_map():
-    """bone name -> (bone key, side) for every bone the skeleton can emit.
-
-    Used by the retarget to look a skeleton bone up in the mapping table
-    without re-deriving names.
-    """
-    out = {}
-    for key, pattern in BONE_NAMES.items():
-        if "{S}" in pattern:
-            for side in ("L", "R"):
-                out[pattern.format(S=side)] = (key, side)
-        else:
-            out[pattern] = (key, None)
-    return out
-
-
-# ---------------------------------------------------------------------------
-# Roll helpers (shared with retarget.py)
-# ---------------------------------------------------------------------------
-
-
-def vec_roll_to_mat3(vec, roll):
-    """Blender's bone orientation matrix for a direction + roll.
-
-    Port of ``vec_roll_to_mat3`` from Blender's armature code: +Y runs along
-    the bone, +Z is the bone's 'up' after applying ``roll``.
-    """
-    nor = Vector(vec)
-    if nor.length < 1e-9:
-        nor = Vector((0.0, 1.0, 0.0))
-    nor = nor.normalized()
-    target = Vector((0.0, 1.0, 0.0))
-    axis = target.cross(nor)
-    if axis.dot(axis) > 1e-10:
-        axis.normalize()
-        theta = target.angle(nor)
-        b_matrix = Matrix.Rotation(theta, 3, axis)
-    else:
-        updown = 1.0 if target.dot(nor) > 0.0 else -1.0
-        b_matrix = Matrix(
-            ((updown, 0.0, 0.0), (0.0, updown, 0.0), (0.0, 0.0, 1.0))
-        )
-    return Matrix.Rotation(roll, 3, nor) @ b_matrix
-
-
-def roll_from_up(head, tail, up):
-    """Roll (radians) that turns a bone's +Z toward ``up``."""
-    nor = (Vector(tail) - Vector(head))
-    if nor.length < 1e-9:
-        return 0.0
-    nor = nor.normalized()
-    u = Vector(up)
-    u = u - nor * u.dot(nor)  # project into the bone's rotation plane
-    if u.length < 1e-6:
-        return 0.0
-    u.normalize()
-    z = vec_roll_to_mat3(nor, 0.0).col[2]
-    angle = z.angle(u, 0.0)
-    if nor.dot(z.cross(u)) < 0.0:
-        angle = -angle
-    return angle
-
-
-def marker_up_vector(euler):
-    """The 'up' (+Z) axis of a landmark's rotation."""
-    return Vector(euler).to_matrix().col[2].normalized()
-
-
-def roll_from_marker(head, tail, euler):
-    return roll_from_up(head, tail, marker_up_vector(euler))
-
-
 def mirror_point(point, mid_x):
     p = Vector(point)
     return Vector((2.0 * mid_x - p.x, p.y, p.z))
@@ -294,107 +142,6 @@ def mirror_rotation(euler):
     """Mirror an Euler rotation across the YZ plane (X axis flip)."""
     x, y, z = euler
     return (x, -y, -z)
-
-
-# ---------------------------------------------------------------------------
-# Skeleton from landmarks
-# ---------------------------------------------------------------------------
-
-
-def primary_rig_bones(m, height, floor_z, rotations=None, fingers=False):
-    """Build the simplified humanoid skeleton as BoneDefs from landmarks.
-
-    ``m`` maps landmark key -> Vector (world space). ``rotations`` maps
-    landmark key -> Euler for the landmarks whose rotation is enabled; those
-    supply the roll of the bones that start at them. The spine runs from the
-    hip midpoint to the shoulder midpoint, the neck to the ear midpoint
-    (lowered to the chin), the hand to the index/pinky midpoint and the foot
-    through the heel / foot-index landmarks.
-    """
-    up = Vector((0.0, 0.0, 1.0))
-    P = {k: Vector(v) for k, v in m.items()}
-    rot = dict(rotations or {})
-    bones = []
-
-    def roll_for(key, side, head, tail):
-        source = ROLL_SOURCE.get(key)
-        if source is None:
-            return 0.0
-        lm_key = source.format(s=(side or "L").lower())
-        euler = rot.get(lm_key)
-        if euler is None:
-            return 0.0
-        return roll_from_marker(head, tail, euler)
-
-    def add(key, head, tail, parent=None, connect=False, side=None):
-        bone = BoneDef(
-            name=bone_name(key, side),
-            head=tuple(head),
-            tail=tuple(tail),
-            roll=roll_for(key, side, head, tail),
-            parent=bone_name(parent, side) if parent else None,
-            use_connect=connect,
-        )
-        bones.append(bone)
-        return bone
-
-    def mid(a, b):
-        return (P[a] + P[b]) / 2.0
-
-    hip_mid = mid("hip_l", "hip_r")
-    shoulder_mid = mid("shoulder_l", "shoulder_r")
-    ear_mid = mid("ear_l", "ear_r")
-    mouth_mid = mid("mouth_l", "mouth_r")
-    eye_mid = mid("eye_l", "eye_r")
-
-    hips_head = hip_mid - up * (0.01 * height)
-    hips_tail = hip_mid + up * (0.07 * height)
-    neck_base = shoulder_mid + up * (0.01 * height)
-    chin = Vector((ear_mid.x, (ear_mid.y + mouth_mid.y) / 2.0, mouth_mid.z - 0.02 * height))
-    head_top = Vector((ear_mid.x, ear_mid.y, eye_mid.z + 0.08 * height))
-
-    add("hips", hips_head, hips_tail)
-    prev, a = "hips", hips_tail
-    for i, key in enumerate(("spine", "spine1", "spine2")):
-        b = hips_tail.lerp(neck_base, (i + 1) / 3.0)
-        add(key, a, b, parent=prev, connect=True)
-        prev, a = key, b
-    add("neck", neck_base, chin, parent="spine2", connect=True)
-    add("head", chin, head_top, parent="neck", connect=True)
-
-    fwd = Vector((0.0, -1.0, 0.0))
-    for side, sign in (("L", 1.0), ("R", -1.0)):
-        s = side.lower()
-        shoulder = P[f"shoulder_{s}"]
-        elbow, wrist = P[f"elbow_{s}"], P[f"wrist_{s}"]
-        hand_tip = mid(f"index_{s}", f"pinky_{s}")
-        hip, knee, ankle = P[f"hip_{s}"], P[f"knee_{s}"], P[f"ankle_{s}"]
-        heel, toe_tip = P[f"heel_{s}"], P[f"foot_index_{s}"]
-
-        shoulder_head = neck_base + Vector((sign * 0.02 * height, 0.0, -0.01 * height))
-        add("shoulder", shoulder_head, shoulder, parent="spine2", side=side)
-        add("upper_arm", shoulder, elbow, parent="shoulder", connect=True, side=side)
-        add("forearm", elbow, wrist, parent="upper_arm", connect=True, side=side)
-        if (hand_tip - wrist).length < 1e-4:
-            d = wrist - elbow
-            hand_tip = wrist + (d.normalized() if d.length > 1e-6 else Vector((sign, 0, 0))) * (0.09 * height)
-        add("hand", wrist, hand_tip, parent="forearm", connect=True, side=side)
-        if fingers:
-            thumb = P[f"thumb_{s}"]
-            if (thumb - wrist).length > 1e-4:
-                add("thumb", wrist, thumb, parent="hand", side=side)
-
-        add("thigh", hip, knee, parent="hips", side=side)
-        add("shin", knee, ankle, parent="thigh", connect=True, side=side)
-        ball = heel.lerp(toe_tip, 0.7)
-        if (ball - ankle).length < 1e-4:
-            ball = ankle + fwd * (0.1 * height) - up * (0.04 * height)
-        add("foot", ankle, ball, parent="shin", connect=True, side=side)
-        toe_end = toe_tip if (toe_tip - ball).length > 1e-4 else ball + fwd * (0.05 * height)
-        add("toe", ball, toe_end, parent="foot", connect=True, side=side)
-
-    return bones
-
 
 # ---------------------------------------------------------------------------
 # Landmark handles (draggable empties)
@@ -766,9 +513,8 @@ class ARMATURE_OT_skeleton_remove_marker(Operator):
 class ARMATURE_OT_skeleton_load_preset(Operator):
     """Fill this Skeleton node with MediaPipe's 33 pose landmarks.
 
-    The Skeleton and Rig outputs and the whole retarget table key off these
-    landmark names, so this preset is what turns a bag of markers back into a
-    drivable body skeleton."""
+    A 1.8 m T-pose body, ready to drag onto the character. Adds only what is
+    missing unless Replace Markers is ticked."""
 
     bl_idname = "armature_nodes.skeleton_load_preset"
     bl_label = "Load MediaPipe Preset"

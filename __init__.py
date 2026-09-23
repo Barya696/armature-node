@@ -23,7 +23,45 @@ bl_info = {
 }
 
 
+# Import order is dependency order: nodes holds references to classes from
+# sockets and core, so a stale sockets module would hand nodes the old socket
+# classes.
+_SUBMODULES = (
+    "core",
+    "sockets",
+    "tree",
+    "snapshot",
+    "primary_rig",
+    "nodes",
+    "build",
+    "decompile",
+    "operators",
+    "ui",
+    "sync",
+)
+
+
+def _reload_submodules():
+    """Re-read edited source files before registering.
+
+    Without this, editing the addon and toggling it off/on in Preferences (or
+    hitting Reload Scripts) changes nothing: ``from . import nodes`` returns
+    whatever is already in ``sys.modules``, so Blender keeps running the code
+    it loaded the first time and the addon looks like it never changed.
+
+    Only reloads modules already imported, so the first enable is untouched.
+    """
+    import importlib
+    import sys
+
+    for name in _SUBMODULES:
+        module = sys.modules.get(f"{__name__}.{name}")
+        if module is not None:
+            importlib.reload(module)
+
+
 def register():
+    _reload_submodules()
     from . import sockets, tree, nodes, operators, primary_rig, ui, sync
 
     sockets.register()

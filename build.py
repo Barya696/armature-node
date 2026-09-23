@@ -362,24 +362,32 @@ def _shapes_only_pass(obj, bone_defs):
     return applied
 
 
-def retarget_pass(tree):
-    """Drive every rig wired to a marker skeleton.
+def marker_pose_pass(tree, obj):
+    """Pose every controller whose Custom Shape node has a marker wired in.
 
-    Runs after the bones exist, because posing a control needs the armature
-    to be evaluated. An Armature Input node with nothing in its Skeleton
-    input is a no-op, so this costs nothing on graphs that do not retarget.
+    Runs after the bones exist and are in place, because posing a bone writes
+    a matrix resolved against its parent's evaluated transform. Markers drive
+    the POSE only: rest geometry stays whatever the graph built, and moving a
+    marker moves the control the way grabbing it in Pose mode would.
+
+    A Custom Shape node with no marker wired in is skipped, so this costs
+    nothing on graphs that do not use markers.
     """
-    ctx = EvalContext()
+    if obj is None or obj.type != "ARMATURE":
+        return 0
     applied = 0
     for node in tree.nodes:
-        if node.bl_idname != "ArmatureNodesInputNode":
-            continue
-        if not hasattr(node, "apply_retarget"):
+        if node.bl_idname != "ArmatureNodesCustomShapeNode":
             continue
         try:
-            applied += node.apply_retarget(ctx)
+            if node.apply_marker_pose(obj=obj):
+                applied += 1
         except Exception as exc:  # noqa: BLE001
-            print(f"[Armature Nodes] Retarget failed on '{node.name}': {exc}")
+            print(f"[Armature Nodes] Marker pose failed on '{node.name}': {exc}")
+    if applied:
+        view_layer = getattr(bpy.context, "view_layer", None)
+        if view_layer is not None:
+            view_layer.update()
     return applied
 
 
@@ -400,33 +408,15 @@ def _restore_mode(built_obj, remembered):
         print(f"[Armature Nodes] Could not restore {mode} mode: {exc}")
 
 
-def _retarget_only_object(tree):
-    """The rig a retarget-only graph drives (Primary Rig -> Armature Input,
-    with no Armature Output node to build). Returns None when there is none."""
-    for node in tree.nodes:
-        if node.bl_idname != "ArmatureNodesInputNode":
-            continue
-        sock = node.inputs.get("Skeleton")
-        if sock is not None and sock.is_linked and node.source is not None:
-            return node.source
-    return None
-
-
 def build_armature_from_tree(tree, strict=False):
-    """Apply the tree to its armature (full build, shapes-only update,
-    retarget-only drive, or teardown of what the graph no longer produces).
+    """Apply the tree to its armature (full build, shapes-only update, or
+    teardown of what the graph no longer produces).
 
     Returns the armature object, or None when the graph produces nothing.
     Called automatically by live update.
     """
     output = find_output_node(tree)
     if output is None:
-        # A graph that only drives an existing rig has nothing to compile.
-        driven = _retarget_only_object(tree)
-        if driven is not None:
-            retarget_pass(tree)
-            tree.is_dirty = False
-            return driven
         if strict:
             raise RuntimeError("No Armature Output node in the tree")
         # The Output node is gone: so is everything it generated.
@@ -453,7 +443,6 @@ def build_armature_from_tree(tree, strict=False):
                 _ensure_object_mode()
                 _shapes_only_pass(obj, [])
                 _restore_mode(obj, remembered)
-        retarget_pass(tree)
         tree.is_dirty = False
         return None
     # A copied node graph must never overwrite the source rig. The original
@@ -481,7 +470,7 @@ def build_armature_from_tree(tree, strict=False):
         obj = bpy.data.objects.get(name)
         if obj is not None and obj.type == "ARMATURE":
             _shapes_only_pass(obj, bone_defs)
-            retarget_pass(tree)
+            marker_pose_pass(tree, obj)
             tree.is_dirty = False
             _restore_mode(obj, remembered)
             return obj
@@ -497,7 +486,7 @@ def build_armature_from_tree(tree, strict=False):
         tag_owner(obj, tree, output)
     _edit_mode_pass(obj, bone_defs)
     _pose_mode_pass(obj, bone_defs)
-    retarget_pass(tree)
+    marker_pose_pass(tree, obj)
     tree.is_dirty = False
     _restore_mode(obj, remembered)
     return obj

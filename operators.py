@@ -383,84 +383,6 @@ class ARMATURE_OT_paste_bone_transform(Operator):
         return {"FINISHED"}
 
 
-def _override_node(context):
-    node = getattr(context, "node", None)
-    if node is not None and hasattr(node, "bone_overrides"):
-        return node
-    return None
-
-
-class ARMATURE_OT_add_bone_override(Operator):
-    """Add a manual skeleton bone -> control bone pairing, which takes
-    priority over the automatic match for that bone"""
-
-    bl_idname = "armature_nodes.add_bone_override"
-    bl_label = "Add Bone Override"
-    bl_options = {"REGISTER", "UNDO"}
-
-    skeleton_bone: StringProperty(name="Skeleton Bone", default="")
-
-    @classmethod
-    def poll(cls, context):
-        return _override_node(context) is not None
-
-    def execute(self, context):
-        node = _override_node(context)
-        node.add_override(self.skeleton_bone)
-        node.show_overrides = True
-        return {"FINISHED"}
-
-
-class ARMATURE_OT_remove_bone_override(Operator):
-    """Remove this manual bone pairing"""
-
-    bl_idname = "armature_nodes.remove_bone_override"
-    bl_label = "Remove Bone Override"
-    bl_options = {"REGISTER", "UNDO"}
-
-    index: bpy.props.IntProperty(name="Index", default=-1)
-
-    @classmethod
-    def poll(cls, context):
-        return _override_node(context) is not None
-
-    def execute(self, context):
-        node = _override_node(context)
-        if not 0 <= self.index < len(node.bone_overrides):
-            return {"CANCELLED"}
-        node.bone_overrides.remove(self.index)
-        node.id_data.mark_dirty()
-        return {"FINISHED"}
-
-
-class ARMATURE_OT_fill_bone_overrides(Operator):
-    """Add a row for every bone the automatic match resolved, so any pairing
-    can be re-pointed at a different control"""
-
-    bl_idname = "armature_nodes.fill_bone_overrides"
-    bl_label = "Fill Overrides From Matches"
-    bl_options = {"REGISTER", "UNDO"}
-
-    @classmethod
-    def poll(cls, context):
-        return _override_node(context) is not None
-
-    def execute(self, context):
-        from .core import EvalContext
-
-        node = _override_node(context)
-        added = node.fill_overrides_from_matches(EvalContext())
-        if not added:
-            self.report(
-                {"WARNING"},
-                "Nothing to fill: wire a Primary Rig into Skeleton and set a source rig",
-            )
-            return {"CANCELLED"}
-        node.show_overrides = True
-        self.report({"INFO"}, f"Added {added} override rows")
-        return {"FINISHED"}
-
-
 classes = (
     ARMATURE_OT_build_from_nodes,
     ARMATURE_OT_decompile_to_nodes,
@@ -470,9 +392,6 @@ classes = (
     ARMATURE_OT_snapshot_armature,
     ARMATURE_OT_copy_bone_transform,
     ARMATURE_OT_paste_bone_transform,
-    ARMATURE_OT_add_bone_override,
-    ARMATURE_OT_remove_bone_override,
-    ARMATURE_OT_fill_bone_overrides,
 )
 
 
