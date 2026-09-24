@@ -143,36 +143,60 @@ def _pose_signature(bone_defs):
     )
 
 
-def _apply_graph_pose(obj, bone_defs):
+# tree name -> bones the last Full Rig build posed, so a bone whose node was
+# deleted goes back to rest instead of keeping the pose for ever.
+_full_posed = {}
+
+
+def _apply_graph_pose(obj, bone_defs, tree_name=""):
     """Apply the pose the Transform-category nodes asked for.
 
     Modify mode gets this through the record pipeline. Full Rig owns its
-    armature and has no record to diff against, so the pose is applied
+    armature and has no record to diff against, so the same pose pass is run
     directly -- without this, every Bone, Position, Rotation, Transform and
     Snap node was silently discarded in Full Rig mode.
     """
-    from .apply.pose_display import apply_transform
+    from . import bridge
+    from .apply.pose_display import pose_pass
     from .apply.writer import Writer
+    from .model.types import TransformDef
 
     if obj is None or obj.pose is None:
         return 0
-    writer = Writer()
+    transforms = {}
     for bdef in bone_defs:
-        values = {}
-        if bdef.pose_location is not None:
-            values["location"] = bdef.pose_location
-        if bdef.pose_rotation is not None:
-            values["rotation"] = bdef.pose_rotation
-        if bdef.pose_scale is not None:
-            values["scale"] = bdef.pose_scale
-        if not values:
-            continue
-        apply_transform(obj, obj.pose.bones.get(bdef.name), values, writer)
-    if writer.writes:
-        view_layer = getattr(bpy.context, "view_layer", None)
-        if view_layer is not None:
-            view_layer.update()
+        transform = bridge._transform_from_graph(bdef)
+        if not transform.is_empty():
+            transforms[bdef.name] = transform
+    # Bones posed last time and not now: an empty transform sends them to rest.
+    for name in _full_posed.get(tree_name, ()):
+        transforms.setdefault(name, TransformDef())
+    _full_posed[tree_name] = {n for n, t in transforms.items() if not t.is_empty()}
+
+    writer = Writer()
+    pose_pass(obj, transforms, writer)
+    for message in writer.errors[:3]:
+        print(f"[Armature Nodes] {message}")
     return writer.writes
+
+
+def _follow_live(tree):
+    for node in tree.nodes:
+        if hasattr(node, "follow_live"):
+            try:
+                node.follow_live()
+            except Exception as exc:  # noqa: BLE001
+                print(f"[Armature Nodes] Live link failed on '{node.name}': {exc}")
+
+
+def _note_built(tree):
+    """Whatever the linked bones look like now is the graph's own doing."""
+    for node in tree.nodes:
+        if hasattr(node, "note_built"):
+            try:
+                node.note_built()
+            except Exception as exc:  # noqa: BLE001
+                print(f"[Armature Nodes] Live snapshot failed on '{node.name}': {exc}")
 
 
 def _remember_mode():
@@ -266,6 +290,7 @@ def _modify_pass(tree, name, bone_defs):
     # scheduled another build, which flipped again. Most builds write nothing
     # at all, so the whole dance was for a no-op.
     result = pipeline.apply(obj, base, target, touched_store.read(obj))
+    _note_built(tree)
 
     tree.last_error = "; ".join(result.errors[:2]) if result.errors else ""
     tree.is_dirty = False
@@ -288,6 +313,10 @@ def build_armature_from_tree(tree, strict=False):
         tree.is_dirty = False
         return None
 
+    # Anything the user did to a live-linked bone since the last look goes
+    # into its node first, so this build evaluates with it instead of
+    # snapping the bone back.
+    _follow_live(tree)
     name, bone_defs = evaluate_tree(tree, strict=strict)
     mode = getattr(output, "mode", "MODIFY")
 
@@ -361,7 +390,8 @@ def build_armature_from_tree(tree, strict=False):
     # Pose last, and from whatever mode the user is in: writing pbone.matrix
     # needs no operator, so this is safe mid-pose and must not be deferred.
     if pose_changed or rest_changed:
-        _apply_graph_pose(obj, bone_defs)
+        _apply_graph_pose(obj, bone_defs, tree.name)
+        _note_built(tree)
 
     _full_signatures[tree.name] = (rest_sig, pose_sig)
     tree.is_dirty = False

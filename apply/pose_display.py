@@ -1,9 +1,11 @@
 """Write custom shape, its placement, pose settings and the graph's pose."""
 
+import bpy
+
 from .. import compat
 from .widgets import ensure_widget
 
-__all__ = ["apply_display", "apply_pose", "apply_transform"]
+__all__ = ["apply_display", "apply_pose", "pose_target", "pose_pass"]
 
 _DISPLAY_TO_ATTR = {
     "scale": "custom_shape_scale_xyz",
@@ -75,77 +77,135 @@ def apply_pose(pbone, leaf, value, writer):
             writer.set(pbone, key, sub)
 
 
-def apply_transform(obj, pbone, values, writer):
-    """Write the graph's world-space pose for one bone.
+def pose_target(obj, pbone, transform):
+    """The armature-space matrix the graph asks for, or ``None`` for rest.
 
-    Only the components the graph set are written; a component back at
-    ``None`` is *cleared* to the rest pose, which is how removing a node undoes
-    its posing. Scale falls back to 1 rather than the bone's current scale, so
-    clearing is deterministic.
+    Resolution, per component:
+
+    * **Absolute** (``location`` / ``rotation`` / ``scale``) wins outright.
+    * **Relative** (``offset``, ``rotation_offset``, ``local_*``) is applied to
+      the bone's REST pose -- identity basis, following its parent's current
+      pose. Never to the live pose: that already contains the last build's
+      offset, so it would be added again on every build and the bone would
+      drift away.
+    * **Neither** leaves that component exactly as the bone has it, which is
+      what lets a node move a bone without also pinning its rotation.
+
+    ``local_*`` are the bone's own Location / Rotation channels (the N-panel
+    values), so a local offset follows the bone's axes and its parent.
     """
     from mathutils import Euler, Matrix, Vector
 
-    if pbone is None:
-        return
-    world = obj.matrix_world @ pbone.matrix
-    cur_loc, cur_rot, cur_scale = world.decompose()
+    if transform.is_empty():
+        return None
 
-    loc = Vector(values["location"]) if values.get("location") else None
-    rot = values.get("rotation")
-    scale = values.get("scale")
-
-    if "location" in values and loc is None:
-        loc = None  # cleared: fall through to the rest position below
-    target_loc = loc if loc is not None else cur_loc
-    target_rot = (
-        Euler(tuple(rot), "XYZ").to_matrix().to_4x4()
-        if rot
-        else cur_rot.to_matrix().to_4x4()
+    # The pose the relative parts build on: rest, moved along the bone's own
+    # axes when there is a local part.
+    local_loc = Vector(transform.local_offset or (0.0, 0.0, 0.0))
+    local_rot = Euler(tuple(transform.local_rotation or (0.0, 0.0, 0.0)), "XYZ")
+    basis = Matrix.LocRotScale(local_loc, local_rot, Vector((1.0, 1.0, 1.0)))
+    base = obj.convert_space(
+        pose_bone=pbone, matrix=basis, from_space="LOCAL", to_space="POSE"
     )
-    target_scale = Vector(scale) if scale else cur_scale
+    base_loc, base_rot, _base_scale = base.decompose()
+    cur_loc, cur_rot, cur_scale = pbone.matrix.decompose()
 
-    # Anything the graph cleared goes back to the bone's rest state, which for
-    # a pose bone means an identity basis.
-    cleared = [k for k in ("location", "rotation", "scale") if k in values and not values[k]]
-    if cleared and not any(values.get(k) for k in ("location", "rotation", "scale")):
-        if not _same_matrix(pbone.matrix_basis, Matrix.Identity(4)):
-            pbone.matrix_basis = Matrix.Identity(4)
-            writer.count()
-        return
+    to_arm = obj.matrix_world.inverted_safe()
+    arm_rot = to_arm.to_quaternion()
 
-    target = (
-        Matrix.Translation(target_loc)
-        @ target_rot
-        @ Matrix.Diagonal(target_scale).to_4x4()
+    relative_loc = transform.offset is not None or transform.local_offset is not None
+    relative_rot = (
+        transform.rotation_offset is not None or transform.local_rotation is not None
     )
-    new_basis_world = obj.matrix_world.inverted_safe() @ target
-    if _same_matrix(pbone.matrix, new_basis_world):
-        return
-    try:
-        pbone.matrix = new_basis_world
-    except (AttributeError, ValueError) as exc:
-        writer.note(f"pose {pbone.name}: {exc}")
-        return
-    writer.count()
-    # Blender accepts the assignment and then silently discards it when the
-    # bone cannot move: a connected bone's head is pinned to its parent's
-    # tail, and locked channels are not writable. Queue it for checking once
-    # the depsgraph has re-evaluated -- reporting a write that did nothing is
-    # worse than not writing, because the user sees no error and no motion.
-    writer.pending_poses.append((pbone, new_basis_world))
+
+    if transform.location is not None:
+        loc = to_arm @ Vector(transform.location)
+    else:
+        loc = base_loc if relative_loc else cur_loc
+    if transform.offset is not None:
+        # A world-axis offset, expressed in armature space.
+        loc = loc + arm_rot @ Vector(transform.offset)
+
+    if transform.rotation is not None:
+        rot = arm_rot @ Euler(tuple(transform.rotation), "XYZ").to_quaternion()
+    else:
+        rot = base_rot if relative_rot else cur_rot
+    if transform.rotation_offset is not None:
+        # Along world axes, about the bone's own head: rotate in place.
+        world_offset = Euler(tuple(transform.rotation_offset), "XYZ").to_quaternion()
+        rot = (arm_rot @ world_offset @ arm_rot.inverted()) @ rot
+
+    scale = Vector(transform.scale) if transform.scale is not None else cur_scale
+    return Matrix.LocRotScale(loc, rot, scale)
 
 
-def verify_poses(writer):
-    """Check queued poses after the view layer has been updated."""
-    for pbone, intended in writer.pending_poses:
+def pose_pass(obj, transforms, writer):
+    """Pose every bone in ``transforms`` ({name: TransformDef}).
+
+    Parent-first, with a depsgraph flush between depths. A child's matrix is
+    resolved against its parent's EVALUATED pose, so writing a child before
+    its parent has been evaluated places it relative to where the parent used
+    to be -- which is how moving the whole rig left the children below the
+    origin.
+
+    Every write is verified once the depsgraph has settled. Blender accepts
+    ``pbone.matrix = ...`` on a connected bone or a locked channel and then
+    silently discards it; counting that as a write is how the addon looked
+    broken with no error to show for it.
+    """
+    from mathutils import Matrix
+
+    if not transforms or obj.pose is None:
+        return
+    view_layer = getattr(bpy.context, "view_layer", None)
+
+    def depth(pbone):
+        d, parent = 0, pbone.parent
+        while parent is not None:
+            d += 1
+            parent = parent.parent
+        return d
+
+    items = []
+    for name, transform in transforms.items():
+        pbone = obj.pose.bones.get(name)
+        if pbone is not None:
+            items.append((depth(pbone), name, pbone, transform))
+    items.sort(key=lambda item: (item[0], item[1]))
+
+    written = []
+    level = None
+    for d, _name, pbone, transform in items:
+        if level is not None and d != level and view_layer is not None:
+            view_layer.update()
+        level = d
+        target = pose_target(obj, pbone, transform)
+        if target is None:
+            # Nothing is asked of this bone any more: back to rest.
+            if not _same_matrix(pbone.matrix_basis, Matrix.Identity(4)):
+                pbone.matrix_basis = Matrix.Identity(4)
+                writer.count()
+            continue
+        if _same_matrix(pbone.matrix, target):
+            continue  # already there: two identical builds write nothing
         try:
-            stuck = _same_matrix(pbone.matrix, intended)
+            pbone.matrix = target
+        except (AttributeError, ValueError) as exc:
+            writer.note(f"pose {pbone.name}: {exc}")
+            continue
+        writer.count()
+        written.append((pbone, target))
+
+    if view_layer is not None:
+        view_layer.update()
+    for pbone, target in written:
+        try:
+            stuck = _same_matrix(pbone.matrix, target, eps=1e-4)
         except ReferenceError:
-            continue  # bone went away mid-build; nothing useful to report
+            continue
         if not stuck:
             writer.writes -= 1
             writer.note(_why_blocked(pbone))
-    writer.pending_poses = []
 
 
 def _why_blocked(pbone):
@@ -153,11 +213,7 @@ def _why_blocked(pbone):
     reasons = []
     if pbone.bone.use_connect:
         reasons.append("it is connected to its parent (head is pinned)")
-    locked = [
-        axis
-        for axis, is_locked in zip("XYZ", pbone.lock_location)
-        if is_locked
-    ]
+    locked = [axis for axis, is_locked in zip("XYZ", pbone.lock_location) if is_locked]
     if locked:
         reasons.append("location " + "/".join(locked) + " locked")
     if all(pbone.lock_rotation) and pbone.lock_rotation_w:

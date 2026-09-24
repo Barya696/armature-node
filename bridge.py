@@ -88,29 +88,39 @@ def _display_from_shape(base_display, shape):
     )
 
 
+def _vec(value):
+    return tuple(float(v) for v in value) if value is not None else None
+
+
+def _nonzero(value):
+    """The vector, or None when it is absent or all zeros.
+
+    An offset of zero is "no offset", and has to read back as None: a zero
+    tuple would diff against the record's None on every build and look like a
+    change that never goes away.
+    """
+    if value is None:
+        return None
+    value = tuple(float(v) for v in value)
+    return value if any(abs(v) > 1e-9 for v in value) else None
+
+
 def _transform_from_graph(bone):
     """The graph's pose request as a record TransformDef.
 
-    The old graph carries absolute values plus accumulated offsets; the record
-    stores one resolved world value per component. An offset with no absolute
-    part is left for the pipeline to resolve against the live pose, so it is
-    only folded in when there is something to fold it into.
+    Absolute values and relative offsets are carried separately and resolved
+    at apply time against the bone's rest pose. This used to fold an offset
+    into the absolute location and DROP it when there was none, which is why a
+    Transform node on its own did nothing at all.
     """
-    location = getattr(bone, "pose_location", None)
-    rotation = getattr(bone, "pose_rotation", None)
-    scale = getattr(bone, "pose_scale", None)
-    offset = tuple(getattr(bone, "pose_offset", (0.0, 0.0, 0.0)) or (0.0, 0.0, 0.0))
-    rot_offset = tuple(
-        getattr(bone, "pose_rotation_offset", (0.0, 0.0, 0.0)) or (0.0, 0.0, 0.0)
-    )
-    if location is not None and any(offset):
-        location = tuple(a + b for a, b in zip(location, offset))
-    if rotation is not None and any(rot_offset):
-        rotation = tuple(a + b for a, b in zip(rotation, rot_offset))
     return TransformDef(
-        location=tuple(location) if location is not None else None,
-        rotation=tuple(rotation) if rotation is not None else None,
-        scale=tuple(scale) if scale is not None else None,
+        location=_vec(getattr(bone, "pose_location", None)),
+        rotation=_vec(getattr(bone, "pose_rotation", None)),
+        scale=_vec(getattr(bone, "pose_scale", None)),
+        offset=_nonzero(getattr(bone, "pose_offset", None)),
+        rotation_offset=_nonzero(getattr(bone, "pose_rotation_offset", None)),
+        local_offset=_nonzero(getattr(bone, "pose_local_offset", None)),
+        local_rotation=_nonzero(getattr(bone, "pose_local_rotation", None)),
     )
 
 

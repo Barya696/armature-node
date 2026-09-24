@@ -37,12 +37,7 @@ class Writer:
         self.writes = 0
         self.errors = []
         self.bones = set()
-        # (pose_bone, intended matrix) pairs, checked after the view layer is
-        # updated. pbone.matrix is COMPUTED from matrix_basis plus the parent
-        # chain and constraints, so reading it back before the depsgraph
-        # re-evaluates returns the old value -- verifying inline would report
-        # every successful write as blocked.
-        self.pending_poses = []
+
 
     def count(self, changed=True):
         if changed:

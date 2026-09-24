@@ -192,17 +192,35 @@ def test_a_linked_marker_overrides_the_typed_value():
     )
 
 
-def test_use_location_off_ignores_the_socket():
+def test_unticked_location_is_a_live_readout():
+    """Off, the node does not drive the bone: it shows where the bone is."""
+    import bpy
     from armature_nodes.build import build_armature_from_tree
 
     obj, tree, bone = _setup("MODIFY")
-    build_armature_from_tree(tree)
-    before = _world_head(obj, "bone.002")
-
     bone.use_location = False
-    bone.inputs["Position"].default_value = (7.0, 7.0, 7.0)
     build_armature_from_tree(tree)
 
-    after = _world_head(obj, "bone.002")
-    for a, b in zip(before, after):
-        assert abs(a - b) < 1e-4, "location was written although its box was off"
+    pb = obj.pose.bones["bone.002"]
+    pb.location = (0.0, 0.5, 0.0)  # the user grabs the bone
+    bpy.context.view_layer.update()
+    moved = _world_head(obj, "bone.002")
+
+    build_armature_from_tree(tree)
+    got = _world_head(obj, "bone.002")
+    assert (got - moved).length < 1e-4, "an undriven bone was snapped back"
+    shown = bone.inputs["Position"].default_value
+    assert (moved - type(moved)(shown)).length < 1e-4, "Position does not show the bone"
+
+
+def test_typing_into_position_takes_the_bone():
+    """Typing a position is asking for it, whatever the checkbox said."""
+    from armature_nodes.build import build_armature_from_tree
+
+    obj, tree, bone = _setup("MODIFY")
+    bone.use_location = False
+    bone.inputs["Position"].default_value = (7.0, 0.0, 7.0)
+    assert bone.use_location, "typing did not take the bone over"
+    build_armature_from_tree(tree)
+    got = _world_head(obj, "bone.002")
+    assert abs(got.x - 7.0) < 1e-4 and abs(got.z - 7.0) < 1e-4, f"got {got[:]}"

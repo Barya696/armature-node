@@ -31,6 +31,14 @@ from .types import (
 RECORD_VERSION = 2
 
 
+#: Every TransformDef field, in storage order. Missing keys read back as None,
+#: so a record written before the relative fields existed still loads.
+_TRANSFORM_KEYS = (
+    "location", "rotation", "scale",
+    "offset", "rotation_offset", "local_offset", "local_rotation",
+)
+
+
 class RecordError(ValueError):
     """A stored record could not be read."""
 
@@ -90,9 +98,8 @@ def _bone_to_dict(b):
             "ik": dict(b.pose.ik),
         },
         "transform": {
-            "location": list(b.transform.location) if b.transform.location else None,
-            "rotation": list(b.transform.rotation) if b.transform.rotation else None,
-            "scale": list(b.transform.scale) if b.transform.scale else None,
+            key: (list(getattr(b.transform, key)) if getattr(b.transform, key) else None)
+            for key in _TRANSFORM_KEYS
         },
         "constraints": [
             {"type": c.type, "name": c.name, "props": dict(c.props)} for c in b.constraints
@@ -164,7 +171,7 @@ def _transform_from_dict(d):
         v = d.get(key)
         return tuple(float(x) for x in v) if v else None
 
-    return TransformDef(location=opt("location"), rotation=opt("rotation"), scale=opt("scale"))
+    return TransformDef(**{key: opt(key) for key in _TRANSFORM_KEYS})
 
 
 def _bone_from_dict(name, d):

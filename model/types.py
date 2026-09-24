@@ -126,6 +126,25 @@ class TransformDef:
     location: Optional[tuple] = None
     rotation: Optional[tuple] = None  # euler XYZ, radians
     scale: Optional[tuple] = None
+    # Relative moves, resolved at apply time against the bone's REST pose
+    # (identity basis, following its parent's current pose) -- never against
+    # the live pose, which would re-add the offset on every build and drift.
+    # World offsets are along global axes; local ones are the bone's own
+    # Location / Rotation channels, exactly as in the N-panel.
+    offset: Optional[tuple] = None
+    rotation_offset: Optional[tuple] = None  # euler XYZ, radians
+    local_offset: Optional[tuple] = None
+    local_rotation: Optional[tuple] = None  # euler XYZ, radians
+
+    def is_empty(self):
+        """True when the graph asks nothing of this bone's pose."""
+        return all(
+            v is None
+            for v in (
+                self.location, self.rotation, self.scale, self.offset,
+                self.rotation_offset, self.local_offset, self.local_rotation,
+            )
+        )
 
 
 @dataclass(frozen=True)

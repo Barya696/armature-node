@@ -36,7 +36,7 @@ from ..store import widgets_lib
 from . import collections as _collections
 from . import constraints as _constraints
 from . import rest as _rest
-from .pose_display import apply_display, apply_pose, apply_transform, verify_poses
+from .pose_display import apply_display, apply_pose, pose_pass
 from .writer import Writer
 
 __all__ = ["Result", "apply"]
@@ -108,15 +108,17 @@ def apply(obj, base, target, previously_touched=None, library=None):
         library = widgets_lib.read(obj)
 
     with lock.held("build"):
-        _apply_plan(obj, plan, library, writer)
-        if writer.pending_poses:
-            # A pose is only real once the depsgraph has re-evaluated: until
-            # then pbone.matrix still reads the old value, and a child would
-            # inherit a stale parent.
-            view_layer = getattr(bpy.context, "view_layer", None)
-            if view_layer is not None:
-                view_layer.update()
-            verify_poses(writer)
+        posed = _apply_plan(obj, plan, library, writer)
+        # Pose last: the edit pass can change rest geometry, and relative
+        # offsets are resolved against rest. Each bone gets its WHOLE target
+        # transform rather than only the leaves that changed -- clearing one
+        # component must not reset the others.
+        if posed:
+            pose_pass(
+                obj,
+                {n: target.bones[n].transform for n in posed if n in target.bones},
+                writer,
+            )
 
     # The record is READ-ONLY here. A build that rewrote it would fold its own
     # output into the original, which is the whole class of bug this replaces.
@@ -128,8 +130,10 @@ def apply(obj, base, target, previously_touched=None, library=None):
 
 
 def _apply_plan(obj, plan, library, writer):
+    """Everything except posing. Returns the bones whose pose must be set."""
     armature = obj.data
     edit_plan = {}
+    posed = []
 
     # --- Object-mode pass ----------------------------------------------------
     for name, values in plan.items():
@@ -165,15 +169,15 @@ def _apply_plan(obj, plan, library, writer):
             apply_pose(pbone, leaf, value, writer)
         if "constraints" in values:
             _constraints.apply_constraints(pbone, values["constraints"], writer)
-        transform = sections.get("transform")
-        if transform:
-            apply_transform(obj, pbone, transform, writer)
+        if sections.get("transform"):
+            posed.append(name)
 
     # --- Edit-mode pass ------------------------------------------------------
     # Entered only when rest geometry actually changed, so a build that just
     # swaps a widget never leaves Object mode.
     if edit_plan:
         _apply_edit(obj, edit_plan, writer)
+    return posed
 
 
 def _apply_edit(obj, edit_plan, writer):

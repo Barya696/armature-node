@@ -7,7 +7,8 @@ Three socket types, deliberately:
   geometry from node to node. Everything between Armature Input and Armature
   Output reads this, changes some of it, and passes it on.
 * **Constraint** -- a constraint definition, wired into a bone-producing node.
-* **Vector** -- a position / rotation / offset value. Unlinked, the socket is
+* **Vector / Rotation / Scale** -- a value: a position or offset in scene
+  units, an orientation in degrees, or a scale factor. Unlinked, the socket is
   itself the value field (the Shader and Geometry Editor convention), so a
   node with no wire into it still has something to work with.
 """
@@ -25,6 +26,14 @@ def _on_socket_value_changed(self, context):
     hierarchy that injection never touches -- without this a typed vector
     would change silently and the armature would never follow.
     """
+    from .tree import is_updating
+
+    # Only a real edit: values the rig writes into a node arrive with live
+    # update suspended, and must not be mistaken for the user typing.
+    if not is_updating():
+        node = getattr(self, "node", None)
+        if node is not None and hasattr(node, "on_socket_edited"):
+            node.on_socket_edited(self)
     tree = getattr(self, "id_data", None)
     if tree is not None and hasattr(tree, "mark_dirty"):
         tree.mark_dirty()
@@ -67,11 +76,43 @@ class ConstraintSocket(_SocketDrawMixin, NodeSocket):
     socket_color = (0.70, 0.40, 0.95, 1.0)
 
 
-class VectorSocket(_SocketDrawMixin, NodeSocket):
-    """A position, rotation or offset.
+class _ValueSocketMixin:
+    """Shared ``get_value`` for the sockets that carry a 3-vector.
 
-    ``marker_key`` is set when the vector comes from a Skeleton node output,
-    naming which marker it is. Consumers read the marker's live position
+    ``_marker_attr`` names what a linked marker supplies: its position to a
+    Vector socket, its orientation to a Rotation socket -- so wiring a marker
+    into a Rotation input turns the bone with the handle rather than feeding a
+    position in as if it were angles.
+    """
+
+    _marker_attr = "position"
+
+    def get_value(self):
+        """The vector on this socket: from the link if there is one, from a
+        marker when the link names one, otherwise the typed default."""
+        if self.is_linked and self.links:
+            link = self.links[0]
+            from_sock = link.from_socket
+            key = getattr(from_sock, "marker_key", "")
+            node = link.from_node
+            if key and hasattr(node, "marker_by_key"):
+                marker = node.marker_by_key(key)
+                if marker is not None:
+                    return tuple(getattr(marker, self._marker_attr))
+            if hasattr(from_sock, "default_value"):
+                v = from_sock.default_value
+                try:
+                    return (float(v[0]), float(v[1]), float(v[2]))
+                except (TypeError, IndexError):
+                    pass
+        return tuple(self.default_value)
+
+
+class VectorSocket(_ValueSocketMixin, _SocketDrawMixin, NodeSocket):
+    """A position or offset, in scene units.
+
+    ``marker_key`` is set when the vector comes from a Marker or Skeleton
+    output, naming which marker it is. Consumers read the marker's live value
     through it, so dragging the handle in the viewport moves whatever the wire
     feeds. It stays empty on an ordinary vector.
     """
@@ -89,35 +130,55 @@ class VectorSocket(_SocketDrawMixin, NodeSocket):
     )
     marker_key: StringProperty(
         name="Marker Key",
-        description="Marker this socket reads its position from, when it has one",
+        description="Marker this socket reads its value from, when it has one",
         default="",
     )
 
-    def get_value(self):
-        """The vector on this socket: from the link if there is one, from a
-        marker when the link names one, otherwise the typed default."""
-        if self.is_linked and self.links:
-            link = self.links[0]
-            from_sock = link.from_socket
-            key = getattr(from_sock, "marker_key", "")
-            node = link.from_node
-            if key and hasattr(node, "marker_by_key"):
-                marker = node.marker_by_key(key)
-                if marker is not None:
-                    return tuple(marker.position)
-            if hasattr(from_sock, "default_value"):
-                v = from_sock.default_value
-                try:
-                    return (float(v[0]), float(v[1]), float(v[2]))
-                except (TypeError, IndexError):
-                    pass
-        return tuple(self.default_value)
+
+class RotationSocket(_ValueSocketMixin, _SocketDrawMixin, NodeSocket):
+    """An orientation, as XYZ Euler.
+
+    Its own type because the unit is: shown in degrees, stored in radians. A
+    rotation carried on a Vector socket was labelled in metres and read "90"
+    as ninety radians.
+    """
+
+    bl_idname = "ArmatureNodesRotationSocket"
+    bl_label = "Rotation"
+    socket_color = (0.63, 0.39, 0.78, 1.0)
+    _marker_attr = "rotation"
+
+    default_value: FloatVectorProperty(
+        name="Rotation",
+        size=3,
+        default=(0.0, 0.0, 0.0),
+        subtype="EULER",
+        update=_on_socket_value_changed,
+    )
+
+
+class ScaleSocket(_ValueSocketMixin, _SocketDrawMixin, NodeSocket):
+    """A per-axis scale factor. Defaults to 1, which means "unchanged"."""
+
+    bl_idname = "ArmatureNodesScaleSocket"
+    bl_label = "Scale"
+    socket_color = (0.39, 0.63, 0.78, 1.0)
+
+    default_value: FloatVectorProperty(
+        name="Scale",
+        size=3,
+        default=(1.0, 1.0, 1.0),
+        subtype="XYZ",
+        update=_on_socket_value_changed,
+    )
 
 
 classes = (
     RigSocket,
     ConstraintSocket,
     VectorSocket,
+    RotationSocket,
+    ScaleSocket,
 )
 
 

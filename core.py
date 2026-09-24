@@ -75,6 +75,9 @@ class BoneDef:
     # nodes in a row stack instead of overwriting each other.
     pose_offset: tuple = (0.0, 0.0, 0.0)
     pose_rotation_offset: tuple = (0.0, 0.0, 0.0)
+    # The same, along the bone's own axes -- its Location / Rotation channels.
+    pose_local_offset: tuple = (0.0, 0.0, 0.0)
+    pose_local_rotation: tuple = (0.0, 0.0, 0.0)
 
 
 def unique_names(bones):
@@ -205,6 +208,8 @@ def copy_bone(b):
         pose_scale=b.pose_scale,
         pose_offset=tuple(b.pose_offset),
         pose_rotation_offset=tuple(b.pose_rotation_offset),
+        pose_local_offset=tuple(b.pose_local_offset),
+        pose_local_rotation=tuple(b.pose_local_rotation),
         constraints=[
             ConstraintDef(type=c.type, name=c.name, params=dict(c.params))
             for c in b.constraints

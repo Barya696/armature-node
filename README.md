@@ -202,13 +202,24 @@ own **Handles** toggle still wins, for hiding one marker without unwiring it.
 
 All four write the **pose**, never rest geometry — so they cannot change the
 proportions of a rig they are layered onto, and a custom shape follows because
-Blender draws widgets at the posed bone. A component the graph does not set
-keeps whatever the rig already has.
+Blender draws widgets at the posed bone. A freshly added node does nothing
+until you ask it to, and a component the graph does not set keeps whatever the
+rig already has.
 
-- **Position** — set the selected bones' world position (Set Position).
-- **Rotation** — set their world orientation.
-- **Transform** — *offset* translation and rotation, so several Transform
-  nodes stack, plus an optional absolute scale.
+- **Position** — like Geometry Nodes' *Set Position*.
+  - **Position**: where the bones go, in world space. Used only when **Set
+    Position** is ticked or something is wired in (a wired marker counts).
+    Ticking the box first fills Position from the bone, so it never jumps.
+  - **Offset**: added on top, along world axes.
+- **Rotation** — the same pattern for orientation, in **degrees**: *Set
+  Rotation* + Rotation for an absolute world orientation, Offset to turn on
+  top. A wired marker supplies its own rotation.
+- **Transform** — like *Transform Geometry*: Translation, Rotation and Scale,
+  all relative, so several Transform nodes stack. **Space**:
+  - **World** — along the scene axes, whatever way the bone points.
+  - **Local** — along the bone's own axes. These *are* its Location and
+    Rotation channels, the N-panel values, and they follow the parent the way
+    hand-posing does.
 - **Snap** — put the selected bones on a mesh. Snap To picks what "on" means:
   - **Origin** — the target object's own origin
   - **Bounding Box** — centre of its bounds
@@ -218,6 +229,42 @@ keeps whatever the rig already has.
   - **Surface** — closest point on the surface to the bone
 
   plus an offset applied after the snap.
+
+**Live, both ways.** A Position, Rotation, Transform or Bone node working on
+a single bone mirrors it in real time:
+
+- **Rig to node**: grab, rotate or scale the bone in Pose mode and the node's
+  fields follow as you drag. If the value comes from a wired marker, the
+  marker's handle moves with the bone too.
+- **Node to rig**: type a value and the bone moves. On Position and Rotation,
+  typing into the field takes the bone over (ticks *Set*) — a field that
+  looked like an input but only displayed was the old complaint.
+- While a node is not driving a value (*Set* off, nothing wired, zero
+  offset), that field is a plain readout of where the bone is.
+
+The node tells its own writes apart from yours with a snapshot taken after
+every build: anything that differs from it was you, and only that difference
+is folded in. That is what keeps it from chasing its own output — which on a
+constrained bone would oscillate for ever. Relative values (Offset, Transform)
+measure your move from the rest pose, so moving the parent or the whole
+object is not mistaken for a new offset. Undo, redo and file load reset the
+snapshots. One live node per bone: two nodes linked to the same bone would
+each pick up the same grab.
+
+How the relative moves behave:
+
+- **They are measured from the rest pose**, never from the live one. The live
+  pose already contains the last build's move, so measuring from it would add
+  the move again every build and the bone would drift.
+- **Each bone moves once.** With a parent and its child both selected, a World
+  move is applied to the parent and the child is carried — Blender's own
+  G/R/S does exactly this. (Local is channel semantics, so it accumulates down
+  a chain, as typing the same Location into every bone would.)
+- **A later absolute value wins.** Set Position after a Transform replaces the
+  Transform's offset, as in Geometry Nodes.
+- **Blocked moves are reported.** A connected bone, a locked channel or a
+  constraint can make Blender discard a pose; the Output and the sidebar say
+  which, instead of reporting success.
 
 ### Shape
 

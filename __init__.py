@@ -34,6 +34,7 @@ _SUBMODULES = (
     "capture",
     "apply",
     "bridge",
+    "livelink",
     "legacy_adapter",
     "sockets",
     "tree",

@@ -178,7 +178,9 @@ def test_offset_pose_accumulates():
     r = make_record(2)
     once = ops.offset_pose(r, ["root"], location=(1.0, 0.0, 0.0))
     twice = ops.offset_pose(once, ["root"], location=(2.0, 0.0, 0.0))
-    assert twice.bones["root"].transform.location == (3.0, 0.0, 0.0)
+    assert twice.bones["root"].transform.offset == (3.0, 0.0, 0.0)
+    # An offset is not an absolute location: that is resolved at apply time.
+    assert twice.bones["root"].transform.location is None
 
 
 def test_mirror_names():

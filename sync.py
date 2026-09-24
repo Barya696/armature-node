@@ -340,29 +340,42 @@ def watch_armature_mode():
 
 
 def sync_bone_nodes():
-    """Let every Bone node read the components it does not drive.
+    """Pull the live rig into every live-linked node.
 
-    This is what makes the node show a bone's current transform without the
-    user pressing anything. Only unticked components are read, so a node can
-    never chase a value it wrote -- see ``BoneNode.follow_live_transform``.
+    What makes a Bone, Position, Rotation or Transform node show and hold the
+    bone's real transform while the user poses it. The node tells its own
+    writes apart from the user's with a snapshot -- see ``livelink``.
     """
+    from .store import lock
     from .tree import is_updating
 
-    if is_updating():
-        return  # a rebuild is mid-flight; pose matrices are not trustworthy
+    if is_updating() or lock.is_held():
+        return  # mid-build: matrices are half-applied, and it is our own write
     changed = False
     for tree in _trees_to_track():
         for node in tree.nodes:
-            if node.bl_idname != "ArmatureNodesBoneNode":
+            if not hasattr(node, "follow_live"):
                 continue
             try:
-                if node.follow_live_transform():
+                if node.follow_live():
                     changed = True
             except Exception as exc:  # noqa: BLE001
-                print(f"[Armature Nodes] Bone follow failed on '{node.name}': {exc}")
+                print(f"[Armature Nodes] Live link failed on '{node.name}': {exc}")
     if changed:
         for _space, area in _armature_node_spaces():
             area.tag_redraw()
+
+
+@persistent
+def _on_undo_redo(*_args):
+    """Undo restores node values and pose together, but not the snapshots.
+
+    Keeping them would make an undone grab look like a brand-new move, and it
+    would be folded into the node a second time.
+    """
+    from . import livelink
+
+    livelink.reset()
 
 
 @persistent
@@ -395,6 +408,9 @@ def _on_frame_change(scene, depsgraph=None):
 def _on_load_post(*_args):
     global _last_active
     _topology.clear()  # signatures from the previous file mean nothing here
+    from . import livelink
+
+    livelink.reset()
     _last_active = None
     _subscribe_msgbus()  # msgbus subscriptions do not survive file load
     request_sync()
@@ -430,6 +446,9 @@ def register():
         bpy.app.handlers.frame_change_post.append(_on_frame_change)
     if _on_load_post not in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.append(_on_load_post)
+    for handlers in (bpy.app.handlers.undo_post, bpy.app.handlers.redo_post):
+        if _on_undo_redo not in handlers:
+            handlers.append(_on_undo_redo)
     request_sync()
 
 
@@ -439,6 +458,9 @@ def unregister():
         bpy.app.timers.unregister(_deferred_sync)
     if _on_load_post in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.remove(_on_load_post)
+    for handlers in (bpy.app.handlers.undo_post, bpy.app.handlers.redo_post):
+        if _on_undo_redo in handlers:
+            handlers.remove(_on_undo_redo)
     if _on_frame_change in bpy.app.handlers.frame_change_post:
         bpy.app.handlers.frame_change_post.remove(_on_frame_change)
     if _on_depsgraph_update in bpy.app.handlers.depsgraph_update_post:

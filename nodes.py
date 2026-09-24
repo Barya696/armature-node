@@ -45,7 +45,13 @@ from .core import (
     select_bones,
     copy_bone,
 )
-from .sockets import RigSocket, ConstraintSocket, VectorSocket
+from .sockets import (
+    RigSocket,
+    ConstraintSocket,
+    VectorSocket,
+    RotationSocket,
+    ScaleSocket,
+)
 from .widgets import PRESET_ITEMS as _widget_preset_items
 from .widgets import widget_enum_items as _widget_enum_items
 
@@ -121,8 +127,8 @@ class ArmatureNodeBase:
             layout.label(text="All bones", icon="INFO")
 
 
-def _bone_select_prop():
-    return StringProperty(
+def _bone_select_prop(update=None):
+    kwargs = dict(
         name="Bone",
         description=(
             "Bone this node affects. Empty = every bone on the wire; several "
@@ -130,6 +136,99 @@ def _bone_select_prop():
         ),
         default="",
     )
+    if update is not None:
+        kwargs["update"] = update
+    return StringProperty(**kwargs)
+
+
+def _same_vec(a, b, eps=1e-6):
+    return all(abs(float(x) - float(y)) <= eps for x, y in zip(a, b))
+
+
+def _write_socket_value(node, name, value):
+    """Set an unlinked socket's value without scheduling a rebuild.
+
+    Returns True when it changed. Suspended because this is the rig talking
+    to the node, not an edit: rebuilding would write the same value straight
+    back, and on a constrained bone that is the start of an oscillation.
+    """
+    sock = node.inputs.get(name)
+    if sock is None or sock.is_linked:
+        return False
+    value = tuple(float(v) for v in value)
+    if _same_vec(sock.default_value, value):
+        return False
+    from .tree import suspend_live_update
+
+    with suspend_live_update():
+        sock.default_value = value
+    return True
+
+
+def _linked_marker(node, name):
+    """(marker node, marker) wired into ``name``, or (None, None)."""
+    sock = node.inputs.get(name)
+    if sock is None or not sock.is_linked or not sock.links:
+        return None, None
+    link = sock.links[0]
+    key = getattr(link.from_socket, "marker_key", "")
+    source = link.from_node
+    if not key or not hasattr(source, "marker_by_key"):
+        return None, None
+    return source, source.marker_by_key(key)
+
+
+class _LiveLinkMixin:
+    """A node that mirrors the one bone it poses, both ways, live.
+
+    The graph writing a value and the user grabbing the bone both have to end
+    up on the node. ``livelink`` tells them apart with a snapshot taken after
+    every build: anything that differs from it was the user, and only that
+    delta is folded in. Subclasses say which bone (``live_bone``), where a
+    delta goes (``absorb``) and which fields are plain readouts (``readout``).
+
+    One live node per bone: two nodes linked to the same bone would each fold
+    the same grab in, and the bone would move twice on the next build.
+    """
+
+    def live_bone(self):
+        return None, None
+
+    def absorb(self, obj, pbone, delta):
+        return False
+
+    def readout(self, obj, pbone):
+        return False
+
+    def follow_live(self):
+        """Pull the bone's current state into the node. True if anything changed."""
+        from . import livelink
+
+        obj, pbone = self.live_bone()
+        # Edit mode leaves pose matrices stale.
+        if pbone is None or obj.mode == "EDIT":
+            return False
+        delta = livelink.delta_since(self, obj, pbone)
+        changed = False
+        if delta is not None and delta.moved():
+            changed = bool(self.absorb(obj, pbone, delta))
+        if self.readout(obj, pbone):
+            changed = True
+        return changed
+
+    def note_built(self):
+        """The graph just wrote the bone: that pose is ours, not the user's."""
+        from . import livelink
+
+        obj, pbone = self.live_bone()
+        if pbone is not None and obj.mode != "EDIT":
+            livelink.remember(self, obj, pbone)
+
+    def free(self):
+        from . import livelink
+
+        livelink.forget(self)
+        super().free()
 
 
 class _ModifierNodeBase(ArmatureNodeBase):
@@ -714,7 +813,7 @@ def _on_bone_selected(self, context):
         tree.mark_dirty()
 
 
-class BoneNode(_ModifierNodeBase, Node):
+class BoneNode(_LiveLinkMixin, _ModifierNodeBase, Node):
     """One bone from the rig, posed.
 
     Pick any bone -- DEF, MCH, ORG or a control, it makes no difference to
@@ -836,58 +935,71 @@ class BoneNode(_ModifierNodeBase, Node):
             marker_node.push_markers_to_empties()
         return True
 
-    def follow_live_transform(self, obj=None):
-        """Show the live value of the components this node does *not* drive.
+    def live_bone(self):
+        if not self.bone:
+            return None, None
+        obj = self.resolve_armature()
+        if obj is None or obj.pose is None:
+            return None, None
+        return obj, obj.pose.bones.get(self.bone)
 
-        Loop-free by construction. A component whose checkbox is on is written
-        by this node, so reading it back would chase its own output -- worse on
-        a constrained or parented bone, where the evaluated result differs from
-        what was written and the two would oscillate. A component whose
-        checkbox is off is never written, so following it is just display.
+    def on_socket_edited(self, sock):
+        if sock.name == "Position" and not self.use_location:
+            self.use_location = True
 
-        The pay-off is that ticking a component on never makes the bone jump:
-        the field already holds the value the bone actually has.
+    def absorb(self, obj, pbone, delta):
+        """Ticked components are driven: the user's move is folded into them."""
+        from . import livelink
 
-        Returns True when a field changed, so the caller can redraw.
-        """
+        changed = False
+        if self.use_location:
+            if self.position_is_linked():
+                marker_node, marker = self.linked_marker()
+                if marker is not None:
+                    marker.set_position(Vector(marker.position) + delta.world_loc)
+                    marker_node.push_markers_to_empties()
+                    changed = True
+            else:
+                value = Vector(self.position() or (0.0, 0.0, 0.0)) + delta.world_loc
+                changed |= _write_socket_value(self, "Position", value)
+        updates = []
+        if self.use_rotation:
+            value = livelink.compose(delta.world_rot, self.bone_rotation)
+            if not _same_vec(value, self.bone_rotation):
+                updates.append(("bone_rotation", value))
+        if self.use_scale:
+            _l, _r, scale = delta.now.world.decompose()
+            if not _same_vec(scale, self.bone_scale):
+                updates.append(("bone_scale", tuple(scale)))
+        return self._set_fields(updates) or changed
+
+    def readout(self, obj, pbone):
+        """Unticked components are not driven: they just show the bone."""
+        from mathutils import Euler
+
+        loc, _rot, scale = (obj.matrix_world @ pbone.matrix).decompose()
+        changed = False
+        if not self.use_location and not self.position_is_linked():
+            changed |= _write_socket_value(self, "Position", loc)
+        updates = []
+        if not self.use_rotation:
+            e = (obj.matrix_world @ pbone.matrix).to_euler(
+                "XYZ", Euler(self.bone_rotation, "XYZ")
+            )
+            if not _same_vec((e.x, e.y, e.z), self.bone_rotation):
+                updates.append(("bone_rotation", (e.x, e.y, e.z)))
+        if not self.use_scale and not _same_vec(scale, self.bone_scale):
+            updates.append(("bone_scale", tuple(scale)))
+        return self._set_fields(updates) or changed
+
+    def _set_fields(self, updates):
         global _syncing_bone_read
         from .tree import suspend_live_update
 
-        if not self.bone:
-            return False
-        if obj is None or getattr(obj, "type", "") != "ARMATURE":
-            obj = self.resolve_armature()
-        # Edit mode leaves pose matrices stale; reading them would store
-        # nonsense the moment the user tabs back out.
-        if obj is None or obj.pose is None or obj.mode == "EDIT":
-            return False
-        pbone = obj.pose.bones.get(self.bone)
-        if pbone is None:
-            return False
-
-        loc, rot, scale = (obj.matrix_world @ pbone.matrix).decompose()
-        euler = rot.to_euler("XYZ")
-        updates = []
-        if (
-            not self.use_location
-            and not self.position_is_linked()
-            and (Vector(self.position() or (0, 0, 0)) - loc).length > _EPS
-        ):
-            self.set_position(loc)
-        if (
-            not self.use_rotation
-            and (Vector(self.bone_rotation) - Vector(euler)).length > _EPS
-        ):
-            updates.append(("bone_rotation", (euler.x, euler.y, euler.z)))
-        if not self.use_scale and (Vector(self.bone_scale) - scale).length > _EPS:
-            updates.append(("bone_scale", tuple(scale)))
         if not updates:
             return False
-
         _syncing_bone_read = True
         try:
-            # Suspended: following the bone is display, not an edit, and must
-            # not schedule a rebuild -- that would be a loop of its own.
             with suspend_live_update():
                 for name, value in updates:
                     setattr(self, name, value)
@@ -895,6 +1007,10 @@ class BoneNode(_ModifierNodeBase, Node):
         finally:
             _syncing_bone_read = False
         return True
+
+    def follow_live_transform(self, obj=None):
+        """Kept for callers that predate the live link."""
+        return self.follow_live()
 
     def draw_buttons(self, context, layout):
         layout.context_pointer_set("node", self)
@@ -977,8 +1093,12 @@ class BoneNode(_ModifierNodeBase, Node):
                 continue
             if self.use_location and position is not None:
                 b.pose_location = tuple(position)
+                b.pose_offset = _ZERO
+                b.pose_local_offset = _ZERO
             if self.use_rotation:
                 b.pose_rotation = tuple(self.bone_rotation)
+                b.pose_rotation_offset = _ZERO
+                b.pose_local_rotation = _ZERO
             if self.use_scale:
                 b.pose_scale = tuple(self.bone_scale)
             # Constraints are pose-stack data, so they only reach the
@@ -1377,69 +1497,437 @@ def _redraw_viewports():
 # ---------------------------------------------------------------------------
 
 
-class PositionNode(_ModifierNodeBase, Node):
-    """Set the world position of the selected bones (Set Position).
+_ZERO = (0.0, 0.0, 0.0)
 
-    A pose transform: the bone is moved the way grabbing it in Pose mode
-    would, and its rest geometry is untouched -- so this cannot deform the
-    proportions of the rig it is layered onto, and a custom shape follows
-    because Blender draws widgets at the posed bone.
+
+def _nonzero(value):
+    return any(abs(v) > 1e-9 for v in value)
+
+
+def _not_unit(value):
+    return any(abs(v - 1.0) > 1e-9 for v in value)
+
+
+def _add(a, b):
+    return tuple(x + y for x, y in zip(a or _ZERO, b))
+
+
+def _compose(offset, previous):
+    """Rotation ``offset`` applied after ``previous``, both XYZ Euler.
+
+    Composed as quaternions: adding Euler angles is only right for rotations
+    about a single axis, and stacks of Rotation / Transform nodes are exactly
+    where that breaks.
+    """
+    from mathutils import Euler
+
+    q = Euler(tuple(offset), "XYZ").to_quaternion() @ Euler(
+        tuple(previous or _ZERO), "XYZ"
+    ).to_quaternion()
+    e = q.to_euler("XYZ")
+    return (e.x, e.y, e.z)
+
+
+def _on_transform_select_changed(self, context):
+    """A bone was picked: seed the absolute value from it, then rebuild."""
+    self.seed_from_bone()
+    self.schedule_rebuild()
+
+
+# True while code (not the user) flips Set Position / Set Rotation, so the
+# callback does not seed over a value that is being deliberately kept.
+_seeding_suspended = False
+
+
+def _on_use_absolute_changed(self, context):
+    """Set Position / Set Rotation toggled on: start from where the bone is,
+    so ticking the box never makes it jump."""
+    if not _seeding_suspended:
+        self.seed_from_bone()
+    self.schedule_rebuild()
+
+
+def _set_without_seeding(node, prop, value):
+    """Flip a Set checkbox without the callback overwriting the socket.
+
+    ``node[prop] = value`` used to be the way to skip an update callback. On
+    Blender 5.x it no longer reaches the RNA property at all -- it creates a
+    separate custom property of the same name and leaves the real one alone --
+    so the guard has to be explicit.
+    """
+    global _seeding_suspended
+    _seeding_suspended = True
+    try:
+        setattr(node, prop, value)
+    finally:
+        _seeding_suspended = False
+
+
+def _acos_w(q):
+    import math
+
+    return math.acos(min(1.0, abs(q.w)))
+
+
+def _draw_live_state(node, layout):
+    """Say whether the node is mirroring a bone, and if not, why."""
+    obj, pbone = node.live_bone()
+    if pbone is not None:
+        layout.label(text=f"Live: {pbone.name}", icon="LINKED")
+    elif node.bone and ";" in node.bone:
+        layout.label(text="Live link needs a single bone", icon="UNLINKED")
+
+
+class _TransformNodeBase(_LiveLinkMixin, _ModifierNodeBase):
+    """Shared plumbing for the Transform category.
+
+    Each node lists its value sockets in ``_INPUTS``. ``ensure_inputs`` brings
+    a node saved by an older version into line -- earlier versions used plain
+    Vector sockets for rotation, which showed metres and read "90" as ninety
+    radians -- so an existing graph is fixed on sight rather than needing its
+    nodes deleted and re-added.
+    """
+
+    _INPUTS = ()  # (name, socket class, default or None)
+
+    def init(self, context):
+        super().init(context)
+        for name, cls, default in self._INPUTS:
+            sock = self.inputs.new(cls.bl_idname, name)
+            if default is not None:
+                sock.default_value = default
+
+    def ensure_inputs(self):
+        """Returns the names of sockets that did not exist before."""
+        created = set()
+        for index, (name, cls, default) in enumerate(self._INPUTS, start=1):
+            sock = self.inputs.get(name)
+            if sock is not None and sock.bl_idname == cls.bl_idname:
+                continue
+            carried = None
+            if sock is not None:
+                # Keep what the user typed: an old Vector-typed Rotation held
+                # radians, which is exactly what the new socket stores.
+                carried = tuple(getattr(sock, "default_value", ()) or ()) or None
+                self.inputs.remove(sock)
+            else:
+                created.add(name)
+            sock = self.inputs.new(cls.bl_idname, name)
+            if carried is not None and len(carried) == 3:
+                sock.default_value = carried
+            elif default is not None:
+                sock.default_value = default
+            try:
+                self.inputs.move(len(self.inputs) - 1, index)
+            except (AttributeError, RuntimeError, TypeError, ValueError):
+                pass  # order is cosmetic; the socket works wherever it sits
+        return created
+
+    def socket_value(self, name, fallback=_ZERO):
+        sock = self.inputs.get(name)
+        if sock is None or not hasattr(sock, "get_value"):
+            return tuple(fallback)
+        return tuple(float(v) for v in sock.get_value())
+
+    def socket_linked(self, name):
+        sock = self.inputs.get(name)
+        return bool(sock is not None and sock.is_linked)
+
+    def single_bone(self):
+        """(armature, pose bone) when exactly one bone is selected."""
+        names = [n.strip() for n in self.bone.split(";") if n.strip()]
+        if len(names) != 1:
+            return None, None
+        obj = self.resolve_armature()
+        if obj is None or obj.pose is None:
+            return None, None
+        return obj, obj.pose.bones.get(names[0])
+
+    def write_socket(self, name, value):
+        """Set a socket's own value without scheduling a rebuild per axis."""
+        return _write_socket_value(self, name, value)
+
+    def live_bone(self):
+        return self.single_bone()
+
+    def on_socket_edited(self, sock):
+        """The user typed into a socket. Overridden where that means more."""
+
+    def seed_from_bone(self):
+        """Overridden by the nodes that have an absolute value to seed."""
+
+    @staticmethod
+    def top_level(bones, chosen):
+        """``chosen`` minus bones whose ancestor is also chosen.
+
+        A relative move is resolved against the rest pose, which follows the
+        parent -- so moving a parent and its child by +1 X would carry the
+        child +1 with its parent and then move it +1 more. Blender's own
+        transform has the same problem and the same answer: with a parent and
+        child both selected, only the parent is transformed and the child is
+        carried. Each bone ends up moved exactly once.
+        """
+        names = {b.name for b in chosen}
+        parents = {b.name: b.parent for b in bones}
+        out = []
+        for b in chosen:
+            parent, seen = parents.get(b.name), set()
+            carried = False
+            while parent and parent not in seen:
+                if parent in names:
+                    carried = True
+                    break
+                seen.add(parent)
+                parent = parents.get(parent)
+            if not carried:
+                out.append(b)
+        return out
+
+    def draw_buttons(self, context, layout):
+        self.ensure_inputs()
+        self.draw_bone_select(layout)
+
+
+class PositionNode(_TransformNodeBase, Node):
+    """Set Position -- move the selected bones, like the Geometry Nodes node.
+
+    * **Position**: where the bones go, in world space. Used only when *Set
+      Position* is ticked or something is wired in; otherwise the bones keep
+      their location. That default is what makes a freshly added node
+      harmless: it used to take (0, 0, 0) with every bone selected, so
+      dropping one on the wire sent the whole rig to the origin.
+    * **Offset**: added on top, along world axes. On its own it moves bones
+      relative to their rest pose, so rebuilding never adds it twice.
+
+    Setting a position replaces any offset an earlier node applied -- the
+    later node wins, as in Geometry Nodes. Pose only; rest geometry is never
+    touched.
     """
 
     bl_idname = "ArmatureNodesPositionNode"
     bl_label = "Position"
     bl_icon = "CON_LOCLIKE"
 
-    bone: _bone_select_prop()
+    bone: _bone_select_prop(update=_on_transform_select_changed)
+    use_position: BoolProperty(
+        name="Set Position",
+        description=(
+            "Move the bones to Position. Off, they keep their location and "
+            "only Offset applies"
+        ),
+        default=False,
+        update=_on_use_absolute_changed,
+    )
 
-    def init(self, context):
-        super().init(context)
-        self.inputs.new(VectorSocket.bl_idname, "Position")
+    _INPUTS = (("Position", VectorSocket, None), ("Offset", VectorSocket, None))
+
+    def uses_absolute(self):
+        return self.use_position or self.socket_linked("Position")
+
+    def ensure_inputs(self):
+        created = super().ensure_inputs()
+        # A node saved before Offset existed applied its Position whenever it
+        # ran. If one was set, tick the box so it keeps doing so instead of
+        # quietly becoming a no-op.
+        if "Offset" in created and not self.socket_linked("Position"):
+            if _nonzero(self.socket_value("Position")):
+                # Not a plain assignment: the callback would seed Position
+                # from the bone and overwrite the very value being kept.
+                _set_without_seeding(self, "use_position", True)
+        return created
+
+    def seed_from_bone(self):
+        if not self.use_position:
+            return
+        obj, pbone = self.single_bone()
+        if pbone is not None:
+            self.write_socket("Position", (obj.matrix_world @ pbone.matrix).to_translation())
+
+    def on_socket_edited(self, sock):
+        # Typing a position is asking for it: take the bone over, rather than
+        # leaving a field that looks like an input but only displays.
+        if sock.name == "Position" and not self.use_position:
+            _set_without_seeding(self, "use_position", True)
+
+    def absorb(self, obj, pbone, delta):
+        """The user moved the bone: fold the move into whatever drives it."""
+        if self.socket_linked("Position"):
+            marker_node, marker = _linked_marker(self, "Position")
+            if marker is None:
+                return False  # driven by something that cannot be written back
+            marker.set_position(Vector(marker.position) + delta.world_loc)
+            marker_node.push_markers_to_empties()
+            return True
+        if self.use_position:
+            value = Vector(self.socket_value("Position")) + delta.world_loc
+            return self.write_socket("Position", value)
+        if _nonzero(self.socket_value("Offset")):
+            # Measured from rest: a parent or object move is not an offset.
+            value = Vector(self.socket_value("Offset")) + delta.rel_loc
+            return self.write_socket("Offset", value)
+        return False
+
+    def readout(self, obj, pbone):
+        """Not driving: Position simply shows where the bone is."""
+        if self.uses_absolute():
+            return False
+        return self.write_socket("Position", (obj.matrix_world @ pbone.matrix).to_translation())
 
     def draw_buttons(self, context, layout):
-        self.draw_bone_select(layout)
+        super().draw_buttons(context, layout)
+        layout.prop(self, "use_position")
+        if self.socket_linked("Position"):
+            layout.label(text="Position from the wired input", icon="LINKED")
+        elif self.uses_absolute() and not self.bone:
+            layout.label(text="Every bone goes to one point", icon="ERROR")
+        _draw_live_state(self, layout)
 
     def eval_bones(self, ctx):
         bones = self.stream(ctx)
-        sock = self.inputs.get("Position")
-        position = sock.get_value() if sock is not None else (0.0, 0.0, 0.0)
-        for b in self.selected(bones):
-            b.pose_location = tuple(position)
+        absolute = self.uses_absolute()
+        position = self.socket_value("Position")
+        offset = self.socket_value("Offset")
+        has_offset = _nonzero(offset)
+        if not absolute and not has_offset:
+            return bones  # nothing asked: the node is a pass-through
+        chosen = self.selected(bones)
+        if absolute:
+            for b in chosen:
+                b.pose_location = position
+                b.pose_offset = _ZERO
+                b.pose_local_offset = _ZERO
+        if has_offset:
+            for b in self.top_level(bones, chosen):
+                b.pose_offset = _add(b.pose_offset, offset)
         return bones
 
 
-class RotationNode(_ModifierNodeBase, Node):
-    """Set the world orientation of the selected bones."""
+class RotationNode(_TransformNodeBase, Node):
+    """Set Rotation -- orient the selected bones, in degrees.
+
+    * **Rotation**: the world orientation to give the bones. Used only when
+      *Set Rotation* is ticked or something is wired in (a wired marker
+      supplies its own rotation). Off, the bones keep their orientation.
+    * **Offset**: turned on top, along world axes, about each bone's own head.
+
+    Setting a rotation replaces any rotation offset an earlier node applied.
+    """
 
     bl_idname = "ArmatureNodesRotationNode"
     bl_label = "Rotation"
     bl_icon = "CON_ROTLIKE"
 
-    bone: _bone_select_prop()
+    bone: _bone_select_prop(update=_on_transform_select_changed)
+    use_rotation: BoolProperty(
+        name="Set Rotation",
+        description=(
+            "Give the bones this orientation. Off, they keep theirs and only "
+            "Offset applies"
+        ),
+        default=False,
+        update=_on_use_absolute_changed,
+    )
 
-    def init(self, context):
-        super().init(context)
-        sock = self.inputs.new(VectorSocket.bl_idname, "Rotation")
-        sock.default_value = (0.0, 0.0, 0.0)
+    _INPUTS = (("Rotation", RotationSocket, None), ("Offset", RotationSocket, None))
+
+    def uses_absolute(self):
+        return self.use_rotation or self.socket_linked("Rotation")
+
+    def ensure_inputs(self):
+        created = super().ensure_inputs()
+        if "Offset" in created and not self.socket_linked("Rotation"):
+            if _nonzero(self.socket_value("Rotation")):
+                _set_without_seeding(self, "use_rotation", True)
+        return created
+
+    def seed_from_bone(self):
+        if not self.use_rotation:
+            return
+        obj, pbone = self.single_bone()
+        if pbone is not None:
+            e = (obj.matrix_world @ pbone.matrix).to_euler("XYZ")
+            self.write_socket("Rotation", (e.x, e.y, e.z))
+
+    def on_socket_edited(self, sock):
+        if sock.name == "Rotation" and not self.use_rotation:
+            _set_without_seeding(self, "use_rotation", True)
+
+    def absorb(self, obj, pbone, delta):
+        from mathutils import Euler
+
+        from . import livelink
+
+        if self.socket_linked("Rotation"):
+            marker_node, marker = _linked_marker(self, "Rotation")
+            if marker is None:
+                return False
+            marker.set_rotation(livelink.compose(delta.world_rot, marker.rotation))
+            marker_node.push_markers_to_empties()
+            return True
+        if self.use_rotation:
+            # The node's own Offset sits on top of Rotation, so the user's turn
+            # is taken into Rotation's frame before it is composed in.
+            own = Euler(self.socket_value("Offset"), "XYZ").to_quaternion()
+            spin = own.inverted() @ delta.world_rot @ own
+            value = livelink.compose(spin, self.socket_value("Rotation"))
+            return self.write_socket("Rotation", value)
+        if _nonzero(self.socket_value("Offset")):
+            value = livelink.compose(delta.rel_rot, self.socket_value("Offset"))
+            return self.write_socket("Offset", value)
+        return False
+
+    def readout(self, obj, pbone):
+        from mathutils import Euler
+
+        if self.uses_absolute():
+            return False
+        current = Euler(self.socket_value("Rotation"), "XYZ")
+        e = (obj.matrix_world @ pbone.matrix).to_euler("XYZ", current)
+        return self.write_socket("Rotation", (e.x, e.y, e.z))
 
     def draw_buttons(self, context, layout):
-        self.draw_bone_select(layout)
+        super().draw_buttons(context, layout)
+        layout.prop(self, "use_rotation")
+        if self.socket_linked("Rotation"):
+            layout.label(text="Rotation from the wired input", icon="LINKED")
+        _draw_live_state(self, layout)
 
     def eval_bones(self, ctx):
         bones = self.stream(ctx)
-        sock = self.inputs.get("Rotation")
-        rotation = sock.get_value() if sock is not None else (0.0, 0.0, 0.0)
-        for b in self.selected(bones):
-            b.pose_rotation = tuple(rotation)
+        absolute = self.uses_absolute()
+        rotation = self.socket_value("Rotation")
+        offset = self.socket_value("Offset")
+        has_offset = _nonzero(offset)
+        if not absolute and not has_offset:
+            return bones
+        chosen = self.selected(bones)
+        if absolute:
+            for b in chosen:
+                b.pose_rotation = rotation
+                b.pose_rotation_offset = _ZERO
+                b.pose_local_rotation = _ZERO
+        if has_offset:
+            for b in self.top_level(bones, chosen):
+                b.pose_rotation_offset = _compose(offset, b.pose_rotation_offset)
         return bones
 
 
-class TransformNode(_ModifierNodeBase, Node):
-    """Offset the selected bones (Transform Geometry).
+class TransformNode(_TransformNodeBase, Node):
+    """Transform -- move, turn and scale the selected bones relative to rest.
 
-    Translation and rotation are *deltas* added to whatever pose the bone
-    already has, so several Transform nodes stack. Scale is absolute, because
-    a control's scale is a value rather than a displacement.
+    Like Geometry Nodes' Transform Geometry: nothing is absolute, so several
+    Transform nodes stack, and each build resolves against the rest pose
+    rather than the live one -- rebuilding never applies the move twice.
+
+    **Space** decides the axes:
+
+    * **World**: along the scene axes, whatever way the bone points.
+    * **Local**: along the bone's own axes -- these are its Location and
+      Rotation channels, the values in the N-panel, and they follow the
+      parent the way hand-posing does.
+
+    Rotation is about each bone's own head. Scale multiplies what earlier
+    nodes set, and 1 means unchanged.
     """
 
     bl_idname = "ArmatureNodesTransformNode"
@@ -1447,50 +1935,102 @@ class TransformNode(_ModifierNodeBase, Node):
     bl_icon = "ORIENTATION_GLOBAL"
 
     bone: _bone_select_prop()
-    scale: FloatVectorProperty(
-        name="Scale", size=3, default=(1.0, 1.0, 1.0), subtype="XYZ"
-    )
-    use_scale: BoolProperty(
-        name="Set Scale",
-        description="Off leaves the control's scale alone",
-        default=False,
+    space: EnumProperty(
+        name="Space",
+        items=(
+            ("WORLD", "World", "Along the scene axes"),
+            ("LOCAL", "Local", "Along the bone's own axes: its Location and Rotation channels"),
+        ),
+        default="WORLD",
     )
 
-    def init(self, context):
-        super().init(context)
-        self.inputs.new(VectorSocket.bl_idname, "Translation")
-        self.inputs.new(VectorSocket.bl_idname, "Rotation")
+    _INPUTS = (
+        ("Translation", VectorSocket, None),
+        ("Rotation", RotationSocket, None),
+        ("Scale", ScaleSocket, (1.0, 1.0, 1.0)),
+    )
+
+    def absorb(self, obj, pbone, delta):
+        """Fold the user's move in, per component.
+
+        A component the node already drives takes the delta, which is safe on
+        a constrained bone because the delta never contains the node's own
+        write. A component it does not drive yet takes the bone's whole
+        current offset from rest instead -- otherwise a bone that was already
+        hand-posed would jump back by that amount the moment the node started
+        driving it.
+        """
+        from mathutils import Euler
+
+        from . import livelink
+
+        local = self.space == "LOCAL"
+        now = delta.now
+        t = self.socket_value("Translation")
+        r = self.socket_value("Rotation")
+        s = self.socket_value("Scale", (1.0, 1.0, 1.0))
+        changed = False
+
+        if local:
+            loc_step, rot_step = delta.local_loc, delta.local_rot
+            basis_loc, basis_rot, _ = now.basis.decompose()
+            loc_whole = basis_loc
+            rot_whole = basis_rot
+        else:
+            loc_step, rot_step = delta.rel_loc, delta.rel_rot
+            wl, wr, _ = now.world.decompose()
+            rl, rr, _ = now.rest.decompose()
+            loc_whole = wl - rl
+            rot_whole = wr @ rr.inverted()
+
+        if loc_step.length > 1e-5:
+            value = Vector(t) + loc_step if _nonzero(t) else loc_whole
+            changed |= self.write_socket("Translation", value)
+        if 2.0 * _acos_w(rot_step) > 1e-5:
+            if _nonzero(r):
+                value = livelink.compose(rot_step, r)
+            else:
+                e = rot_whole.to_euler("XYZ", Euler(r, "XYZ"))
+                value = (e.x, e.y, e.z)
+            changed |= self.write_socket("Rotation", value)
+        if (delta.scale_ratio - Vector((1.0, 1.0, 1.0))).length > 1e-5:
+            value = tuple(a * b for a, b in zip(s, delta.scale_ratio))
+            changed |= self.write_socket("Scale", value)
+        return changed
 
     def draw_buttons(self, context, layout):
-        self.draw_bone_select(layout)
-        row = layout.row(align=True)
-        row.prop(self, "use_scale", text="")
-        sub = row.row(align=True)
-        sub.enabled = self.use_scale
-        sub.prop(self, "scale", text="")
+        super().draw_buttons(context, layout)
+        layout.prop(self, "space", expand=True)
+        _draw_live_state(self, layout)
 
     def eval_bones(self, ctx):
         bones = self.stream(ctx)
-        t_sock = self.inputs.get("Translation")
-        r_sock = self.inputs.get("Rotation")
-        translation = Vector(t_sock.get_value() if t_sock else (0, 0, 0))
-        rotation = Vector(r_sock.get_value() if r_sock else (0, 0, 0))
-        for b in self.selected(bones):
-            # Fold into an absolute target when one is already set, so a
-            # Position node followed by a Transform node reads as "put it
-            # there, then nudge it" rather than the two fighting.
-            if b.pose_location is not None:
-                b.pose_location = tuple(Vector(b.pose_location) + translation)
-            else:
-                b.pose_offset = tuple(Vector(b.pose_offset) + translation)
-            if b.pose_rotation is not None:
-                b.pose_rotation = tuple(Vector(b.pose_rotation) + rotation)
-            else:
-                b.pose_rotation_offset = tuple(
-                    Vector(b.pose_rotation_offset) + rotation
-                )
-            if self.use_scale:
-                b.pose_scale = tuple(self.scale)
+        translation = self.socket_value("Translation")
+        rotation = self.socket_value("Rotation")
+        scale = self.socket_value("Scale", (1.0, 1.0, 1.0))
+        move, turn, grow = _nonzero(translation), _nonzero(rotation), _not_unit(scale)
+        if not (move or turn or grow):
+            return bones
+        local = self.space == "LOCAL"
+        chosen = self.selected(bones)
+        # Local is channel semantics -- every bone's own Location / Rotation,
+        # which do accumulate down a chain, exactly as typing the same value
+        # into each bone's N-panel would. World moves each bone once.
+        targets = chosen if local else self.top_level(bones, chosen)
+        for b in targets:
+            if move:
+                if local:
+                    b.pose_local_offset = _add(b.pose_local_offset, translation)
+                else:
+                    b.pose_offset = _add(b.pose_offset, translation)
+            if turn:
+                if local:
+                    b.pose_local_rotation = _compose(rotation, b.pose_local_rotation)
+                else:
+                    b.pose_rotation_offset = _compose(rotation, b.pose_rotation_offset)
+            if grow:
+                base = b.pose_scale or (1.0, 1.0, 1.0)
+                b.pose_scale = tuple(x * y for x, y in zip(base, scale))
         return bones
 
 
@@ -1603,6 +2143,8 @@ class SnapNode(_ModifierNodeBase, Node):
                 print(f"[Armature Nodes] Snap failed on '{b.name}': {exc}")
                 continue
             b.pose_location = tuple(Vector(anchor) + offset)
+            b.pose_offset = _ZERO
+            b.pose_local_offset = _ZERO
         return bones
 
 

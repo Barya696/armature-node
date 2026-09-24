@@ -131,26 +131,28 @@ def set_pose(record, names, location=None, rotation=None, scale=None):
     )
 
 
-def offset_pose(record, names, location=None, rotation=None):
-    """Add to the pose already on the wire.
+def offset_pose(record, names, location=None, rotation=None, local=False):
+    """Move bones relative to their rest pose.
 
     Offsets accumulate, so several Transform nodes in a row stack instead of
-    overwriting each other. An offset against a bone with no pose set yet is
-    measured from the record's rest state, which the apply stage resolves --
-    here it simply seeds the value.
+    overwriting each other. They are stored as offsets -- not folded into an
+    absolute location -- because the rest pose they are relative to is only
+    known at apply time, and resolving against the live pose would add the
+    offset again on every build.
     """
+    loc_key = "local_offset" if local else "offset"
+    rot_key = "local_rotation" if local else "rotation_offset"
 
     def bump(b):
         t = b.transform
-        loc = t.location
-        rot = t.rotation
+        changes = {}
         if location is not None:
-            base = loc or (0.0, 0.0, 0.0)
-            loc = tuple(a + o for a, o in zip(base, location))
+            base = getattr(t, loc_key) or (0.0, 0.0, 0.0)
+            changes[loc_key] = tuple(a + o for a, o in zip(base, location))
         if rotation is not None:
-            base = rot or (0.0, 0.0, 0.0)
-            rot = tuple(a + o for a, o in zip(base, rotation))
-        return replace(b, transform=replace(t, location=loc, rotation=rot))
+            base = getattr(t, rot_key) or (0.0, 0.0, 0.0)
+            changes[rot_key] = tuple(a + o for a, o in zip(base, rotation))
+        return replace(b, transform=replace(t, **changes))
 
     if location is None and rotation is None:
         return record
