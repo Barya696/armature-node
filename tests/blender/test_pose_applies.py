@@ -61,7 +61,7 @@ def _assert_moved(obj, tree, bone, mode):
 
     build_armature_from_tree(tree)
     target = (3.0, 0.0, 5.0)
-    bone.bone_location = target
+    bone.inputs["Position"].default_value = target
     build_armature_from_tree(tree)
 
     got = _world_head(obj, "bone.002")
@@ -91,7 +91,7 @@ def test_pose_applies_while_in_pose_mode():
     bpy.ops.object.mode_set(mode="POSE")
     assert obj.mode == "POSE"
 
-    bone.bone_location = (0.0, 2.0, 4.0)
+    bone.inputs["Position"].default_value = (0.0, 2.0, 4.0)
     build_armature_from_tree(tree)
 
     assert obj.mode == "POSE", "applying a pose changed the mode"
@@ -107,7 +107,7 @@ def test_unchecked_components_are_left_alone():
     bone.use_scale = False
     before = obj.pose.bones["bone.002"].matrix_basis.to_scale()
 
-    bone.bone_location = (1.0, 1.0, 1.0)
+    bone.inputs["Position"].default_value = (1.0, 1.0, 1.0)
     build_armature_from_tree(tree)
 
     after = obj.pose.bones["bone.002"].matrix_basis.to_scale()
@@ -156,3 +156,53 @@ def test_a_blocked_pose_is_reported_not_silently_dropped():
     message = result.errors[0]
     assert "bone.002" in message
     assert "connected" in message or "locked" in message, message
+
+
+def test_typing_into_an_unlinked_position_socket_works():
+    """The reported bug: the socket accepted typing and discarded it."""
+    from armature_nodes.build import build_armature_from_tree
+
+    obj, tree, bone = _setup("MODIFY")
+    sock = bone.inputs["Position"]
+    assert not sock.is_linked, "this test is about the UNLINKED socket"
+
+    sock.default_value = (2.0, 0.0, 4.0)
+    build_armature_from_tree(tree)
+
+    got = _world_head(obj, "bone.002")
+    assert abs(got.x - 2.0) < 1e-4 and abs(got.z - 4.0) < 1e-4, f"got {got[:]}"
+
+
+def test_a_linked_marker_overrides_the_typed_value():
+    from armature_nodes.build import build_armature_from_tree
+
+    obj, tree, bone = _setup("MODIFY")
+    bone.inputs["Position"].default_value = (9.0, 9.0, 9.0)
+
+    skel = tree.nodes.new("ArmatureNodesSkeletonNode")
+    marker = skel.markers[0]
+    marker.set_position((1.0, 0.0, 3.0))
+    sock = next(s for s in skel.outputs if s.marker_key == marker.key)
+    tree.links.new(sock, bone.inputs["Position"])
+
+    build_armature_from_tree(tree)
+    got = _world_head(obj, "bone.002")
+    assert abs(got.x - 1.0) < 1e-4 and abs(got.z - 3.0) < 1e-4, (
+        f"marker should win over the typed value, got {got[:]}"
+    )
+
+
+def test_use_location_off_ignores_the_socket():
+    from armature_nodes.build import build_armature_from_tree
+
+    obj, tree, bone = _setup("MODIFY")
+    build_armature_from_tree(tree)
+    before = _world_head(obj, "bone.002")
+
+    bone.use_location = False
+    bone.inputs["Position"].default_value = (7.0, 7.0, 7.0)
+    build_armature_from_tree(tree)
+
+    after = _world_head(obj, "bone.002")
+    for a, b in zip(before, after):
+        assert abs(a - b) < 1e-4, "location was written although its box was off"

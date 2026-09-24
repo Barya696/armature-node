@@ -737,13 +737,6 @@ class BoneNode(_ModifierNodeBase, Node):
         default="",
         update=_on_bone_selected,
     )
-    bone_location: FloatVectorProperty(
-        name="Location",
-        description="World position of the bone",
-        size=3,
-        default=(0.0, 0.0, 0.0),
-        subtype="TRANSLATION",
-    )
     bone_rotation: FloatVectorProperty(
         name="Rotation",
         description="World orientation of the bone, as an XYZ Euler",
@@ -768,16 +761,39 @@ class BoneNode(_ModifierNodeBase, Node):
         self._multi_input(ConstraintSocket.bl_idname, "Constraints")
         self.width = 220
 
-    def driven_position(self):
-        """The world position wired into this node, or None when nothing is.
+    def position_socket(self):
+        return self.inputs.get("Position")
 
-        A linked Marker wins over the node's own Location field: the whole
-        point of wiring one in is that the handle is now the control.
+    def position(self):
+        """The world position this node asks for.
+
+        The **Position socket is the location input**, whether or not a wire is
+        plugged into it -- unlinked it is the value field (the Geometry Nodes
+        convention), linked it follows the marker.
+
+        This used to return None unless something was wired in, so the socket
+        was drawn editable, accepted typing, and silently discarded it. The
+        node also carried a separate Location field that did work, which meant
+        two location inputs that disagreed.
         """
-        sock = self.inputs.get("Position")
-        if sock is None or not sock.is_linked:
+        sock = self.position_socket()
+        if sock is None:
             return None
         return sock.get_value()
+
+    def position_is_linked(self):
+        sock = self.position_socket()
+        return bool(sock is not None and sock.is_linked)
+
+    def set_position(self, value):
+        """Write the socket's own value, bypassing the rebuild callback."""
+        sock = self.position_socket()
+        if sock is None:
+            return
+        from .tree import suspend_live_update
+
+        with suspend_live_update():
+            sock.default_value = tuple(value)
 
     def linked_marker(self):
         """(node, marker) driving the Position input, or (None, None)."""
@@ -804,7 +820,7 @@ class BoneNode(_ModifierNodeBase, Node):
         loc, rot, scale = (obj.matrix_world @ pbone.matrix).decompose()
         _syncing_bone_read = True
         try:
-            self.bone_location = tuple(loc)
+            self.set_position(loc)
             self.bone_rotation = tuple(rot.to_euler("XYZ"))
             self.bone_scale = tuple(scale)
             self.synced = True
@@ -852,8 +868,12 @@ class BoneNode(_ModifierNodeBase, Node):
         loc, rot, scale = (obj.matrix_world @ pbone.matrix).decompose()
         euler = rot.to_euler("XYZ")
         updates = []
-        if not self.use_location and (Vector(self.bone_location) - loc).length > _EPS:
-            updates.append(("bone_location", tuple(loc)))
+        if (
+            not self.use_location
+            and not self.position_is_linked()
+            and (Vector(self.position() or (0, 0, 0)) - loc).length > _EPS
+        ):
+            self.set_position(loc)
         if (
             not self.use_rotation
             and (Vector(self.bone_rotation) - Vector(euler)).length > _EPS
@@ -892,11 +912,19 @@ class BoneNode(_ModifierNodeBase, Node):
             layout.label(text="Pick a bone to pose", icon="INFO")
             return
         self._draw_blockers(layout, obj)
-        driven = self.driven_position() is not None
-        if driven:
-            layout.label(text="Location driven by a marker", icon="EMPTY_AXIS")
+
+        # Location lives on the Position socket, not here: one input, editable
+        # in place when nothing is wired in, driven by a marker when something
+        # is. Two location fields that disagreed is what made the socket look
+        # broken.
+        row = layout.row(align=True)
+        row.prop(self, "use_location", text="")
+        if self.position_is_linked():
+            row.label(text="Position: from marker", icon="EMPTY_AXIS")
+        else:
+            row.label(text="Position: see input below", icon="EMPTY_AXIS")
+
         for flag, prop in (
-            ("use_location", "bone_location"),
             ("use_rotation", "bone_rotation"),
             ("use_scale", "bone_scale"),
         ):
@@ -904,11 +932,9 @@ class BoneNode(_ModifierNodeBase, Node):
             row.prop(self, flag, text="")
             sub = row.column(align=True)
             # Unticked, the field follows the bone and is read-only: it is a
-            # readout, not an input. A wired marker owns the location the same
-            # way, so showing either editable would invite an edit that the
-            # next rebuild throws away.
-            on = getattr(self, flag)
-            sub.enabled = on and not (driven and prop == "bone_location")
+            # readout, not an input, so showing it editable would invite an
+            # edit that the next rebuild throws away.
+            sub.enabled = getattr(self, flag)
             sub.prop(self, prop, text="")
         layout.label(text="Unticked values follow the bone", icon="INFO")
 
@@ -945,14 +971,12 @@ class BoneNode(_ModifierNodeBase, Node):
         if not self.bone:
             return bones
         constraints = gather_input_constraints(self, "Constraints", ctx)
-        driven = self.driven_position()
+        position = self.position()
         for b in bones:
             if b.name != self.bone:
                 continue
-            if driven is not None:
-                b.pose_location = tuple(driven)
-            elif self.use_location:
-                b.pose_location = tuple(self.bone_location)
+            if self.use_location and position is not None:
+                b.pose_location = tuple(position)
             if self.use_rotation:
                 b.pose_rotation = tuple(self.bone_rotation)
             if self.use_scale:
