@@ -30,14 +30,14 @@ def decompile_armature_to_tree(obj, tree, shapes_only=False, full=False):
       bones, so nodes can add and remove them.
     """
     from .nodes import ArmatureInputNode, ArmatureOutputNode
-    from . import baseline
 
-    # Record what the rig is before any graph runs against it. Taken here
-    # because this is the one moment the armature is guaranteed unmodified by
-    # this tree; everything downstream reads the stored copy, never the object.
-    if not baseline.has_baseline(obj):
-        baseline.store(obj)
-
+    # Deliberately NO capture here. Opening an editor is not a promise that
+    # the rig is unmodified -- it usually means the opposite, that the user is
+    # about to change it, and a rig whose widgets were already swapped would
+    # be recorded as its own original and saved that way for ever.
+    #
+    # An unbound rig gets a graph that reads nothing; the Input node shows
+    # "Not bound" with a Bind button, and binding is the user's decision.
     tree.nodes.clear()
 
     source = tree.nodes.new(ArmatureInputNode.bl_idname)
@@ -45,7 +45,6 @@ def decompile_armature_to_tree(obj, tree, shapes_only=False, full=False):
     source.location = (0, 0)
 
     output = tree.nodes.new(ArmatureOutputNode.bl_idname)
-    output.armature_name = obj.name
     output.mode = "FULL" if full else "MODIFY"
     output.location = (NODE_X_SPACING, 0)
 

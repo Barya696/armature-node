@@ -216,6 +216,8 @@ def _deferred_sync():
         sync_editors_to_active()
         watch_tree_topology()  # catches node/link removals update() misses
         sync_marker_handles()  # catches drags that emit no depsgraph event
+        sync_bone_nodes()  # Bone nodes follow the bones they do not drive
+        watch_armature_mode()  # a rig leaving Edit mode needs the build re-run
     except Exception as exc:  # noqa: BLE001
         print(f"[Armature Nodes] Editor sync failed: {exc}")
     return 0.25
@@ -312,6 +314,57 @@ def sync_marker_handles():
             area.tag_redraw()
 
 
+# tree name -> the mode its armature was in on the last tick.
+_armature_modes = {}
+
+
+def watch_armature_mode():
+    """Rebuild when a bound armature leaves Edit or Pose mode.
+
+    Modify mode skips while the armature is in Edit mode (``armature.bones``
+    is stale there); Full Rig defers in both Edit and Pose, because rebuilding
+    edit bones would drag the user out of whatever they were doing. Nothing
+    else would notice the mode change, so the graph would stay unapplied until
+    the user happened to touch a node.
+    """
+    for tree in _trees_to_track():
+        obj = armature_for_tree(tree)
+        if obj is None:
+            continue
+        previous = _armature_modes.get(tree.name)
+        _armature_modes[tree.name] = obj.mode
+        # Leaving Edit OR Pose: a build may have been deferred to avoid
+        # interrupting, so run it now that the user is out.
+        if previous in ("EDIT", "POSE") and obj.mode != previous:
+            tree.mark_dirty()
+
+
+def sync_bone_nodes():
+    """Let every Bone node read the components it does not drive.
+
+    This is what makes the node show a bone's current transform without the
+    user pressing anything. Only unticked components are read, so a node can
+    never chase a value it wrote -- see ``BoneNode.follow_live_transform``.
+    """
+    from .tree import is_updating
+
+    if is_updating():
+        return  # a rebuild is mid-flight; pose matrices are not trustworthy
+    changed = False
+    for tree in _trees_to_track():
+        for node in tree.nodes:
+            if node.bl_idname != "ArmatureNodesBoneNode":
+                continue
+            try:
+                if node.follow_live_transform():
+                    changed = True
+            except Exception as exc:  # noqa: BLE001
+                print(f"[Armature Nodes] Bone follow failed on '{node.name}': {exc}")
+    if changed:
+        for _space, area in _armature_node_spaces():
+            area.tag_redraw()
+
+
 @persistent
 def _on_depsgraph_update(scene, depsgraph=None):
     # Fallback: selection clicks in the viewport always trigger a depsgraph
@@ -322,8 +375,9 @@ def _on_depsgraph_update(scene, depsgraph=None):
     # one pass and does not loop.
     try:
         sync_marker_handles()
+        sync_bone_nodes()
     except Exception as exc:  # noqa: BLE001
-        print(f"[Armature Nodes] Marker sync failed: {exc}")
+        print(f"[Armature Nodes] Node sync failed: {exc}")
 
 
 @persistent
@@ -332,8 +386,9 @@ def _on_frame_change(scene, depsgraph=None):
     # node values following the animated bones.
     try:
         sync_marker_handles()
+        sync_bone_nodes()
     except Exception as exc:  # noqa: BLE001
-        print(f"[Armature Nodes] Marker sync failed: {exc}")
+        print(f"[Armature Nodes] Node sync failed: {exc}")
 
 
 @persistent

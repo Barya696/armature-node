@@ -99,11 +99,10 @@ class ArmatureNodeBase:
                 src = getattr(node, "source", None)
                 if src is not None and getattr(src, "type", "") == "ARMATURE":
                     return src
-        for node in tree.nodes:
-            if node.bl_idname == "ArmatureNodesOutputNode":
-                obj = bpy.data.objects.get(node.armature_name)
-                if obj is not None and obj.type == "ARMATURE":
-                    return obj
+        # No fallback to the Output's armature_name. The target follows the
+        # BINDING, never the selection or a typed name: a tree that quietly
+        # retargeted itself to whichever armature was active is how a rig
+        # ended up modified by a graph that was never pointed at it.
         return None
 
     def draw_bone_select(self, layout):
@@ -538,7 +537,7 @@ class ArmatureInputNode(ArmatureNodeBase, Node):
     evaluation and could never get back to the original.
 
     Instead the unmodified rig is stored on the armature object itself (see
-    ``baseline.py``) and this node inherits from that. Every evaluation starts
+    ``store/record.py``) and this node inherits from that. Every evaluation starts
     from the same base state, so deleting a node genuinely undoes it, and
     unplugging this node cannot lose anything -- the record lives on the rig,
     not in the wire.
@@ -557,7 +556,7 @@ class ArmatureInputNode(ArmatureNodeBase, Node):
         self.width = 220
 
     def draw_buttons(self, context, layout):
-        from . import baseline
+        from .store import record as record_store
 
         layout.context_pointer_set("node", self)
         layout.prop(self, "source", text="")
@@ -565,20 +564,30 @@ class ArmatureInputNode(ArmatureNodeBase, Node):
         if obj is None:
             layout.label(text="Pick the rig to modify", icon="INFO")
             return
-        stored = baseline.load(obj)
+        base = record_store.read(obj)
+        if base is None:
+            col = layout.column(align=True)
+            col.label(text="Not bound", icon="ERROR")
+            col.operator("armature_nodes.bind_rig", icon="FILE_TICK")
+            return
         row = layout.row(align=True)
-        if stored:
-            row.label(text=f"Stored: {len(stored)} bones", icon="CHECKMARK")
-        else:
-            row.label(text="Captured on first use", icon="INFO")
-        row.operator(
-            "armature_nodes.capture_baseline", text="", icon="FILE_REFRESH"
-        )
+        row.label(text=f"Bound: {len(base.bones)} bones", icon="CHECKMARK")
+        row.operator("armature_nodes.capture_record", text="", icon="FILE_REFRESH")
 
     def eval_bones(self, ctx):
-        from . import baseline
+        """The bound rig, straight from its record. Never reads the armature.
 
-        return baseline.bone_defs(self.source)
+        The record is the single source of truth, and the build diffs against
+        that same record -- reading the live object here would make the two
+        disagree, and would re-capture an already-modified rig as the original.
+        """
+        from . import bridge
+        from .store import record as record_store
+
+        base = record_store.read(self.source)
+        if base is None:
+            return []  # not bound: the Output reports it, nothing is written
+        return bridge.to_bone_defs(base)
 
 
 class ArmatureOutputNode(ArmatureNodeBase, Node):
@@ -627,16 +636,31 @@ class ArmatureOutputNode(ArmatureNodeBase, Node):
         self.width = 200
 
     def target_name(self):
-        """The object this output writes to."""
-        if self.armature_name:
+        """The object this output writes to.
+
+        In **Modify** mode that is exclusively the Armature Input's source --
+        ``armature_name`` is ignored, because modifying a rig the graph was
+        never pointed at is never what the user meant. It applies to Full Rig
+        only, where the graph builds an armature of its own and has to be able
+        to name it.
+        """
+        if self.mode != "MODIFY" and self.armature_name:
             return self.armature_name
         obj = self.resolve_armature()
-        return obj.name if obj is not None else "Armature"
+        if obj is not None:
+            return obj.name
+        return self.armature_name or "Armature"
 
     def draw_buttons(self, context, layout):
         layout.prop(self, "mode", text="")
-        layout.prop(self, "armature_name", text="")
-        if not self.armature_name:
+        # The name field only means something in Full Rig mode; showing it in
+        # Modify mode invites the user to type a target that is then ignored.
+        if self.mode != "MODIFY":
+            layout.prop(self, "armature_name", text="")
+        target = self.resolve_armature()
+        if target is None and self.mode == "MODIFY":
+            layout.label(text="No Armature Input", icon="ERROR")
+        else:
             layout.label(text=f"-> {self.target_name()}", icon="ARMATURE_DATA")
         layout.prop(self, "show_markers", toggle=True, icon="EMPTY_AXIS")
 
@@ -796,6 +820,62 @@ class BoneNode(_ModifierNodeBase, Node):
             marker_node.push_markers_to_empties()
         return True
 
+    def follow_live_transform(self, obj=None):
+        """Show the live value of the components this node does *not* drive.
+
+        Loop-free by construction. A component whose checkbox is on is written
+        by this node, so reading it back would chase its own output -- worse on
+        a constrained or parented bone, where the evaluated result differs from
+        what was written and the two would oscillate. A component whose
+        checkbox is off is never written, so following it is just display.
+
+        The pay-off is that ticking a component on never makes the bone jump:
+        the field already holds the value the bone actually has.
+
+        Returns True when a field changed, so the caller can redraw.
+        """
+        global _syncing_bone_read
+        from .tree import suspend_live_update
+
+        if not self.bone:
+            return False
+        if obj is None or getattr(obj, "type", "") != "ARMATURE":
+            obj = self.resolve_armature()
+        # Edit mode leaves pose matrices stale; reading them would store
+        # nonsense the moment the user tabs back out.
+        if obj is None or obj.pose is None or obj.mode == "EDIT":
+            return False
+        pbone = obj.pose.bones.get(self.bone)
+        if pbone is None:
+            return False
+
+        loc, rot, scale = (obj.matrix_world @ pbone.matrix).decompose()
+        euler = rot.to_euler("XYZ")
+        updates = []
+        if not self.use_location and (Vector(self.bone_location) - loc).length > _EPS:
+            updates.append(("bone_location", tuple(loc)))
+        if (
+            not self.use_rotation
+            and (Vector(self.bone_rotation) - Vector(euler)).length > _EPS
+        ):
+            updates.append(("bone_rotation", (euler.x, euler.y, euler.z)))
+        if not self.use_scale and (Vector(self.bone_scale) - scale).length > _EPS:
+            updates.append(("bone_scale", tuple(scale)))
+        if not updates:
+            return False
+
+        _syncing_bone_read = True
+        try:
+            # Suspended: following the bone is display, not an edit, and must
+            # not schedule a rebuild -- that would be a loop of its own.
+            with suspend_live_update():
+                for name, value in updates:
+                    setattr(self, name, value)
+                self.synced = True
+        finally:
+            _syncing_bone_read = False
+        return True
+
     def draw_buttons(self, context, layout):
         layout.context_pointer_set("node", self)
         obj = self.resolve_armature()
@@ -811,8 +891,7 @@ class BoneNode(_ModifierNodeBase, Node):
         if not self.bone:
             layout.label(text="Pick a bone to pose", icon="INFO")
             return
-        if not self.synced:
-            layout.label(text="Not read from the rig yet", icon="INFO")
+        self._draw_blockers(layout, obj)
         driven = self.driven_position() is not None
         if driven:
             layout.label(text="Location driven by a marker", icon="EMPTY_AXIS")
@@ -824,10 +903,42 @@ class BoneNode(_ModifierNodeBase, Node):
             row = layout.row(align=True)
             row.prop(self, flag, text="")
             sub = row.column(align=True)
-            # A wired marker owns the location, so showing the field editable
-            # would invite an edit that the next rebuild throws away.
-            sub.enabled = getattr(self, flag) and not (driven and prop == "bone_location")
+            # Unticked, the field follows the bone and is read-only: it is a
+            # readout, not an input. A wired marker owns the location the same
+            # way, so showing either editable would invite an edit that the
+            # next rebuild throws away.
+            on = getattr(self, flag)
+            sub.enabled = on and not (driven and prop == "bone_location")
             sub.prop(self, prop, text="")
+        layout.label(text="Unticked values follow the bone", icon="INFO")
+
+    def _draw_blockers(self, layout, obj):
+        """Say up front when Blender will refuse the pose.
+
+        A connected bone cannot be translated (its head is pinned to the
+        parent's tail) and locked channels are not writable. Blender accepts
+        the write and silently drops it, so without this the node looks like
+        it simply does not work.
+        """
+        if obj is None or obj.pose is None or not self.bone:
+            return
+        pbone = obj.pose.bones.get(self.bone)
+        if pbone is None:
+            layout.label(text="No such bone on the rig", icon="ERROR")
+            return
+        notes = []
+        if self.use_location and pbone.bone.use_connect:
+            notes.append("Connected: cannot be moved")
+        if self.use_location:
+            locked = [a for a, l in zip("XYZ", pbone.lock_location) if l]
+            if locked:
+                notes.append("Location " + "".join(locked) + " locked")
+        if self.use_rotation and all(pbone.lock_rotation):
+            notes.append("Rotation locked")
+        if self.use_scale and all(pbone.lock_scale):
+            notes.append("Scale locked")
+        for note in notes:
+            layout.label(text=note, icon="LOCKED")
 
     def eval_bones(self, ctx):
         bones = self.stream(ctx)

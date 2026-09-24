@@ -64,33 +64,63 @@ searchable dropdown of that rig's real bone names.
 
 The graph stays the size of your edits, not the size of the rig.
 
-### The rig stores its own baseline
+### The rig is the database
 
 The Armature Output writes back to the same object the Input reads, so a live
 read would feed the graph its own results. A stack that turns Deform off, or
 replaces a widget, would see the changed value on the next evaluation and
 could never get back to the original.
 
-So the unmodified rig is serialised once and stored **on the armature object**
-as a custom property (`an_baseline`), the first time a graph is bound to it.
-Every evaluation starts from that same base state, which is what makes the
-stack behave like modifiers:
+So the unmodified rig is stored **on the armature object itself**, in three
+custom properties:
 
-- Deleting a node genuinely undoes it, instead of leaving its effect baked in.
-- Unplugging the Armature Input cannot lose anything — the record is on the
-  rig, not in the wire.
-- An empty graph is **not** a teardown. It means "no modifications defined",
-  so the rig is left exactly alone. (It used to strip every widget, which
-  leaves a Rigify rig looking precisely like a metarig, and no replug could
-  undo it.)
+| Property | Holds |
+| --- | --- |
+| `an_rig_record` | the complete rig as JSON: bones, hierarchy, deform flags, collections, colours, display, pose settings, full constraint properties |
+| `an_rig_widgets` | the widget **meshes**, zlib+base64 — so a rig can be rebuilt when its `WGT-*` objects are gone |
+| `an_rig_touched` | which fields the last build wrote |
 
-Only rest data is stored — bones, hierarchy, deform flags, constraints and
-custom shapes. Pose is deliberately excluded: posing is what the graph does,
-and a baseline that remembered it would fight the Transform nodes.
+**Capture is explicit.** It happens when you click **Bind Rig**, and nowhere
+else. Opening an editor does not capture, evaluating does not capture, and a
+missing record is never filled in lazily — an unbound rig shows *Not bound*
+with a Bind button and the graph writes nothing. That restriction is the whole
+point: a capture is only correct when the rig is unmodified, and only a
+deliberate click can promise that.
 
-The refresh button on the Armature Input re-captures, for when you have edited
-the armature itself. It asks first, because it captures whatever the rig looks
-like *now* — including anything the graph has already applied.
+### Every build is restore-then-apply
+
+```
+base    = store.record.read(obj)          # the rig as it was
+target  = graph evaluated over base       # what the graph asks for
+changes = model.diff(base, target)        # per bone, per field
+apply.pipeline(obj, base, target, store.touched.read(obj))
+```
+
+The pipeline does three things in order:
+
+1. **Restore** every field the *last* build wrote that this one is not
+   writing, back to its recorded value.
+2. **Apply** this build's changes.
+3. **Record** what it wrote, for the next build to restore.
+
+Step 1 is why the viewport converges on `record + graph` whatever you do.
+Deleting a node, unplugging the Input, or emptying the tree all leave paths in
+the touched set that the next build puts back — so an empty graph means
+**the rig equals its record**, not "leave whatever was there" and certainly
+not a teardown. There is no special case for it, and there cannot be one.
+
+Because the diff is per field, only what actually changed is written: two
+identical builds write **zero** properties.
+
+Only rest data is recorded. Pose transforms are not — posing is what the graph
+does, and a record that remembered the live pose would fight the Transform
+nodes on every build.
+
+**`apply/` is the only writer.** Nothing else in the addon may assign to a
+Bone, EditBone, PoseBone, Constraint or Armature property; a test walks the
+AST and fails if anything does. (Marker handles are ordinary empties, not
+armature data, and are written by the marker nodes.)
+
 
 ## Node categories
 
@@ -101,14 +131,17 @@ like *now* — including anything the graph has already applied.
   constraints and existing custom shapes. It emits that rig **unmodified**.
 
   It does *not* read the live armature. The record lives **on the rig itself**
-  (see *The rig stores its own baseline*), and this node inherits from it.
+  (see *The rig is the database*), and this node inherits from it. If there is
+  no record it emits nothing and shows *Not bound* with a Bind button.
 - **Armature Output** — **Rig** in, nothing out. It is the display end of the
   graph: it writes the rig back *and* shows the markers of every Marker and
   Skeleton node feeding it, which its **Markers** toggle turns off for the
   whole graph at once. Leaving *Armature* blank targets the Input's source,
   which is the normal case. Two modes:
   - **Modify** (default) — writes shapes and pose onto the existing rig; its
-    bones, constraints and drivers are left alone. Safe on a Rigify rig.
+    bones, constraints and drivers are left alone. Safe on a Rigify rig. The
+    target is **exclusively the Armature Input's source**: the graph follows
+    the binding, never the selection or a typed name.
   - **Full Rig** — the graph owns the armature and rebuilds its bones, so
     nodes can add and remove them.
 
@@ -223,7 +256,12 @@ node, which marks the tree dirty, which re-poses the rig.
 | File | Responsibility |
 | --- | --- |
 | `core.py` | `BoneDef` / `ConstraintDef` / `ShapeDef`, eval context and memoization, bone selection |
-| `baseline.py` | The rig's stored record of its unmodified state, kept on the armature object |
+| `model/` | Pure data: types, JSON schema, v1→v2 migration, diff, rig transforms. Imports no `bpy`. |
+| `store/` | The `an_rig_*` properties, and the build lock. The only place they are touched. |
+| `capture/` | Live armature → `RigRecord`. Never writes. Called only from Bind and Capture. |
+| `apply/` | `RigRecord` → live armature. The only writer. |
+| `bridge.py` | Seam between the old node graph's `BoneDef` and `RigRecord`, until `graph/` lands |
+| `compat.py` | 3.6 / 4.x RNA shims (bone collections, colour, wire width) |
 | `sockets.py` | Rig (the whole armature, the stream), Constraint, Vector sockets |
 | `tree.py` | `ArmatureNodeTree` data-block, dirty tracking, live update |
 | `nodes.py` | Every node type |

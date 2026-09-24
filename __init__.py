@@ -28,7 +28,13 @@ bl_info = {
 # classes.
 _SUBMODULES = (
     "core",
-    "baseline",
+    "compat",
+    "model",
+    "store",
+    "capture",
+    "apply",
+    "bridge",
+    "legacy_adapter",
     "sockets",
     "tree",
     "primary_rig",
@@ -62,8 +68,9 @@ def _reload_submodules():
 
 def register():
     _reload_submodules()
-    from . import sockets, tree, nodes, operators, primary_rig, ui, sync
+    from . import ops, sockets, tree, nodes, operators, primary_rig, ui, sync
 
+    ops.register()
     sockets.register()
     tree.register()
     nodes.register()
@@ -74,7 +81,7 @@ def register():
 
 
 def unregister():
-    from . import sockets, tree, nodes, operators, primary_rig, ui, sync
+    from . import ops, sockets, tree, nodes, operators, primary_rig, ui, sync
 
     sync.unregister()
     ui.unregister()
@@ -83,6 +90,7 @@ def unregister():
     nodes.unregister()
     tree.unregister()
     sockets.unregister()
+    ops.unregister()
 
 
 if __name__ == "__main__":

@@ -208,7 +208,12 @@ class ARMATURE_OT_convert_rig(Operator):
         from .build import tag_owner, find_output_node
 
         try:
-            tree = resync_tree_from_armature(obj, shapes_only=False, full=True)
+            # Modify, not Full Rig. Decompiling now emits two nodes rather
+            # than one per bone, so "Convert" and the automatic bind produce
+            # the same graph -- the only difference was a mode that tells the
+            # addon to rebuild all 706 bones of a generated rig on every tick,
+            # and that silently discarded every pose the graph asked for.
+            tree = resync_tree_from_armature(obj, shapes_only=False, full=False)
         except RuntimeError as exc:
             self.report({"ERROR"}, str(exc))
             return {"CANCELLED"}
@@ -237,39 +242,6 @@ class ARMATURE_OT_convert_rig(Operator):
         return {"FINISHED"}
 
 
-class ARMATURE_OT_capture_baseline(Operator):
-    """Re-record the rig's current state as the graph's starting point.
-
-    Use it after editing the armature itself -- adding bones, changing the
-    rest pose. Note it captures whatever the rig looks like NOW, including
-    anything this graph has already applied to it, so the modifications become
-    part of the new base state"""
-
-    bl_idname = "armature_nodes.capture_baseline"
-    bl_label = "Capture Rig State"
-    bl_options = {"REGISTER", "UNDO"}
-
-    @classmethod
-    def poll(cls, context):
-        node = getattr(context, "node", None)
-        return node is not None and getattr(node, "source", None) is not None
-
-    def invoke(self, context, event):
-        return context.window_manager.invoke_confirm(self, event)
-
-    def execute(self, context):
-        from . import baseline
-
-        obj = context.node.source
-        count = baseline.store(obj)
-        if not count:
-            self.report({"WARNING"}, "Nothing to capture")
-            return {"CANCELLED"}
-        context.node.id_data.mark_dirty()
-        self.report({"INFO"}, f"Stored {count} bones on '{obj.name}'")
-        return {"FINISHED"}
-
-
 class ARMATURE_OT_bone_read_from_rig(Operator):
     """Re-read this bone's current transform off the rig into the node"""
 
@@ -293,7 +265,6 @@ class ARMATURE_OT_bone_read_from_rig(Operator):
 
 
 classes = (
-    ARMATURE_OT_capture_baseline,
     ARMATURE_OT_bone_read_from_rig,
     ARMATURE_OT_build_from_nodes,
     ARMATURE_OT_decompile_to_nodes,

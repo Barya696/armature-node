@@ -63,7 +63,6 @@ OWNER_TREE_KEY = "an_owner_tree"
 OWNER_NODE_KEY = "an_owner_node"
 # Bones the graph shaped on its last run (Custom Shapes Only mode), so the
 # next run can strip controllers whose nodes are gone.
-SHAPED_BONES_KEY = "an_shaped_bones"
 
 
 def tag_owner(obj, tree, node):
@@ -97,358 +96,83 @@ def _drop_owned_objects(tree):
         queue_object_removal(obj.name)
 
 
-def _ensure_object_mode():
-    if bpy.context.mode != "OBJECT" and bpy.context.active_object:
-        bpy.ops.object.mode_set(mode="OBJECT")
+from .apply.legacy_full import (  # noqa: E402
+    _activate,
+    _edit_mode_pass,
+    _ensure_object_mode,
+    _get_or_create_armature_object,
+    _pose_mode_pass,
+)
 
 
-def _target_collection():
-    # bpy.context.collection is None inside timer callbacks; fall back to the
-    # scene root collection so live updates can still link new objects.
-    collection = bpy.context.collection
-    if collection is None:
-        collection = bpy.context.scene.collection
-    return collection
+# tree name -> signature of the bone list its last Full Rig build produced.
+# Module level so it resets on reload, which is the safe direction: a stale
+# entry could skip a needed rebuild, a missing one only costs one rebuild.
+_full_signatures = {}
 
 
-def _get_or_create_armature_object(name):
-    obj = bpy.data.objects.get(name)
-    if obj is not None and obj.type == "ARMATURE":
-        return obj, False
-    arm_data = bpy.data.armatures.new(name)
-    obj = bpy.data.objects.new(name, arm_data)
-    _target_collection().objects.link(obj)
-    return obj, True
-
-
-def _activate(obj):
-    """Make ``obj`` the active, visible, selected object so mode_set polls true."""
-    view_layer = bpy.context.view_layer
-    if obj.name not in view_layer.objects:
-        # Object exists but is not in this view layer (e.g. excluded
-        # collection): link it to the scene root so it can be edited.
-        bpy.context.scene.collection.objects.link(obj)
-    try:
-        if obj.hide_get():
-            obj.hide_set(False)
-    except RuntimeError:
-        pass
-    obj.hide_viewport = False
-    view_layer.objects.active = obj
-    obj.select_set(True)
-
-
-def _edit_mode_pass(obj, bone_defs):
-    """Create/update edit bones from BoneDefs, matched by name."""
-    _activate(obj)
-    bpy.ops.object.mode_set(mode="EDIT")
-    try:
-        edit_bones = obj.data.edit_bones
-        wanted = {b.name for b in bone_defs}
-
-        # Remove bones no longer produced by the graph.
-        for eb in list(edit_bones):
-            if eb.name not in wanted:
-                edit_bones.remove(eb)
-
-        # Create/update all bones first (positions), then parent links,
-        # so parenting never references a bone that does not exist yet.
-        for b in bone_defs:
-            eb = edit_bones.get(b.name)
-            if eb is None:
-                eb = edit_bones.new(b.name)
-            eb.head = b.head
-            eb.tail = b.tail
-            eb.roll = b.roll
-            eb.use_deform = b.use_deform
-            eb.envelope_distance = b.envelope_distance
-            eb.envelope_weight = b.envelope_weight
-
-        for b in bone_defs:
-            eb = edit_bones[b.name]
-            if b.parent and b.parent in edit_bones:
-                eb.parent = edit_bones[b.parent]
-                eb.use_connect = b.use_connect
-            else:
-                eb.parent = None
-                eb.use_connect = False
-    finally:
-        bpy.ops.object.mode_set(mode="OBJECT")
-
-
-def _resolve_target(name, self_obj):
-    """Constraint targets are stored by object name. A rig rebuilt from a
-    snapshot may carry a different object name, so targets that pointed at
-    the original armature are redirected to the armature being built."""
-    obj = bpy.data.objects.get(name)
-    if obj is None and self_obj is not None:
-        return self_obj
-    return obj
-
-
-def _apply_constraint(pose_bone, cdef, self_obj=None):
-    try:
-        con = pose_bone.constraints.new(cdef.type)
-    except TypeError as exc:
-        print(f"[Armature Nodes] Cannot create constraint {cdef.type}: {exc}")
-        return
-    if cdef.name:
-        con.name = cdef.name
-    params = dict(cdef.params)
-    # Set 'targets' collection (Armature constraint) separately.
-    targets = params.pop("targets", None)
-    # Object pointers first so dependent props (subtarget) validate.
-    for key in ("target", "pole_target", "space_object"):
-        if key in params:
-            value = _resolve_target(params.pop(key), self_obj)
-            if value is not None:
-                try:
-                    setattr(con, key, value)
-                except (AttributeError, TypeError) as exc:
-                    print(f"[Armature Nodes] Skipped constraint param {key}: {exc}")
-    for key, value in params.items():
-        if isinstance(value, list):
-            value = tuple(value)
-        try:
-            setattr(con, key, value)
-        except (AttributeError, TypeError, ValueError) as exc:
-            print(f"[Armature Nodes] Skipped constraint param {key}: {exc}")
-    if targets and hasattr(con, "targets"):
-        for t in targets:
-            tgt = con.targets.new()
-            tgt.target = _resolve_target(t.get("target", ""), self_obj)
-            tgt.subtarget = t.get("subtarget", "")
-            tgt.weight = t.get("weight", 1.0)
-
-
-def _apply_shape(pbone, bdef):
-    """Assign (or clear) the custom shape widget on a pose bone."""
-    from .widgets import resolve_widget_for_bone
-
-    shape = bdef.shape
-    widget = resolve_widget_for_bone(shape, bdef.name) if shape else None
-    if widget is None:
-        pbone.custom_shape = None
-        pbone.bone.show_wire = False
-        return
-    pbone.custom_shape = widget
-    pbone.custom_shape_scale_xyz = shape.scale
-    pbone.custom_shape_translation = shape.translation
-    pbone.custom_shape_rotation_euler = shape.rotation
-    pbone.use_custom_shape_bone_size = shape.scale_to_bone_length
-    pbone.bone.show_wire = shape.show_wire
-    if hasattr(pbone, "custom_shape_wire_width"):  # Blender 4.x+
-        pbone.custom_shape_wire_width = shape.wire_width
-
-
-def _pose_mode_pass(obj, bone_defs):
-    """Clear graph-managed constraints and apply constraints + custom shapes."""
-    _activate(obj)
-    bpy.ops.object.mode_set(mode="POSE")
-    try:
-        defs_by_name = {b.name: b for b in bone_defs}
-        for pbone in obj.pose.bones:
-            bdef = defs_by_name.get(pbone.name)
-            if bdef is None:
-                continue
-            for con in list(pbone.constraints):
-                pbone.constraints.remove(con)
-            for cdef in bdef.constraints:
-                _apply_constraint(pbone, cdef, self_obj=obj)
-            _apply_shape(pbone, bdef)
-    finally:
-        bpy.ops.object.mode_set(mode="OBJECT")
-
-
-def _geometry_differs(bone, bdef, eps=1e-6):
-    """True when a BoneDef's rest geometry/hierarchy no longer matches the
-    armature bone -- i.e. the user edited it on a Custom Shape node."""
-    if (Vector(bdef.head) - bone.head_local).length > eps:
-        return True
-    if (Vector(bdef.tail) - bone.tail_local).length > eps:
-        return True
-    parent = bone.parent.name if bone.parent else None
-    if (bdef.parent or None) != parent:
-        return True
-    return bone.use_connect != bdef.use_connect or bone.use_deform != bdef.use_deform
-
-
-def _edit_geometry_pass(obj, bone_defs):
-    """Move/re-parent ONLY the given existing bones (no create/remove)."""
-    _activate(obj)
-    bpy.ops.object.mode_set(mode="EDIT")
-    try:
-        edit_bones = obj.data.edit_bones
-        for b in bone_defs:
-            eb = edit_bones.get(b.name)
-            if eb is None:
-                continue
-            eb.head = b.head
-            eb.tail = b.tail
-            eb.roll = b.roll
-            eb.use_deform = b.use_deform
-            if b.parent and b.parent in edit_bones:
-                eb.parent = edit_bones[b.parent]
-                eb.use_connect = b.use_connect
-            else:
-                eb.parent = None
-                eb.use_connect = False
-    finally:
-        bpy.ops.object.mode_set(mode="OBJECT")
-
-
-def _clear_shape(pbone):
-    """Strip the controller widget the graph previously put on this bone."""
-    pbone.custom_shape = None
-    pbone.custom_shape_scale_xyz = (1.0, 1.0, 1.0)
-    pbone.custom_shape_translation = (0.0, 0.0, 0.0)
-    pbone.custom_shape_rotation_euler = (0.0, 0.0, 0.0)
-    pbone.use_custom_shape_bone_size = True
-    pbone.bone.show_wire = False
-    if hasattr(pbone, "custom_shape_wire_width"):
-        pbone.custom_shape_wire_width = 1.0
-
-
-def _shapes_only_pass(obj, bone_defs):
-    """Update an EXISTING armature from its Custom Shape nodes only.
-
-    Used for generated rigs (Rigify): the generator owns bones, constraints
-    and drivers, so only bones that carry a ShapeDef are touched -- their
-    widget, and their rest geometry/parent when a node edited it.
-
-    The set of bones shaped on the previous run is remembered on the object
-    so this pass is a real diff: a bone whose Custom Shape node was deleted,
-    muted or filtered out loses its controller instead of silently keeping
-    the stale one. That is what makes the generated rig live, not just the
-    metarig.
-    """
-    shaped = [b for b in bone_defs if b.shape is not None]
-    moved = [
-        b
-        for b in shaped
-        if b.name in obj.data.bones and _geometry_differs(obj.data.bones[b.name], b)
-    ]
-    if moved:
-        _edit_geometry_pass(obj, moved)
-
-    previous = set(obj.get(SHAPED_BONES_KEY, ()))
-    current = {b.name for b in shaped}
-    stale = previous - current
-
-    _activate(obj)
-    bpy.ops.object.mode_set(mode="POSE")
-    applied = 0
-    cleared = 0
-    try:
-        for bone_name in stale:
-            pbone = obj.pose.bones.get(bone_name)
-            if pbone is None:
-                continue
-            _clear_shape(pbone)
-            cleared += 1
-        for bdef in shaped:
-            pbone = obj.pose.bones.get(bdef.name)
-            if pbone is None:
-                print(f"[Armature Nodes] Rig has no bone '{bdef.name}', skipped")
-                continue
-            _apply_shape(pbone, bdef)
-            applied += 1
-    finally:
-        bpy.ops.object.mode_set(mode="OBJECT")
-
-    obj[SHAPED_BONES_KEY] = sorted(current)
-    if cleared:
-        print(f"[Armature Nodes] Removed {cleared} stale controller(s) from '{obj.name}'")
-    return applied
-
-
-def pose_transform_pass(obj, bone_defs):
-    """Apply the pose written by the Transform-category nodes.
-
-    Runs after the bones exist and are placed, because a pose matrix resolves
-    against the parent's *evaluated* transform -- a child posed before its
-    parent would inherit a stale matrix. Bones are handled parent-first with a
-    view-layer flush per depth level for the same reason.
-
-    Everything here is world space and pose only: rest geometry is never
-    touched, so a stack layered onto an existing rig cannot change its
-    proportions. A component the graph did not set keeps whatever the rig has.
-
-    Returns the number of bones moved.
-    """
-    from mathutils import Euler, Matrix, Vector
-
-    if obj is None or obj.type != "ARMATURE" or obj.pose is None:
-        return 0
-    targeted = [
-        b
-        for b in bone_defs
-        if b.pose_location is not None
-        or b.pose_rotation is not None
-        or b.pose_scale is not None
-        or any(b.pose_offset)
-        or any(b.pose_rotation_offset)
-    ]
-    if not targeted:
-        return 0
-
-    def depth(pbone):
-        d, parent = 0, pbone.parent
-        while parent is not None:
-            d += 1
-            parent = parent.parent
-        return d
-
-    pairs = []
-    for bdef in targeted:
-        pbone = obj.pose.bones.get(bdef.name)
-        if pbone is not None:
-            pairs.append((depth(pbone), bdef, pbone))
-    pairs.sort(key=lambda p: p[0])
-
-    view_layer = getattr(bpy.context, "view_layer", None)
-    world_inv = obj.matrix_world.inverted_safe()
-    applied = 0
-    level = None
-    for d, bdef, pbone in pairs:
-        if level is not None and d != level and view_layer is not None:
-            view_layer.update()
-        level = d
-
-        current = obj.matrix_world @ pbone.matrix
-        cur_loc, cur_rot, cur_scale = current.decompose()
-
-        base_loc = Vector(bdef.pose_location) if bdef.pose_location else cur_loc
-        loc = base_loc + Vector(bdef.pose_offset)
-
-        if bdef.pose_rotation is not None:
-            base_rot = Vector(bdef.pose_rotation)
-        else:
-            base_rot = Vector(cur_rot.to_euler("XYZ"))
-        rot = Euler(tuple(base_rot + Vector(bdef.pose_rotation_offset)), "XYZ")
-
-        scale = Vector(bdef.pose_scale) if bdef.pose_scale else cur_scale
-
-        if (
-            (cur_loc - loc).length < 1e-5
-            and (Vector(cur_rot.to_euler("XYZ")) - Vector(rot)).length < 1e-5
-            and (cur_scale - scale).length < 1e-5
-        ):
-            continue  # already there: keep the pass idempotent
-        target = (
-            Matrix.Translation(loc)
-            @ rot.to_matrix().to_4x4()
-            @ Matrix.Diagonal(scale).to_4x4()
+def _rest_signature(bone_defs):
+    """Changes when the bones themselves change -- what needs Edit mode."""
+    return hash(
+        repr(
+            [
+                (b.name, b.head, b.tail, b.roll, b.parent, b.use_connect,
+                 b.use_deform, repr(b.constraints), repr(b.shape))
+                for b in bone_defs
+            ]
         )
-        try:
-            pbone.matrix = world_inv @ target
-        except (AttributeError, ValueError) as exc:
-            print(f"[Armature Nodes] Could not pose '{pbone.name}': {exc}")
+    )
+
+
+def _pose_signature(bone_defs):
+    """Changes when only the graph's requested pose changes.
+
+    Kept apart from the rest signature because posing needs no mode change at
+    all: ``pbone.matrix`` is writable from Object, Pose or anywhere else. A
+    pose-only edit must never defer, or adjusting a control from the node
+    while in Pose mode would do nothing -- which is exactly what it did.
+    """
+    return hash(
+        repr(
+            [
+                (b.name, b.pose_location, b.pose_rotation, b.pose_scale,
+                 b.pose_offset, b.pose_rotation_offset)
+                for b in bone_defs
+            ]
+        )
+    )
+
+
+def _apply_graph_pose(obj, bone_defs):
+    """Apply the pose the Transform-category nodes asked for.
+
+    Modify mode gets this through the record pipeline. Full Rig owns its
+    armature and has no record to diff against, so the pose is applied
+    directly -- without this, every Bone, Position, Rotation, Transform and
+    Snap node was silently discarded in Full Rig mode.
+    """
+    from .apply.pose_display import apply_transform
+    from .apply.writer import Writer
+
+    if obj is None or obj.pose is None:
+        return 0
+    writer = Writer()
+    for bdef in bone_defs:
+        values = {}
+        if bdef.pose_location is not None:
+            values["location"] = bdef.pose_location
+        if bdef.pose_rotation is not None:
+            values["rotation"] = bdef.pose_rotation
+        if bdef.pose_scale is not None:
+            values["scale"] = bdef.pose_scale
+        if not values:
             continue
-        applied += 1
-    if view_layer is not None:
-        view_layer.update()
-    return applied
+        apply_transform(obj, obj.pose.bones.get(bdef.name), values, writer)
+    if writer.writes:
+        view_layer = getattr(bpy.context, "view_layer", None)
+        if view_layer is not None:
+            view_layer.update()
+    return writer.writes
 
 
 def _remember_mode():
@@ -457,15 +181,95 @@ def _remember_mode():
 
 
 def _restore_mode(built_obj, remembered):
-    """Live updates must not yank the user out of Pose/Edit mode."""
+    """Live updates must not yank the user out of Pose/Edit mode.
+
+    Only the Full Rig path needs this now: it rebuilds edit bones, so it has
+    no choice but to change mode. Modify mode never calls it.
+    """
     name, mode = remembered
-    if mode == "OBJECT" or name is None or name != built_obj.name:
+    if mode == "OBJECT" or name is None or built_obj is None:
         return
+    if name != built_obj.name:
+        return
+    if built_obj.mode == mode:
+        return  # already there; mode_set would emit a pointless depsgraph update
     try:
         bpy.context.view_layer.objects.active = built_obj
         bpy.ops.object.mode_set(mode=mode)
     except RuntimeError as exc:
         print(f"[Armature Nodes] Could not restore {mode} mode: {exc}")
+
+
+def _modify_pass(tree, name, bone_defs):
+    """Modify mode: restore-then-apply against the rig's own record.
+
+    The whole of Modify mode is four lines of intent -- read the record, fold
+    the graph into it, diff, apply -- because every case that used to need a
+    branch is now the same case. An unplugged Input evaluates to nothing,
+    ``overlay`` returns the record unchanged, the diff is empty, and the
+    pipeline restores whatever the last build wrote. Nothing is special.
+    """
+    from . import bridge
+    from .apply import pipeline
+    from .store import record as record_store
+    from .store import touched as touched_store
+
+    obj = bpy.data.objects.get(name)
+    if obj is None or obj.type != "ARMATURE":
+        tree.is_dirty = False
+        return None
+
+    if record_store.needs_migration(obj):
+        # First build is where a legacy record is upgraded; reads before this
+        # point are deliberately non-destructive.
+        try:
+            record_store.persist_migration(obj)
+            # Loud, once. A v1 record was captured by the implementation that
+            # captured lazily, so it may well have recorded an already-modified
+            # rig as the original -- and migration cannot tell. Saying so is
+            # the only honest option; silently blessing it is how a stripped
+            # rig becomes permanent.
+            print(
+                f"[Armature Nodes] Upgraded '{obj.name}' record to v2. "
+                "This record came from an older version that could capture a "
+                "rig after it had been modified. If the rig looks wrong, "
+                "regenerate it and use Capture Rig State on the fresh one."
+            )
+            tree.last_error = (
+                "Record migrated from v1 - verify the rig, then Capture if wrong"
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"[Armature Nodes] Could not upgrade record: {exc}")
+
+    base = record_store.read(obj)
+    if base is None:
+        tree.last_error = f"'{obj.name}' is not bound - use Bind Rig"
+        tree.is_dirty = False
+        return None
+
+    # Edit mode makes ``armature.bones`` stale -- it is the edit_bones that
+    # are live -- so applying now would read and write nothing real. Skip and
+    # let leaving Edit mode retrigger the build.
+    if obj.mode == "EDIT":
+        tree.last_error = ""
+        return obj
+
+    target = bridge.overlay(base, bone_defs)
+    # No mode switching here, deliberately. Custom shapes, pose, constraints
+    # and collection membership are all writable from Pose mode, and the one
+    # thing that is not -- rest geometry -- is handled by the pipeline, which
+    # enters Edit mode only when a rest field actually changed and restores
+    # the mode afterwards.
+    #
+    # Forcing Object mode around every build is what made Pose mode unusable:
+    # mode_set is an operator, so each flip emitted a depsgraph update, which
+    # scheduled another build, which flipped again. Most builds write nothing
+    # at all, so the whole dance was for a no-op.
+    result = pipeline.apply(obj, base, target, touched_store.read(obj))
+
+    tree.last_error = "; ".join(result.errors[:2]) if result.errors else ""
+    tree.is_dirty = False
+    return obj
 
 
 def build_armature_from_tree(tree, strict=False):
@@ -485,23 +289,21 @@ def build_armature_from_tree(tree, strict=False):
         return None
 
     name, bone_defs = evaluate_tree(tree, strict=strict)
-    if not bone_defs:
-        # Nothing feeds the output any more. A generated rig goes away with
-        # its source; a rig the user owns (shapes-only, or an object the graph
-        # did not create) is left untouched.
-        if getattr(output, "mode", "MODIFY") != "MODIFY":
-            for obj in owned_objects(tree.name, output.name):
-                from .tree import queue_object_removal
+    mode = getattr(output, "mode", "MODIFY")
 
-                queue_object_removal(obj.name)
-        # Modify mode deliberately does NOTHING here. An empty stream means
-        # the graph defines no modifications -- most often because the
-        # Armature Input is unplugged or its source is unset -- not that the
-        # rig should be dismantled. Stripping it used to leave a Rigify rig
-        # with no widgets at all, which looks exactly like a metarig, and no
-        # replug could undo it because the shapes were gone from the object.
+    if mode == "MODIFY":
+        return _modify_pass(tree, name, bone_defs)
+
+    if not bone_defs:
+        # Full Rig owns its armature, so a graph that produces nothing means
+        # the armature it generated should go with it.
+        for obj in owned_objects(tree.name, output.name):
+            from .tree import queue_object_removal
+
+            queue_object_removal(obj.name)
         tree.is_dirty = False
         return None
+
     # A copied node graph must never overwrite the source rig. The original
     # bound tree has a live Armature Input pointer; pasted/copied graphs do
     # not, so give them a fresh target on first evaluation.
@@ -518,41 +320,49 @@ def build_armature_from_tree(tree, strict=False):
     if not has_live_source and existing is not None and not bound_here:
         name = _unique_armature_name(name)
         output.armature_name = name
-    elif (
-        bound_here
-        and getattr(output, "mode", "MODIFY") != "MODIFY"
-        and existing.get(OWNER_TREE_KEY) != tree.name
-    ):
-        # Only a Full Rig output owns its armature. In Modify mode the rig is
-        # the user's -- it existed before the graph did. Tagging it here would
-        # make deleting the Output node delete their rig, which is exactly
-        # what the Output's free() promises never to do.
+    elif bound_here and existing.get(OWNER_TREE_KEY) != tree.name:
         tag_owner(existing, tree, output)
-    remembered = _remember_mode()
-    _ensure_object_mode()
+    # Full Rig rebuilds edit bones, so unlike Modify it has no choice but to
+    # change mode. Two guards keep that from fighting the user:
+    #
+    # 1. Nothing to do -> do nothing. Without this, every depsgraph tick ran a
+    #    full EDIT + POSE + OBJECT cycle, and each mode_set is an operator
+    #    that emits another depsgraph update, which scheduled another build.
+    #    That loop is why Pose mode snapped straight back to Object.
+    # 2. Never mid-interaction. Yanking someone out of Pose or Edit to rebuild
+    #    bones they are in the middle of using is hostile; defer until they
+    #    are back in Object mode (sync.watch_armature_mode re-dirties then).
+    rest_sig = _rest_signature(bone_defs)
+    pose_sig = _pose_signature(bone_defs)
+    previous = _full_signatures.get(tree.name)
+    rest_changed = previous is None or previous[0] != rest_sig
+    pose_changed = previous is None or previous[1] != pose_sig
 
-    if getattr(output, "mode", "MODIFY") == "MODIFY":
-        obj = bpy.data.objects.get(name)
-        if obj is not None and obj.type == "ARMATURE":
-            _shapes_only_pass(obj, bone_defs)
-            pose_transform_pass(obj, bone_defs)
-            tree.is_dirty = False
-            _restore_mode(obj, remembered)
-            return obj
-        # The rig this stack targets is gone. Whatever the graph still
-        # produces on its own (Bone, Chain and Marker nodes) is built as a
-        # new armature rather than silently doing nothing.
-        print(
-            f"[Armature Nodes] '{name}' not found; rebuilding it from the "
-            f"graph ({len(bone_defs)} bones)"
-        )
+    if existing is not None and not rest_changed and not pose_changed:
+        tree.is_dirty = False
+        return existing  # nothing to do; running anyway is what caused the loop
 
-    obj, created = _get_or_create_armature_object(name)
-    if created or obj.get(OWNER_TREE_KEY) == tree.name:
-        tag_owner(obj, tree, output)
-    _edit_mode_pass(obj, bone_defs)
-    _pose_mode_pass(obj, bone_defs)
-    pose_transform_pass(obj, bone_defs)
+    obj = existing
+    if rest_changed:
+        # Rebuilding bones needs Edit mode, so it cannot run while the user is
+        # in the middle of Pose or Edit. Defer -- sync.watch_armature_mode
+        # re-dirties the tree when they leave.
+        if existing is not None and existing.mode != "OBJECT":
+            return existing
+        remembered = _remember_mode()
+        _ensure_object_mode()
+        obj, created = _get_or_create_armature_object(name)
+        if created or obj.get(OWNER_TREE_KEY) == tree.name:
+            tag_owner(obj, tree, output)
+        _edit_mode_pass(obj, bone_defs)
+        _pose_mode_pass(obj, bone_defs)
+        _restore_mode(obj, remembered)
+
+    # Pose last, and from whatever mode the user is in: writing pbone.matrix
+    # needs no operator, so this is safe mid-pose and must not be deferred.
+    if pose_changed or rest_changed:
+        _apply_graph_pose(obj, bone_defs)
+
+    _full_signatures[tree.name] = (rest_sig, pose_sig)
     tree.is_dirty = False
-    _restore_mode(obj, remembered)
     return obj
