@@ -167,23 +167,6 @@ def test_offset_absorbs_a_grab_but_not_a_parent_move():
     _assert_close(node.inputs["Offset"].default_value, (1.0, 1.0, 0.0), "Offset after parent move")
 
 
-def test_grabbing_the_bone_moves_a_wired_marker():
-    obj, tree, _s, _o, node = _fresh("ArmatureNodesPositionNode")
-    node.bone = "bone.002"
-    marker_node = tree.nodes.new("ArmatureNodesMarkerNode")
-    marker = marker_node.markers[0]
-    marker.set_position((0.0, 0.0, 1.0))
-    tree.links.new(marker_node.outputs[0], node.inputs["Position"])
-    _build(tree)
-    _assert_close(_head(obj), (0.0, 0.0, 1.0), "bone on marker")
-
-    _grab(obj, (2.0, 0.0, 1.0))
-    _tick()
-    _assert_close(marker.position, (2.0, 0.0, 1.0), "marker followed the bone")
-    _build(tree)
-    _assert_close(_head(obj), (2.0, 0.0, 1.0), "bone stays where it was grabbed")
-
-
 def test_constrained_bone_does_not_oscillate():
     """The trap: the evaluated pose differs from what was written."""
     obj, tree, _s, _o, node = _fresh("ArmatureNodesPositionNode", keep_constraints=True)
@@ -201,6 +184,26 @@ def test_constrained_bone_does_not_oscillate():
     _assert_close(_head(obj, "bone.003"), head, "bone drifted")
 
 
+def test_ticking_set_on_a_constrained_bone_does_not_move_it():
+    """The seed is the pose before constraints: written back, it changes nothing."""
+    obj, tree, _s, _o, node = _fresh("ArmatureNodesPositionNode", keep_constraints=True)
+    node.bone = "bone.003"
+    _build(tree)
+    _tick()
+    before = _head(obj, "bone.003")
+    node.use_position = True
+    _build(tree, BUILDS)
+    _assert_close(_head(obj, "bone.003"), before, "constrained bone moved")
+    # The build above may write nothing at all: the target matches the pose.
+    # A nudge forces a write, and a seed taken from the evaluated pose would
+    # then drop the bone by half its height under the 50% constraint.
+    node.inputs["Position"].default_value = Vector(node.inputs["Position"].default_value) + Vector(
+        (0.2, 0.0, 0.0)
+    )
+    _build(tree)
+    _assert_close(_head(obj, "bone.003"), before + Vector((0.1, 0.0, 0.0)), "nudged bone")
+
+
 def test_undo_does_not_double_apply():
     """Snapshots are not in the undo stack, so undo must clear them."""
     from armature_nodes import livelink
@@ -214,6 +217,169 @@ def test_undo_does_not_double_apply():
     before = tuple(node.inputs["Position"].default_value)
     _tick()
     _assert_close(node.inputs["Position"].default_value, before, "a reset produced a move")
+
+
+# --- Marker -------------------------------------------------------------------
+
+
+def _wire_marker(tree, node, socket="Position", at=(5.0, 5.0, 5.0)):
+    """A Marker node dropped away from the bone, then wired in."""
+    marker_node = tree.nodes.new("ArmatureNodesMarkerNode")
+    marker = marker_node.markers[0]
+    marker.set_position(at)
+    tree.links.new(marker_node.outputs[0], node.inputs[socket])
+    return marker_node, marker
+
+
+def _handle(marker_node, marker):
+    """The marker's viewport empty, created the way the sync tick creates it."""
+    from armature_nodes import sync
+    from armature_nodes.primary_rig import find_marker_empties
+
+    sync.sync_marker_handles()
+    return find_marker_empties(marker_node)[marker.key]
+
+
+def test_wiring_a_marker_puts_it_on_the_bone():
+    """The marker takes the bone's location; the bone does not jump to it."""
+    obj, tree, _s, _o, node = _fresh("ArmatureNodesPositionNode")
+    node.bone = "bone.002"
+    before = _head(obj)
+    marker_node, marker = _wire_marker(tree, node)
+    _build(tree, BUILDS)
+    _assert_close(_head(obj), before, "bone jumped to the marker")
+    _assert_close(marker.position, before, "marker on the bone")
+    _assert_close(_handle(marker_node, marker).location, before, "handle on the bone")
+
+
+def test_a_wired_marker_follows_a_grab():
+    obj, tree, _s, _o, node = _fresh("ArmatureNodesPositionNode")
+    node.bone = "bone.002"
+    marker_node, marker = _wire_marker(tree, node)
+    _build(tree)
+    handle = _handle(marker_node, marker)
+
+    _grab(obj, (2.0, 0.0, 1.0))
+    _tick()
+    _assert_close(marker.position, (2.0, 0.0, 1.0), "marker followed the bone")
+    _assert_close(handle.location, (2.0, 0.0, 1.0), "handle followed the bone")
+    _build(tree, BUILDS)
+    _assert_close(_head(obj), (2.0, 0.0, 1.0), "bone stays where it was grabbed")
+
+
+def test_typing_the_marker_moves_the_bone():
+    obj, tree, _s, _o, node = _fresh("ArmatureNodesPositionNode")
+    node.bone = "bone.002"
+    _marker_node, marker = _wire_marker(tree, node)
+    _build(tree)
+    _tick()
+    marker.position = (1.0, 1.0, 1.0)  # through the update callback, as typing is
+    _build(tree)
+    _tick()
+    _assert_close(_head(obj), (1.0, 1.0, 1.0), "bone after typing")
+    _assert_close(marker.position, (1.0, 1.0, 1.0), "typed value kept")
+
+
+def test_dragging_the_handle_moves_the_bone():
+    obj, tree, _s, _o, node = _fresh("ArmatureNodesPositionNode")
+    node.bone = "bone.002"
+    marker_node, marker = _wire_marker(tree, node)
+    _build(tree)
+    handle = _handle(marker_node, marker)
+    handle.location = (0.5, 0.0, 2.5)
+    _handle(marker_node, marker)  # the tick reads the drag back
+    _build(tree)
+    _tick()
+    _assert_close(_head(obj), (0.5, 0.0, 2.5), "bone after the drag")
+    _assert_close(marker.position, (0.5, 0.0, 2.5), "marker after the drag")
+
+
+def test_marker_is_a_readout_when_the_bone_node_does_not_drive():
+    obj, tree, _s, _o, node = _fresh("ArmatureNodesBoneNode")
+    node.bone = "bone.002"
+    node.use_location = False
+    _marker_node, marker = _wire_marker(tree, node)
+    _build(tree)
+    _tick()
+    _assert_close(marker.position, _head(obj), "marker on the bone")
+
+    _grab(obj, (1.0, 0.0, 2.0))
+    _tick()
+    _assert_close(marker.position, (1.0, 0.0, 2.0), "marker follows the bone")
+    _build(tree)
+    _assert_close(_head(obj), (1.0, 0.0, 2.0), "undriven bone left alone")
+
+
+def test_picking_another_bone_moves_the_marker_onto_it():
+    obj, tree, _s, _o, node = _fresh("ArmatureNodesPositionNode")
+    node.bone = "bone.002"
+    _marker_node, marker = _wire_marker(tree, node)
+    _build(tree)
+    other = _head(obj, "bone.001")
+    node.bone = "bone.001"
+    _build(tree, BUILDS)
+    _assert_close(_head(obj, "bone.001"), other, "new bone jumped to the marker")
+    _assert_close(marker.position, other, "marker on the new bone")
+
+
+def test_marker_rotation_comes_from_the_bone():
+    obj, tree, _s, _o, node = _fresh("ArmatureNodesRotationNode")
+    pb = obj.pose.bones["bone.002"]
+    pb.rotation_mode = "XYZ"
+    pb.rotation_euler = (math.radians(20.0), 0.0, 0.0)
+    bpy.context.view_layer.update()
+    want = (obj.matrix_world @ pb.matrix).to_euler("XYZ")
+    node.bone = "bone.002"
+    _marker_node, marker = _wire_marker(tree, node, socket="Rotation")
+    marker.set_rotation((1.0, 1.0, 1.0))  # somewhere else entirely
+    _build(tree, BUILDS)
+    got = (obj.matrix_world @ pb.matrix).to_euler("XYZ")
+    _assert_close((got.x, got.y, got.z), (want.x, want.y, want.z), "bone turned to the marker")
+    _assert_close(marker.rotation, (want.x, want.y, want.z), "marker rotation")
+
+
+def test_marker_on_a_constrained_bone_does_not_move_it():
+    obj, tree, _s, _o, node = _fresh("ArmatureNodesPositionNode", keep_constraints=True)
+    node.bone = "bone.003"  # 50% Copy Transforms to a still empty
+    _build(tree)
+    before = _head(obj, "bone.003")
+    _marker_node, marker = _wire_marker(tree, node)
+    _build(tree)
+    _tick()
+    settled = tuple(marker.position)
+    for _ in range(BUILDS):
+        _build(tree)
+        _tick()
+    _assert_close(_head(obj, "bone.003"), before, "wiring moved the constrained bone")
+    _assert_close(marker.position, settled, "marker drifted")
+    # Force a write (see the Set test above): only the nudge may show.
+    marker.position = Vector(marker.position) + Vector((0.2, 0.0, 0.0))
+    _build(tree)
+    _assert_close(_head(obj, "bone.003"), before + Vector((0.1, 0.0, 0.0)), "nudged bone")
+
+
+def test_skeleton_landmark_is_not_pulled_onto_the_bone():
+    """Landmarks are a layout to drag onto a character: the bone goes to them."""
+    obj, tree, _s, _o, node = _fresh("ArmatureNodesPositionNode")
+    node.bone = "bone.002"
+    skel = tree.nodes.new("ArmatureNodesSkeletonNode")
+    marker = skel.markers[0]
+    marker.set_position((0.5, 0.0, 1.5))
+    sock = next(s for s in skel.outputs if s.marker_key == marker.key)
+    tree.links.new(sock, node.inputs["Position"])
+    _build(tree, BUILDS)
+    _assert_close(marker.position, (0.5, 0.0, 1.5), "landmark moved")
+    _assert_close(_head(obj), (0.5, 0.0, 1.5), "bone on the landmark")
+
+
+def test_a_marker_on_several_bones_is_left_where_it_is():
+    obj, tree, _s, _o, node = _fresh("ArmatureNodesPositionNode")
+    node.bone = "bone.001;bone.002"
+    marker_node, marker = _wire_marker(tree, node, at=(1.0, 0.0, 1.0))
+    _build(tree)
+    _tick()
+    assert marker_node.live_bone() == (None, None), "several bones cannot be one link"
+    _assert_close(marker.position, (1.0, 0.0, 1.0), "marker moved")
 
 
 # --- Rotation -----------------------------------------------------------------

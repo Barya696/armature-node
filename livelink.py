@@ -26,7 +26,16 @@ import math
 
 from mathutils import Matrix, Vector
 
-__all__ = ["EPS", "BoneState", "Delta", "delta_since", "remember", "forget", "reset"]
+__all__ = [
+    "EPS",
+    "BoneState",
+    "Delta",
+    "driven_world",
+    "delta_since",
+    "remember",
+    "forget",
+    "reset",
+]
 
 EPS = 1e-5
 
@@ -60,6 +69,24 @@ class BoneState:
             rest=obj.matrix_world @ rest_armature,
             basis=pbone.matrix_basis.copy(),
         )
+
+
+def driven_world(obj, pbone):
+    """The bone's world matrix before its own constraints.
+
+    This is the value to seed a node from so that driving the bone changes
+    nothing. The pose is written before constraints run, so on a constrained
+    bone ``pbone.matrix`` -- the evaluated result -- is the wrong thing to
+    write back: the constraint would be applied on top of it again, and the
+    bone would move the moment the node took it over.
+    """
+    armature = obj.convert_space(
+        pose_bone=pbone,
+        matrix=pbone.matrix_basis,
+        from_space="LOCAL",
+        to_space="POSE",
+    )
+    return obj.matrix_world @ armature
 
 
 def _angle(q):

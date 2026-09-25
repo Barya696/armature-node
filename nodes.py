@@ -142,7 +142,17 @@ def _bone_select_prop(update=None):
 
 
 def _same_vec(a, b, eps=1e-6):
-    return all(abs(float(x) - float(y)) <= eps for x, y in zip(a, b))
+    """Equal to within float32 precision.
+
+    Relative, not absolute: node and marker fields are stored as float32, so
+    at 100 m a round trip is off by ~1e-5. An absolute 1e-6 would call that a
+    change on every tick, and each write tags the tree for another depsgraph
+    update -- a loop that never settles.
+    """
+    return all(
+        abs(float(x) - float(y)) <= eps * max(1.0, abs(float(x)), abs(float(y)))
+        for x, y in zip(a, b)
+    )
 
 
 def _write_socket_value(node, name, value):
@@ -797,10 +807,8 @@ _syncing_bone_read = False
 def _on_bone_selected(self, context):
     """Picking a bone reads its current pose off the rig.
 
-    Read once, on selection, not continuously: in a modifier stack the bone's
-    position is an *output* of the graph, so a live read-back would race the
-    pose this node itself writes. After the read the node's values are what
-    the bone follows, and Read From Rig re-syncs on demand.
+    From then on the live link keeps the node in step (``_LiveLinkMixin``);
+    this read is what makes the very first build leave the bone where it is.
     """
     if _syncing_bone_read:
         return
@@ -946,6 +954,10 @@ class BoneNode(_LiveLinkMixin, _ModifierNodeBase, Node):
     def on_socket_edited(self, sock):
         if sock.name == "Position" and not self.use_location:
             self.use_location = True
+
+    def marker_role(self, socket_name):
+        # Location unticked, a wired marker poses nothing: it follows the bone.
+        return ("location", self.use_location) if socket_name == "Position" else None
 
     def absorb(self, obj, pbone, delta):
         """Ticked components are driven: the user's move is folded into them."""
@@ -1193,6 +1205,12 @@ class MarkerNode(MarkerHolderMixin, ArmatureNodeBase, Node):
     It produces no bones and sits outside the Bone stream, the way a value
     node does in Geometry Nodes: it is a position, and what consumes it
     decides what that position means.
+
+    Live, both ways, with the one bone its wire reaches (see ``follow_live``):
+    wiring it in puts the marker on the bone, grabbing the bone moves the
+    marker, and dragging or typing the marker moves the bone. The Skeleton
+    node does not do the first part -- its landmarks are a layout to drag onto
+    a character, and the bones go to them, not the other way round.
     """
 
     bl_idname = "ArmatureNodesMarkerNode"
@@ -1206,6 +1224,12 @@ class MarkerNode(MarkerHolderMixin, ArmatureNodeBase, Node):
         default=True,
         update=lambda self, ctx: self.refresh_handles(),
     )
+    live_bone_name: StringProperty(
+        name="Live Bone",
+        description="The bone this marker was last put on through its wire",
+        default="",
+        options={"HIDDEN"},
+    )
 
     def init(self, context):
         self.width = 180
@@ -1214,6 +1238,106 @@ class MarkerNode(MarkerHolderMixin, ArmatureNodeBase, Node):
     @property
     def marker(self):
         return self.markers[0] if len(self.markers) else None
+
+    # -- Live link ------------------------------------------------------------
+
+    def wired(self):
+        """(consumer, role, driving) for every input this marker feeds.
+
+        ``role`` is what the consumer takes from it -- "location" or
+        "rotation" -- and ``driving`` whether it currently poses the bone with
+        it. Only inputs that use the marker as a place on the rig count: wired
+        into an Offset it is a vector, and there is no bone position to take.
+        """
+        out = []
+        for sock in self.outputs:
+            for link in sock.links:
+                consumer = link.to_node
+                role_of = getattr(consumer, "marker_role", None)
+                role = role_of(link.to_socket.name) if role_of is not None else None
+                if role is not None:
+                    out.append((consumer, role[0], role[1]))
+        return out
+
+    def live_bone(self):
+        """(armature, pose bone) when every wire reaches the same single bone."""
+        obj = pbone = None
+        for consumer, _role, _driving in self.wired():
+            o, pb = consumer.live_bone()
+            if pb is None or (pbone is not None and pb.name != pbone.name):
+                return None, None
+            obj, pbone = o, pb
+        return obj, pbone
+
+    def follow_live(self):
+        """Keep the marker on the bone its wire reaches. True if it moved.
+
+        * **Newly wired to a bone**, or the consumer switched bones: the marker
+          goes onto the bone. Otherwise the bone would jump to wherever the
+          marker happened to be dropped.
+        * **Driving**: the consumer folds a grab into the marker (``absorb``),
+          so nothing is done here -- doing it twice would move it twice.
+        * **Not driving** (a Bone node with Location unticked): the marker is a
+          readout and simply sits on the bone.
+
+        The other direction needs nothing here: dragging or typing the marker
+        rebuilds, and the consumer poses the bone to it.
+        """
+        from . import livelink
+
+        if self.marker is None:
+            return False
+        obj, pbone = self.live_bone()
+        if pbone is None:
+            if self.live_bone_name:
+                self.live_bone_name = ""  # unwired: the next wire seeds again
+            return False
+        if obj.mode == "EDIT":
+            return False  # pose matrices are stale in Edit mode
+        wired = self.wired()
+        roles = {role for _c, role, _d in wired}
+        if pbone.name != self.live_bone_name:
+            self.live_bone_name = pbone.name
+            changed = self._sit_on(livelink.driven_world(obj, pbone), roles)
+            # The consumers' snapshots predate this: a move they had not
+            # folded in yet is already in the marker now, and must not be
+            # added on top of it.
+            for consumer, _r, _d in wired:
+                livelink.remember(consumer, obj, pbone)
+        else:
+            # A readout shows where the bone is, constraints and all.
+            idle = roles - {role for _c, role, driving in wired if driving}
+            changed = self._sit_on(obj.matrix_world @ pbone.matrix, idle)
+        if changed:
+            self.push_markers_to_empties()
+        return changed
+
+    def _sit_on(self, world, roles):
+        """Put the marker where the bone is, for the parts named in ``roles``."""
+        from mathutils import Euler
+
+        marker = self.marker
+        changed = False
+        if "location" in roles:
+            loc = world.to_translation()
+            if not _same_vec(marker.position, loc):
+                marker.set_position(loc)
+                changed = True
+        if "rotation" in roles:
+            e = world.to_euler("XYZ", Euler(marker.rotation, "XYZ"))
+            if not _same_vec(marker.rotation, (e.x, e.y, e.z)):
+                marker.set_rotation((e.x, e.y, e.z))
+                changed = True
+        return changed
+
+    def _draw_live_state(self, layout):
+        if not self.wired():
+            return
+        _obj, pbone = self.live_bone()
+        if pbone is not None:
+            layout.label(text=f"Live: {pbone.name}", icon="LINKED")
+        else:
+            layout.label(text="Live link needs one bone", icon="UNLINKED")
 
     def draw_buttons(self, context, layout):
         layout.context_pointer_set("node", self)
@@ -1236,6 +1360,7 @@ class MarkerNode(MarkerHolderMixin, ArmatureNodeBase, Node):
         layout.prop(marker, "position", text="")
         if marker.use_rotation:
             layout.prop(marker, "rotation", text="")
+        self._draw_live_state(layout)
 
 
 class SkeletonNode(MarkerHolderMixin, ArmatureNodeBase, Node):
@@ -1737,17 +1862,24 @@ class PositionNode(_TransformNodeBase, Node):
         return created
 
     def seed_from_bone(self):
+        from . import livelink
+
         if not self.use_position:
             return
         obj, pbone = self.single_bone()
         if pbone is not None:
-            self.write_socket("Position", (obj.matrix_world @ pbone.matrix).to_translation())
+            self.write_socket("Position", livelink.driven_world(obj, pbone).to_translation())
 
     def on_socket_edited(self, sock):
         # Typing a position is asking for it: take the bone over, rather than
         # leaving a field that looks like an input but only displays.
         if sock.name == "Position" and not self.use_position:
             _set_without_seeding(self, "use_position", True)
+
+    def marker_role(self, socket_name):
+        """What a marker wired into ``socket_name`` is: (role, driving)."""
+        # A wire into Position always sets it; Offset is a vector, not a place.
+        return ("location", True) if socket_name == "Position" else None
 
     def absorb(self, obj, pbone, delta):
         """The user moved the bone: fold the move into whatever drives it."""
@@ -1841,16 +1973,21 @@ class RotationNode(_TransformNodeBase, Node):
         return created
 
     def seed_from_bone(self):
+        from . import livelink
+
         if not self.use_rotation:
             return
         obj, pbone = self.single_bone()
         if pbone is not None:
-            e = (obj.matrix_world @ pbone.matrix).to_euler("XYZ")
+            e = livelink.driven_world(obj, pbone).to_euler("XYZ")
             self.write_socket("Rotation", (e.x, e.y, e.z))
 
     def on_socket_edited(self, sock):
         if sock.name == "Rotation" and not self.use_rotation:
             _set_without_seeding(self, "use_rotation", True)
+
+    def marker_role(self, socket_name):
+        return ("rotation", True) if socket_name == "Rotation" else None
 
     def absorb(self, obj, pbone, delta):
         from mathutils import Euler
@@ -2405,6 +2542,7 @@ _NO_REBUILD_PROPS = {
     "markers",  # CollectionProperty: does not accept update=
     "lock_depth",
     "symmetric",
+    "live_bone_name",  # bookkeeping for the marker's live link
 }
 
 

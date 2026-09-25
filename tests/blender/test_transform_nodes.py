@@ -137,9 +137,10 @@ def test_position_wired_marker_counts_as_set():
     obj, tree, _s, _o, node = _fresh("ArmatureNodesPositionNode")
     node.bone = "bone.002"
     marker_node = tree.nodes.new("ArmatureNodesMarkerNode")
-    marker_node.markers[0].set_position((0.5, 1.0, 2.0))
     tree.links.new(marker_node.outputs[0], node.inputs["Position"])
     assert not node.use_position, "the wire alone should be enough"
+    _build(tree)  # wiring puts the marker on the bone first
+    marker_node.markers[0].position = (0.5, 1.0, 2.0)
     _build(tree)
     _assert_close(_head(obj, "bone.002"), (0.5, 1.0, 2.0), "marker-driven position")
 

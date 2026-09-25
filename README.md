@@ -159,6 +159,17 @@ own **Handles** toggle still wins, for hiding one marker without unwiring it.
 - **Marker** — one handle, as a position. Its **Position** output wires into a
   Bone node and dragging the handle moves that bone. It produces no bones and
   sits outside the Rig stream, the way a value node does in Geometry Nodes.
+
+  Wired to **one** bone — through a Position, Rotation or Bone node — it is
+  live both ways, and the node says *Live: bone*:
+  - **Wiring it in puts the marker on the bone**, not the bone on the marker,
+    so nothing jumps. Picking a different bone on that node does the same.
+  - **Grab the bone** in Pose mode and the marker and its handle follow.
+  - **Drag the handle or type the position** and the bone follows.
+  - Into a Bone node with Location unticked, it does not drive: it just
+    sits on the bone.
+
+  Wired into a Rotation input it takes the bone's orientation the same way.
 - **Skeleton** — a bundle of markers, **one output socket each**: the
   Principled BSDF of markers. Each output is a position, so it wires into
   anything that takes one — a Position node, a Snap offset, a Custom Shape
@@ -179,6 +190,10 @@ own **Handles** toggle still wins, for hiding one marker without unwiring it.
   Every marker is position-only until its gimbal button is pressed, which
   turns the handle into a rotatable axis gizmo.
 
+  Unlike a Marker node, a landmark is **not** moved onto the bone when you
+  wire it in: the landmarks are a layout to drag onto a character, and the
+  bones go to them. A landmark does follow when you grab the bone it drives.
+
 ### Bone
 
 - **Bone** — **one** bone from the rig, posed. Pick any bone (DEF, MCH, ORG or
@@ -189,9 +204,8 @@ own **Handles** toggle still wins, for hiding one marker without unwiring it.
   Scale has its own checkbox, so a node can move a bone without also pinning
   its rotation — an unchecked component is left exactly as the rig has it.
 
-  The read happens **on selection**, not continuously: in a modifier stack the
-  bone's position is an *output* of the graph, so a live read-back would race
-  the pose the node writes. The refresh button re-reads on demand.
+  It stays live after that: ticked values follow when you grab the bone,
+  unticked ones are readouts (see *Live, both ways* under Transform).
 
   The incoming rig arrives on its **Parent** input. Its Constraints input is
   pose-stack data, so it only reaches the armature in **Full Rig** mode.
@@ -235,7 +249,7 @@ a single bone mirrors it in real time:
 
 - **Rig to node**: grab, rotate or scale the bone in Pose mode and the node's
   fields follow as you drag. If the value comes from a wired marker, the
-  marker's handle moves with the bone too.
+  marker's handle moves with the bone too (see Marker, above).
 - **Node to rig**: type a value and the bone moves. On Position and Rotation,
   typing into the field takes the bone over (ticks *Set*) — a field that
   looked like an input but only displayed was the old complaint.
