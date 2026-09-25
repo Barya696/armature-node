@@ -31,6 +31,7 @@ __all__ = [
     "BoneState",
     "Delta",
     "driven_world",
+    "rest_world",
     "delta_since",
     "remember",
     "forget",
@@ -55,20 +56,26 @@ class BoneState:
 
     @classmethod
     def read(cls, obj, pbone):
-        rest_armature = obj.convert_space(
-            pose_bone=pbone,
-            matrix=Matrix.Identity(4),
-            from_space="LOCAL",
-            to_space="POSE",
-        )
         return cls(
             world=obj.matrix_world @ pbone.matrix,
-            # Rest follows the parent's current pose. Relative values are
-            # measured from here, so moving a parent -- or the whole object --
-            # is not mistaken for a change to the child's own offset.
-            rest=obj.matrix_world @ rest_armature,
+            rest=rest_world(obj, pbone),
             basis=pbone.matrix_basis.copy(),
         )
+
+
+def rest_world(obj, pbone):
+    """The bone's rest pose in world space, carried by its parent's pose.
+
+    Relative values are measured from here, so moving a parent -- or the whole
+    object -- is not mistaken for a change to the child's own offset.
+    """
+    armature = obj.convert_space(
+        pose_bone=pbone,
+        matrix=Matrix.Identity(4),
+        from_space="LOCAL",
+        to_space="POSE",
+    )
+    return obj.matrix_world @ armature
 
 
 def driven_world(obj, pbone):

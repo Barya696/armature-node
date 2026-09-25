@@ -232,6 +232,9 @@ def ensure_marker_empties(node):
         if marker.use_rotation:
             obj.rotation_euler = tuple(marker.rotation)
         apply_marker_locks(node, obj, key)
+    # The node has the last word on placement: a Marker node wired into a
+    # relative input draws its handle on the bone, not at the raw value.
+    node.push_markers_to_empties()
     return existing
 
 
@@ -243,20 +246,43 @@ def apply_marker_locks(node, obj, key):
     Symmetric mirroring is a MediaPipe-landmark feature: a custom marker has
     no mirror partner, so it is never locked by it.
 
-    Both marker-holding nodes reach here, and only the Skeleton node has the
-    Symmetric and Lock Depth toggles -- a single Marker node has neither, so
-    they are read with defaults rather than assumed to exist.
+    A node that knows better -- the Marker node, whose locks follow what its
+    wire drives -- says so through ``handle_locks``.
     """
-    mirrored = bool(getattr(node, "symmetric", False)) and LM_SIDE.get(key) == "R"
     use_rot = node.marker_uses_rotation(key)
+    locks = getattr(node, "handle_locks", None)
+    if locks is not None:
+        lock_loc, lock_rot, lock_scale = locks(key)
+        set_handle_locks(obj, lock_loc, lock_rot, lock_scale, use_rot)
+        return
+    mirrored = bool(getattr(node, "symmetric", False)) and LM_SIDE.get(key) == "R"
     if mirrored:
-        obj.lock_location = (True, True, True)
-        obj.lock_rotation = (True, True, True)
+        lock_loc = lock_rot = (True, True, True)
     else:
-        obj.lock_location = (False, bool(getattr(node, "lock_depth", False)), False)
-        obj.lock_rotation = (not use_rot,) * 3
-    obj.empty_display_type = "ARROWS" if use_rot else "SPHERE"
-    obj.hide_select = mirrored
+        lock_loc = (False, bool(getattr(node, "lock_depth", False)), False)
+        lock_rot = (not use_rot,) * 3
+    set_handle_locks(obj, lock_loc, lock_rot, (True, True, True), use_rot, mirrored)
+
+
+def set_handle_locks(obj, lock_loc, lock_rot, lock_scale, arrows, hide_select=False):
+    """Write a handle's locks and look, touching only what differs.
+
+    The Marker node re-applies these on every sync tick. A write of the same
+    value still tags the object for a depsgraph update, which runs the sync
+    again -- so an unconditional write here would never let it settle.
+    """
+    for attr, value in (
+        ("lock_location", tuple(lock_loc)),
+        ("lock_rotation", tuple(lock_rot)),
+        ("lock_scale", tuple(lock_scale)),
+    ):
+        if tuple(getattr(obj, attr)) != value:
+            setattr(obj, attr, value)
+    display = "ARROWS" if arrows else "SPHERE"
+    if obj.empty_display_type != display:
+        obj.empty_display_type = display
+    if obj.hide_select != hide_select:
+        obj.hide_select = hide_select
 
 
 def remove_marker_empties(node):

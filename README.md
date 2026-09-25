@@ -160,16 +160,30 @@ own **Handles** toggle still wins, for hiding one marker without unwiring it.
   Bone node and dragging the handle moves that bone. It produces no bones and
   sits outside the Rig stream, the way a value node does in Geometry Nodes.
 
-  Wired to **one** bone — through a Position, Rotation or Bone node — it is
-  live both ways, and the node says *Live: bone*:
-  - **Wiring it in puts the marker on the bone**, not the bone on the marker,
-    so nothing jumps. Picking a different bone on that node does the same.
-  - **Grab the bone** in Pose mode and the marker and its handle follow.
-  - **Drag the handle or type the position** and the bone follows.
-  - Into a Bone node with Location unticked, it does not drive: it just
-    sits on the bone.
+  A marker carries a position, a rotation and a scale, and its output is a
+  **Transform** socket: all three on one wire. A Transform input (the
+  Transform node's) takes all three; a Position, Rotation or Scale input
+  takes the one that matches its type. A wired marker **is the field it
+  replaces**: whatever the node would show and do with its own field, it
+  shows and does with the marker. So wired to **one** bone — through a
+  Position, Rotation, Transform or Bone node — it is live both ways, and the
+  node says *Live: bone*:
+  - **Wiring it in never moves the bone.** An absolute input (Position,
+    Rotation, a Bone node's Position) puts the marker on the bone; a relative
+    one (Transform's Translation / Rotation / Scale, an Offset) gives the
+    marker the value the field held.
+  - **Grab, rotate or scale the bone** in Pose mode and the marker and its
+    handle follow.
+  - **Drag, turn or scale the handle, or type a value**, and the bone follows.
+  - **Unplug or delete it** and the field takes its value, so the bone stays.
+  - Each value is labelled by the input it feeds (*Translation*, *Rotation*,
+    *Scale*…). One that drives nothing is a greyed readout of the bone, and
+    that part of the handle is locked.
 
-  Wired into a Rotation input it takes the bone's orientation the same way.
+  The handle always sits on the bone. For a relative input it is drawn where
+  the offset puts the bone — rest plus the value, along world or the bone's
+  own axes as the Transform node's Space says — rather than at the raw
+  offset, which would leave it near the world origin.
 - **Skeleton** — a bundle of markers, **one output socket each**: the
   Principled BSDF of markers. Each output is a position, so it wires into
   anything that takes one — a Position node, a Snap offset, a Custom Shape
@@ -229,7 +243,11 @@ rig already has.
   Rotation* + Rotation for an absolute world orientation, Offset to turn on
   top. A wired marker supplies its own rotation.
 - **Transform** — like *Transform Geometry*: Translation, Rotation and Scale,
-  all relative, so several Transform nodes stack. **Space**:
+  all relative, so several Transform nodes stack. The **Transform** input
+  takes all three on one wire — wire a Marker into it and the handle's
+  location, rotation and scale drive the bone together. While it is wired it
+  replaces the three fields, which are hidden; unplug it and they come back
+  holding its last values, so the bone stays put. **Space**:
   - **World** — along the scene axes, whatever way the bone points.
   - **Local** — along the bone's own axes. These *are* its Location and
     Rotation channels, the N-panel values, and they follow the parent the way

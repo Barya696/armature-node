@@ -11,6 +11,7 @@ Three socket types, deliberately:
   units, an orientation in degrees, or a scale factor. Unlinked, the socket is
   itself the value field (the Shader and Geometry Editor convention), so a
   node with no wire into it still has something to work with.
+* **Transform** -- all three at once, on one wire: what a Marker outputs.
 """
 
 import bpy
@@ -80,9 +81,9 @@ class _ValueSocketMixin:
     """Shared ``get_value`` for the sockets that carry a 3-vector.
 
     ``_marker_attr`` names what a linked marker supplies: its position to a
-    Vector socket, its orientation to a Rotation socket -- so wiring a marker
-    into a Rotation input turns the bone with the handle rather than feeding a
-    position in as if it were angles.
+    Vector socket, its orientation to a Rotation socket, its scale to a Scale
+    socket -- so wiring a marker into a Rotation input turns the bone with the
+    handle rather than feeding a position in as if it were angles.
     """
 
     _marker_attr = "position"
@@ -163,6 +164,7 @@ class ScaleSocket(_ValueSocketMixin, _SocketDrawMixin, NodeSocket):
     bl_idname = "ArmatureNodesScaleSocket"
     bl_label = "Scale"
     socket_color = (0.39, 0.63, 0.78, 1.0)
+    _marker_attr = "scale"
 
     default_value: FloatVectorProperty(
         name="Scale",
@@ -173,12 +175,64 @@ class ScaleSocket(_ValueSocketMixin, _SocketDrawMixin, NodeSocket):
     )
 
 
+class TransformSocket(_SocketDrawMixin, NodeSocket):
+    """Location, rotation and scale together, on one wire.
+
+    What a Marker node outputs, and what the Transform node's Transform input
+    takes -- the Geometry Nodes matrix socket, for bones. Wired into a Vector,
+    Rotation or Scale input instead, that input takes its own part, as it
+    always has.
+
+    It has no field of its own. Unlinked, a Transform input is simply unused,
+    and the node's Translation / Rotation / Scale fields apply.
+    """
+
+    bl_idname = "ArmatureNodesTransformSocket"
+    bl_label = "Transform"
+    socket_color = (0.72, 0.20, 0.52, 1.0)
+    #: A linked marker supplies all three of its values through this socket.
+    _marker_attrs = ("position", "rotation", "scale")
+
+    marker_key: StringProperty(
+        name="Marker Key",
+        description="Marker this socket carries, when it comes from one",
+        default="",
+    )
+
+    def get_transform(self):
+        """(location, rotation, scale) from the wire, or None when unlinked.
+
+        From a marker, all three of its values. From any other value, the
+        part its type stands for, with the other two left at identity.
+        """
+        if not self.is_linked or not self.links:
+            return None
+        link = self.links[0]
+        from_sock, node = link.from_socket, link.from_node
+        key = getattr(from_sock, "marker_key", "")
+        if key and hasattr(node, "marker_by_key"):
+            marker = node.marker_by_key(key)
+            if marker is not None:
+                return tuple(marker.position), tuple(marker.rotation), tuple(marker.scale)
+        parts = {"position": (0.0, 0.0, 0.0), "rotation": (0.0, 0.0, 0.0), "scale": (1.0, 1.0, 1.0)}
+        value = getattr(from_sock, "default_value", None)
+        if value is not None:
+            parts[getattr(from_sock, "_marker_attr", "position")] = tuple(value)
+        return parts["position"], parts["rotation"], parts["scale"]
+
+
+def marker_attrs(sock):
+    """Which of a marker's values an input takes: all three, or one."""
+    return getattr(sock, "_marker_attrs", None) or (getattr(sock, "_marker_attr", "position"),)
+
+
 classes = (
     RigSocket,
     ConstraintSocket,
     VectorSocket,
     RotationSocket,
     ScaleSocket,
+    TransformSocket,
 )
 
 
