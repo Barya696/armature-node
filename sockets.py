@@ -202,8 +202,10 @@ class TransformSocket(_SocketDrawMixin, NodeSocket):
     def get_transform(self):
         """(location, rotation, scale) from the wire, or None when unlinked.
 
-        From a marker, all three of its values. From any other value, the
-        part its type stands for, with the other two left at identity.
+        A part the source does not carry is None, and the node leaves that
+        part of the bone alone: a Skeleton landmark with rotation off is a
+        position, and must not turn the bone to face world zero. From any
+        other value, only the part its type stands for.
         """
         if not self.is_linked or not self.links:
             return None
@@ -213,8 +215,14 @@ class TransformSocket(_SocketDrawMixin, NodeSocket):
         if key and hasattr(node, "marker_by_key"):
             marker = node.marker_by_key(key)
             if marker is not None:
-                return tuple(marker.position), tuple(marker.rotation), tuple(marker.scale)
-        parts = {"position": (0.0, 0.0, 0.0), "rotation": (0.0, 0.0, 0.0), "scale": (1.0, 1.0, 1.0)}
+                turns = node.marker_uses_rotation(key)
+                scales = node.marker_uses_scale(key)
+                return (
+                    tuple(marker.position),
+                    tuple(marker.rotation) if turns else None,
+                    tuple(marker.scale) if scales else None,
+                )
+        parts = dict.fromkeys(("position", "rotation", "scale"))
         value = getattr(from_sock, "default_value", None)
         if value is not None:
             parts[getattr(from_sock, "_marker_attr", "position")] = tuple(value)

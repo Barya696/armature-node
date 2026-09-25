@@ -113,14 +113,18 @@ def _transform_from_graph(bone):
     into the absolute location and DROP it when there was none, which is why a
     Transform node on its own did nothing at all.
     """
+    # A channel a node set outright is a request even at zero: "at rest".
+    local_set = getattr(bone, "pose_local_set", ())
+    local = _vec if "location" in local_set else _nonzero
+    turn = _vec if "rotation" in local_set else _nonzero
     return TransformDef(
         location=_vec(getattr(bone, "pose_location", None)),
         rotation=_vec(getattr(bone, "pose_rotation", None)),
         scale=_vec(getattr(bone, "pose_scale", None)),
         offset=_nonzero(getattr(bone, "pose_offset", None)),
         rotation_offset=_nonzero(getattr(bone, "pose_rotation_offset", None)),
-        local_offset=_nonzero(getattr(bone, "pose_local_offset", None)),
-        local_rotation=_nonzero(getattr(bone, "pose_local_rotation", None)),
+        local_offset=local(getattr(bone, "pose_local_offset", None)),
+        local_rotation=turn(getattr(bone, "pose_local_rotation", None)),
     )
 
 

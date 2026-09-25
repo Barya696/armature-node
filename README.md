@@ -168,22 +168,21 @@ own **Handles** toggle still wins, for hiding one marker without unwiring it.
   shows and does with the marker. So wired to **one** bone — through a
   Position, Rotation, Transform or Bone node — it is live both ways, and the
   node says *Live: bone*:
-  - **Wiring it in never moves the bone.** An absolute input (Position,
-    Rotation, a Bone node's Position) puts the marker on the bone; a relative
-    one (Transform's Translation / Rotation / Scale, an Offset) gives the
-    marker the value the field held.
+  - **Wiring it in never moves the bone.** The marker first takes the
+    bone's live values — or, for an Offset or a Local-space Transform field,
+    the value the field held.
   - **Grab, rotate or scale the bone** in Pose mode and the marker and its
     handle follow.
   - **Drag, turn or scale the handle, or type a value**, and the bone follows.
   - **Unplug or delete it** and the field takes its value, so the bone stays.
-  - Each value is labelled by the input it feeds (*Translation*, *Rotation*,
-    *Scale*…). One that drives nothing is a greyed readout of the bone, and
+  - Each value is labelled by the input it feeds (*Location*, *Rotation*,
+    *Scale*, *Offset*…). One that drives nothing is a greyed readout of the bone, and
     that part of the handle is locked.
 
-  The handle always sits on the bone. For a relative input it is drawn where
-  the offset puts the bone — rest plus the value, along world or the bone's
-  own axes as the Transform node's Space says — rather than at the raw
-  offset, which would leave it near the world origin.
+  The handle always sits on the bone. For a value measured from rest (an
+  Offset, a Local-space Transform field) it is drawn where the value puts the
+  bone — rest plus the value — rather than at the raw offset, which would
+  leave it near the world origin.
 - **Skeleton** — a bundle of markers, **one output socket each**: the
   Principled BSDF of markers. Each output is a position, so it wires into
   anything that takes one — a Position node, a Snap offset, a Custom Shape
@@ -242,16 +241,31 @@ rig already has.
 - **Rotation** — the same pattern for orientation, in **degrees**: *Set
   Rotation* + Rotation for an absolute world orientation, Offset to turn on
   top. A wired marker supplies its own rotation.
-- **Transform** — like *Transform Geometry*: Translation, Rotation and Scale,
-  all relative, so several Transform nodes stack. The **Transform** input
-  takes all three on one wire — wire a Marker into it and the handle's
-  location, rotation and scale drive the bone together. While it is wired it
-  replaces the three fields, which are hidden; unplug it and they come back
-  holding its last values, so the bone stays put. **Space**:
-  - **World** — along the scene axes, whatever way the bone points.
-  - **Local** — along the bone's own axes. These *are* its Location and
-    Rotation channels, the N-panel values, and they follow the parent the way
-    hand-posing does.
+- **Transform** — the bone's **Location, Rotation and Scale**, live. Pick a
+  bone and the fields fill with where it is; nothing is applied yet. A value
+  you have not set is a readout that follows the bone, so a fresh node
+  changes nothing. **Type a value**, or turn on its **Set** toggle, and the
+  node sets that part of the bone — turning it on starts from where the bone
+  is, so it never jumps. Parts left unset keep whatever the bone has. A later
+  node that sets the same part wins. **Space**:
+  - **World** — the bone's world location and rotation.
+  - **Local** — its own channels, the N-panel values, which follow the parent
+    the way hand-posing does. Several bones in one node each get the same
+    channel values, as typing them into each bone's N-panel would.
+
+  Scale is the bone's own in both (1 at rest), never the armature object's.
+
+  The **Transform** input is the same thing on one wire, in world space.
+  Wire a Marker into it and the marker first takes the bone's live Location,
+  Rotation and Scale — nothing moves — and from then on the handle and the
+  bone follow each other. While it is wired the three fields are hidden and
+  Space does not apply; unplug it and the fields take its values, set, so
+  the bone stays where it is. A source that carries no rotation — a Skeleton
+  landmark with rotation off — moves the bone without turning it.
+
+  A Transform node saved when its fields were offsets from rest (*Translation*)
+  is converted on first use: each part it applied is set, and re-read from
+  the bone, which is where the offset put it.
 - **Snap** — put the selected bones on a mesh. Snap To picks what "on" means:
   - **Origin** — the target object's own origin
   - **Bounding Box** — centre of its bounds
@@ -268,8 +282,8 @@ a single bone mirrors it in real time:
 - **Rig to node**: grab, rotate or scale the bone in Pose mode and the node's
   fields follow as you drag. If the value comes from a wired marker, the
   marker's handle moves with the bone too (see Marker, above).
-- **Node to rig**: type a value and the bone moves. On Position and Rotation,
-  typing into the field takes the bone over (ticks *Set*) — a field that
+- **Node to rig**: type a value and the bone moves. On Position, Rotation and
+  Transform, typing into the field takes the bone over (turns *Set* on) — a field that
   looked like an input but only displayed was the old complaint.
 - While a node is not driving a value (*Set* off, nothing wired, zero
   offset), that field is a plain readout of where the bone is.
@@ -277,7 +291,7 @@ a single bone mirrors it in real time:
 The node tells its own writes apart from yours with a snapshot taken after
 every build: anything that differs from it was you, and only that difference
 is folded in. That is what keeps it from chasing its own output — which on a
-constrained bone would oscillate for ever. Relative values (Offset, Transform)
+constrained bone would oscillate for ever. Relative values (Offset, Local)
 measure your move from the rest pose, so moving the parent or the whole
 object is not mistaken for a new offset. Undo, redo and file load reset the
 snapshots. One live node per bone: two nodes linked to the same bone would
@@ -292,8 +306,8 @@ How the relative moves behave:
   move is applied to the parent and the child is carried — Blender's own
   G/R/S does exactly this. (Local is channel semantics, so it accumulates down
   a chain, as typing the same Location into every bone would.)
-- **A later absolute value wins.** Set Position after a Transform replaces the
-  Transform's offset, as in Geometry Nodes.
+- **A later absolute value wins.** Set Position after an Offset replaces it,
+  as in Geometry Nodes.
 - **Blocked moves are reported.** A connected bone, a locked channel or a
   constraint can make Blender discard a pose; the Output and the sidebar say
   which, instead of reporting success.

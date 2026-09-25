@@ -101,6 +101,16 @@ def test_fresh_transform_node_is_a_no_op():
     _assert_no_op("ArmatureNodesTransformNode")
 
 
+def test_fresh_transform_node_sets_nothing():
+    """Its own defaults are not an edit: Scale's 1 used to turn Set Scale on,
+    pinning every bone's scale -- invisible on a bone already at scale 1."""
+    _obj, tree, *_ = _fresh("ArmatureNodesTransformNode")
+    node = next(n for n in tree.nodes if n.bl_idname == "ArmatureNodesTransformNode")
+    assert not (node.use_location or node.use_rotation or node.use_scale), (
+        node.use_location, node.use_rotation, node.use_scale,
+    )
+
+
 # --- Position ----------------------------------------------------------------
 
 
@@ -148,14 +158,54 @@ def test_position_wired_marker_counts_as_set():
 # --- Transform -----------------------------------------------------------------
 
 
-def test_transform_world_translation_moves_the_bone():
-    """The headline bug: this did nothing at all."""
+def test_picking_a_bone_fills_the_fields_with_where_it_is():
+    """The fields are the bone's own values, read before anything is applied."""
+    obj, tree, _s, _o, node = _fresh("ArmatureNodesTransformNode")
+    before = _heads(obj)
+    node.bone = "bone.002"
+    world = obj.matrix_world @ obj.pose.bones["bone.002"].matrix
+    _assert_close(node.inputs["Location"].default_value, world.to_translation(), "Location")
+    e = world.to_euler("XYZ")
+    _assert_close(node.inputs["Rotation"].default_value, (e.x, e.y, e.z), "Rotation")
+    _assert_close(node.inputs["Scale"].default_value, (1.0, 1.0, 1.0), "Scale")
+    _build(tree, BUILDS)
+    for name, head in _heads(obj).items():
+        _assert_close(head, before[name], f"picking a bone moved {name}")
+
+
+def test_local_fields_are_the_channels():
+    obj, tree, _s, _o, node = _fresh("ArmatureNodesTransformNode")
+    pb = obj.pose.bones["bone.002"]
+    pb.location = (0.0, 0.3, 0.0)  # hand-posed
+    bpy.context.view_layer.update()
+    node.space = "LOCAL"
+    node.bone = "bone.002"
+    _assert_close(node.inputs["Location"].default_value, (0.0, 0.3, 0.0), "Location channel")
+
+
+def test_transform_world_location_sets_the_bone():
+    """The headline bug of the first version: this did nothing at all."""
     obj, tree, _s, _o, node = _fresh("ArmatureNodesTransformNode")
     node.bone = "bone.002"
-    rest = _head(obj, "bone.002")
-    node.inputs["Translation"].default_value = (1.0, 0.0, 0.0)
+    node.inputs["Location"].default_value = (1.0, 0.0, 2.0)
+    assert node.use_location, "typing a value must set it"
     _build(tree, BUILDS)
-    _assert_close(_head(obj, "bone.002"), rest + Vector((1.0, 0.0, 0.0)), "world +1 X")
+    _assert_close(_head(obj, "bone.002"), (1.0, 0.0, 2.0), "world location")
+
+
+def test_setting_one_part_leaves_the_others_as_they_are():
+    obj, tree, _s, _o, node = _fresh("ArmatureNodesTransformNode")
+    pb = obj.pose.bones["bone.002"]
+    pb.rotation_mode = "XYZ"
+    pb.rotation_euler = (math.radians(20.0), 0.0, 0.0)  # hand-posed
+    bpy.context.view_layer.update()
+    turned = (obj.matrix_world @ pb.matrix).to_quaternion()
+    node.bone = "bone.002"
+    node.inputs["Location"].default_value = (0.5, 0.0, 2.0)
+    _build(tree, BUILDS)
+    _assert_close(_head(obj, "bone.002"), (0.5, 0.0, 2.0), "location")
+    now = (obj.matrix_world @ pb.matrix).to_quaternion()
+    assert now.rotation_difference(turned).angle < 1e-4, "rotation was reset"
 
 
 def test_transform_local_writes_the_location_channel():
@@ -163,10 +213,24 @@ def test_transform_local_writes_the_location_channel():
     obj, tree, _s, _o, node = _fresh("ArmatureNodesTransformNode")
     node.bone = "bone.002"
     node.space = "LOCAL"
-    node.inputs["Translation"].default_value = (0.0, 1.0, 0.0)
+    node.inputs["Location"].default_value = (0.0, 1.0, 0.0)
     _build(tree, BUILDS)
     pb = obj.pose.bones["bone.002"]
     _assert_close(pb.location, (0.0, 1.0, 0.0), "Location channel")
+
+
+def test_a_local_value_of_zero_puts_the_channel_at_rest():
+    """Zero is a value, not "nothing asked": it has to reach the rig."""
+    obj, tree, _s, _o, node = _fresh("ArmatureNodesTransformNode")
+    pb = obj.pose.bones["bone.002"]
+    node.bone = "bone.002"
+    node.space = "LOCAL"
+    node.use_rotation = True  # something else set, so the bone is posed
+    node.inputs["Location"].default_value = (0.0, 0.4, 0.0)
+    _build(tree, BUILDS)
+    node.inputs["Location"].default_value = (0.0, 0.0, 0.0)
+    _build(tree, BUILDS)
+    _assert_close(pb.location, (0.0, 0.0, 0.0), "Location channel")
 
 
 def test_transform_local_follows_the_bone_axes():
@@ -175,7 +239,7 @@ def test_transform_local_follows_the_bone_axes():
     node.bone = "bone.002"
     node.space = "LOCAL"
     rest = _head(obj, "bone.002")
-    node.inputs["Translation"].default_value = (0.0, 1.0, 0.0)
+    node.inputs["Location"].default_value = (0.0, 1.0, 0.0)
     _build(tree, BUILDS)
     _assert_close(_head(obj, "bone.002"), rest + Vector((0.0, 0.0, 1.0)), "local +Y")
 
@@ -188,12 +252,12 @@ def test_transform_rotation_is_degrees_and_turns_in_place():
         "rotation must be shown in degrees, not metres"
     )
     rest = _head(obj, "bone.002")
-    sock.default_value = (math.radians(90.0), 0.0, 0.0)
+    sock.default_value = (0.0, 0.0, 0.0)  # world orientation: identity
     _build(tree, BUILDS)
     world = obj.matrix_world @ obj.pose.bones["bone.002"].matrix
     _assert_close(world.to_translation(), rest, "head must stay put")
-    # The bone pointed up world +Z; 90 degrees about world X turns +Z to -Y.
-    _assert_close(world.to_3x3().col[1].normalized(), (0.0, -1.0, 0.0), "bone axis")
+    # Identity world orientation points the bone's Y axis along world +Y.
+    _assert_close(world.to_3x3().col[1].normalized(), (0.0, 1.0, 0.0), "bone axis")
 
 
 def test_transform_scale():
@@ -205,34 +269,24 @@ def test_transform_scale():
     _assert_close(scale, (2.0, 2.0, 2.0), "scale")
 
 
-def test_transform_moves_every_bone_exactly_once():
-    """Parent and child selected together: the child is carried, not moved twice.
-
-    Also the ordering bug: children must be placed after their parents.
-    """
+def test_local_rotation_sets_every_selected_bone():
+    """Several bones in Local space: each gets the same channel value, as
+    typing it into each bone's N-panel would."""
     obj, tree, _s, _o, node = _fresh("ArmatureNodesTransformNode")
-    # The fixture's last bone has a 50% Copy Transforms to an empty that does
-    # not move, so it rightly lands halfway -- grabbing the root by hand in
-    # Blender gives the same. That is the constraint's behaviour, not the
-    # node's, so it is taken out of this test.
-    for pb in obj.pose.bones:
-        while pb.constraints:
-            pb.constraints.remove(pb.constraints[0])
-    # pbone.matrix is computed: until the depsgraph re-evaluates it still
-    # shows the constrained position.
-    bpy.context.view_layer.update()
-    rest = _heads(obj)
-    node.inputs["Translation"].default_value = (1.0, 0.0, 0.0)  # every bone
+    node.space = "LOCAL"
+    node.bone = "bone.001;bone.002"
+    node.inputs["Rotation"].default_value = (0.0, 0.0, math.radians(10.0))
     _build(tree, BUILDS)
-    for name, head in _heads(obj).items():
-        _assert_close(head, rest[name] + Vector((1.0, 0.0, 0.0)), f"{name} moved")
+    for name in ("bone.001", "bone.002"):
+        e = obj.pose.bones[name].matrix_basis.to_euler("XYZ")
+        _assert_close((e.x, e.y, e.z), (0.0, 0.0, math.radians(10.0)), f"{name} channel")
 
 
 def test_removing_the_node_restores_the_bone():
     obj, tree, src, out, node = _fresh("ArmatureNodesTransformNode")
     node.bone = "bone.002"
     rest = _head(obj, "bone.002")
-    node.inputs["Translation"].default_value = (1.0, 0.0, 0.0)
+    node.inputs["Location"].default_value = (1.0, 0.0, 2.0)
     _build(tree)
     tree.nodes.remove(node)
     tree.links.new(src.outputs["Rig"], out.inputs["Rig"])
@@ -240,21 +294,45 @@ def test_removing_the_node_restores_the_bone():
     _assert_close(_head(obj, "bone.002"), rest, "after deleting the Transform node")
 
 
-def test_stacked_transforms_add_up():
+def test_a_later_transform_node_wins_what_it_sets():
+    """Each node sets only its own parts; the later one wins a part both set."""
     obj, tree, src, out, first = _fresh("ArmatureNodesTransformNode")
     first.bone = "bone.002"
-    first.inputs["Translation"].default_value = (1.0, 0.0, 0.0)
+    first.inputs["Location"].default_value = (1.0, 0.0, 2.0)
+    first.inputs["Scale"].default_value = (2.0, 2.0, 2.0)
     second = tree.nodes.new("ArmatureNodesTransformNode")
     second.bone = "bone.002"
-    second.inputs["Translation"].default_value = (0.0, 2.0, 0.0)
+    second.inputs["Location"].default_value = (0.0, 2.0, 2.0)
     for link in list(tree.links):
         if link.to_node == out:
             tree.links.remove(link)
     tree.links.new(first.outputs["Rig"], second.inputs["Rig"])
     tree.links.new(second.outputs["Rig"], out.inputs["Rig"])
-    rest = _head(obj, "bone.002")
     _build(tree, BUILDS)
-    _assert_close(_head(obj, "bone.002"), rest + Vector((1.0, 2.0, 0.0)), "stacked")
+    _assert_close(_head(obj, "bone.002"), (0.0, 2.0, 2.0), "later location wins")
+    _assert_close(obj.pose.bones["bone.002"].matrix.to_scale(), (2.0, 2.0, 2.0), "scale kept")
+
+
+def test_old_transform_node_keeps_the_bone_where_it_was():
+    """Saved when the fields were offsets from rest: converted, nothing moves."""
+    obj, tree, _s, _o, node = _fresh("ArmatureNodesTransformNode")
+    node.bone = "bone.002"
+    rest = _head(obj, "bone.002")
+    # As an older version saved it: Translation, an offset from rest...
+    node.inputs["Location"].name = "Translation"
+    node.inputs["Translation"].default_value = (1.0, 0.0, 0.0)
+    node.layout_version = 0
+    # ...which it had applied: the bone sits at rest + 1 X.
+    pb = obj.pose.bones["bone.002"]
+    world = (obj.matrix_world @ pb.matrix).copy()
+    world.translation = rest + Vector((1.0, 0.0, 0.0))
+    pb.matrix = obj.matrix_world.inverted() @ world
+    bpy.context.view_layer.update()
+    _build(tree, BUILDS)
+    assert node.inputs.get("Location") is not None, "Translation not renamed"
+    assert node.use_location, "the part it applied is no longer set"
+    _assert_close(node.inputs["Location"].default_value, rest + Vector((1.0, 0.0, 0.0)), "value")
+    _assert_close(_head(obj, "bone.002"), rest + Vector((1.0, 0.0, 0.0)), "bone moved")
 
 
 def test_identical_builds_write_nothing():
@@ -266,7 +344,9 @@ def test_identical_builds_write_nothing():
 
     obj, tree, _s, _o, node = _fresh("ArmatureNodesTransformNode")
     node.bone = "bone.002"
-    node.inputs["Translation"].default_value = (1.0, 0.0, 0.0)
+    node.space = "LOCAL"
+    node.inputs["Location"].default_value = (0.0, 0.0, 0.0)  # a set zero, too
+    node.inputs["Rotation"].default_value = (0.0, 0.0, math.radians(10.0))
     base = record_store.read(obj)
     _name, defs = evaluate_tree(tree)
     target = bridge.overlay(base, defs)

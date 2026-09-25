@@ -431,40 +431,37 @@ def test_marker_in_rotation_turns_live_both_ways():
     _assert_turn(_world_rot(obj), Euler((0.0, 0.0, math.radians(45.0))).to_quaternion(), "bone")
 
 
-def test_marker_in_translation_sits_on_the_bone_not_at_the_offset():
+def test_marker_in_world_location_is_the_bones_location():
     obj, tree, _s, _o, node = _fresh("ArmatureNodesTransformNode")
     node.bone = "bone.002"
-    rest = _head(obj)
-    node.inputs["Translation"].default_value = (0.5, 0.0, 0.0)
-    _build(tree)
-    moved = rest + Vector((0.5, 0.0, 0.0))
-
-    marker_node, marker = _wire_marker(tree, node, socket="Translation")
+    live = _head(obj)
+    marker_node, marker = _wire_marker(tree, node, socket="Location")
     _build(tree, BUILDS)
-    _assert_close(_head(obj), moved, "bone jumped on wiring")
-    _assert_close(marker.position, (0.5, 0.0, 0.0), "marker took the field's value")
+    _assert_close(marker.position, live, "marker did not take the bone's location")
+    _assert_close(_head(obj), live, "bone jumped on wiring")
     handle = _handle(marker_node, marker)
-    _assert_close(handle.location, moved, "handle drawn at the offset, not on the bone")
+    _assert_close(handle.location, live, "handle on the bone")
 
-    _grab(obj, moved + Vector((0.0, 1.0, 0.0)))  # rig -> marker
+    _grab(obj, (1.0, 1.0, 2.0))  # rig -> marker
     _full_tick()
-    _assert_close(marker.position, (0.5, 1.0, 0.0), "Translation after grab")
-    _assert_close(handle.location, _head(obj), "handle after grab")
+    _assert_close(marker.position, (1.0, 1.0, 2.0), "Location after grab")
+    _assert_close(handle.location, (1.0, 1.0, 2.0), "handle after grab")
 
-    handle.location = rest + Vector((1.0, 1.0, 0.0))  # marker -> rig
+    handle.location = (0.0, 1.0, 1.5)  # marker -> rig
     _full_tick()
     _build(tree)
-    _assert_close(marker.position, (1.0, 1.0, 0.0), "Translation after drag")
-    _assert_close(_head(obj), rest + Vector((1.0, 1.0, 0.0)), "bone after drag")
+    _assert_close(marker.position, (0.0, 1.0, 1.5), "Location after drag")
+    _assert_close(_head(obj), (0.0, 1.0, 1.5), "bone after drag")
 
 
-def test_marker_in_local_translation_moves_along_the_bone():
+def test_marker_in_local_location_moves_along_the_bone():
     obj, tree, _s, _o, node = _fresh("ArmatureNodesTransformNode")
     node.bone = "bone.002"
     node.space = "LOCAL"
     rest = _head(obj)
-    marker_node, marker = _wire_marker(tree, node, socket="Translation")
+    marker_node, marker = _wire_marker(tree, node, socket="Location")
     _build(tree)
+    _assert_close(marker.position, (0.0, 0.0, 0.0), "the channel, at rest")
     handle = _handle(marker_node, marker)
     _assert_close(handle.location, rest, "handle on the bone")
 
@@ -472,7 +469,7 @@ def test_marker_in_local_translation_moves_along_the_bone():
     handle.location = rest + Vector((0.0, 0.0, 0.3))
     _full_tick()
     _build(tree)
-    _assert_close(marker.position, (0.0, 0.3, 0.0), "local Translation")
+    _assert_close(marker.position, (0.0, 0.3, 0.0), "local Location")
     _assert_close(_head(obj), rest + Vector((0.0, 0.0, 0.3)), "bone under the handle")
 
 
@@ -485,18 +482,19 @@ def test_marker_in_transform_rotation_turns_live_both_ways():
     marker_node, marker = _wire_marker(tree, node, socket="Rotation")
     _build(tree)
     handle = _handle(marker_node, marker)
+    _assert_turn(Euler(marker.rotation, "XYZ").to_quaternion(), rest_rot, "marker took the bone's")
     _assert_turn(handle.rotation_euler.to_quaternion(), rest_rot, "handle shows the bone")
 
     spin = Euler((0.0, 0.0, math.radians(30.0))).to_quaternion()
     handle.rotation_euler = (spin @ rest_rot).to_euler("XYZ")  # marker -> rig
     _full_tick()
     _build(tree)
-    _assert_turn(Euler(marker.rotation, "XYZ").to_quaternion(), spin, "Rotation is the turn")
+    _assert_turn(Euler(marker.rotation, "XYZ").to_quaternion(), spin @ rest_rot, "Rotation")
     _assert_turn(_world_rot(obj), spin @ rest_rot, "bone turned")
 
     pb.rotation_euler = (0.0, 0.0, 0.0)  # rig -> marker: back to rest
     _full_tick()
-    _assert_close(marker.rotation, (0.0, 0.0, 0.0), "Rotation after the bone was reset")
+    _assert_turn(Euler(marker.rotation, "XYZ").to_quaternion(), rest_rot, "Rotation after reset")
     _assert_turn(handle.rotation_euler.to_quaternion(), rest_rot, "handle after reset")
 
 
@@ -508,7 +506,7 @@ def test_marker_in_transform_scale_scales_live_both_ways():
     marker_node, marker = _wire_marker(tree, node, socket="Scale")
     _build(tree)
     handle = _handle(marker_node, marker)
-    _assert_close(marker.scale, (1.0, 1.0, 1.0), "Scale took the field's value")
+    _assert_close(marker.scale, (1.0, 1.0, 1.0), "Scale took the bone's")
     assert not any(handle.lock_scale), "handle cannot be scaled"
 
     handle.scale = (2.0, 2.0, 2.0)  # marker -> rig
@@ -523,9 +521,11 @@ def test_marker_in_transform_scale_scales_live_both_ways():
 
 
 def test_moving_the_parent_carries_a_relative_handle_without_a_drag():
+    """A Local value is measured from rest, which the parent carries."""
     obj, tree, _s, _o, node = _fresh("ArmatureNodesTransformNode")
     node.bone = "bone.002"
-    marker_node, marker = _wire_marker(tree, node, socket="Translation")
+    node.space = "LOCAL"
+    marker_node, marker = _wire_marker(tree, node, socket="Location")
     _build(tree)
     marker.position = (0.5, 0.0, 0.0)
     _build(tree)
@@ -536,31 +536,32 @@ def test_moving_the_parent_carries_a_relative_handle_without_a_drag():
     _assert_close(marker.position, (0.5, 0.0, 0.0), "parent move read as a drag")
     _assert_close(handle.location, _head(obj), "handle left behind by the parent")
     _build(tree, BUILDS)
-    _assert_close(marker.position, (0.5, 0.0, 0.0), "Translation drifted")
+    _assert_close(marker.position, (0.5, 0.0, 0.0), "Location drifted")
 
 
 def test_unplugging_a_marker_hands_its_value_to_the_field():
     obj, tree, _s, _o, node = _fresh("ArmatureNodesTransformNode")
     node.bone = "bone.002"
-    marker_node, marker = _wire_marker(tree, node, socket="Translation")
+    _marker_node, marker = _wire_marker(tree, node, socket="Location")
     _build(tree)
-    marker.position = (0.0, 0.7, 0.0)
+    marker.position = (0.0, 0.7, 2.0)
     _build(tree)
     placed = _head(obj)
 
-    for link in list(node.inputs["Translation"].links):
+    for link in list(node.inputs["Location"].links):
         tree.links.remove(link)
     _build(tree, BUILDS)
-    _assert_close(node.inputs["Translation"].default_value, (0.0, 0.7, 0.0), "field")
+    _assert_close(node.inputs["Location"].default_value, (0.0, 0.7, 2.0), "field")
+    assert node.use_location, "unplugged, the location must stay set"
     _assert_close(_head(obj), placed, "bone snapped back when unplugged")
 
 
 def test_deleting_a_wired_marker_leaves_the_bone_in_place():
     obj, tree, _s, _o, node = _fresh("ArmatureNodesTransformNode")
     node.bone = "bone.002"
-    marker_node, marker = _wire_marker(tree, node, socket="Translation")
+    marker_node, marker = _wire_marker(tree, node, socket="Location")
     _build(tree)
-    marker.position = (0.0, 0.7, 0.0)
+    marker.position = (0.0, 0.7, 2.0)
     _build(tree)
     placed = _head(obj)
 
@@ -573,12 +574,11 @@ def test_a_marker_from_before_tracking_keeps_driving():
     """No record of its wires: adopt them as they are rather than re-seed."""
     obj, tree, _s, _o, node = _fresh("ArmatureNodesTransformNode")
     node.bone = "bone.002"
-    rest = _head(obj)
-    marker_node, marker = _wire_marker(tree, node, socket="Translation", at=(0.5, 0.0, 0.0))
+    marker_node, marker = _wire_marker(tree, node, socket="Location", at=(0.5, 0.0, 2.0))
     marker_node.live_links = ""  # as saved by an older version
     _build(tree, BUILDS)
-    _assert_close(marker.position, (0.5, 0.0, 0.0), "marker was re-seeded")
-    _assert_close(_head(obj), rest + Vector((0.5, 0.0, 0.0)), "bone")
+    _assert_close(marker.position, (0.5, 0.0, 2.0), "marker was re-seeded")
+    _assert_close(_head(obj), (0.5, 0.0, 2.0), "bone")
 
 
 # --- The Transform input: all three on one wire --------------------------------
@@ -599,62 +599,84 @@ def test_marker_outputs_a_transform():
     assert marker_node.outputs[0].bl_idname == "ArmatureNodesTransformSocket"
 
 
-def test_transform_input_takes_all_three_from_a_marker():
+def test_transform_input_takes_the_bones_live_transform_first():
+    """Wired in, the marker takes where the bone is -- world values -- so
+    the bone does not move, and the Marker node shows the bone's real
+    Location / Rotation / Scale."""
     obj, tree, _s, _o, node = _fresh("ArmatureNodesTransformNode")
     pb = obj.pose.bones["bone.002"]
     pb.rotation_mode = "XYZ"
     pb.lock_scale = (False, False, False)
     node.bone = "bone.002"
-    rest, rest_rot = _head(obj), _world_rot(obj)
-    node.inputs["Translation"].default_value = (0.5, 0.0, 0.0)
+    node.inputs["Location"].default_value = (0.5, 0.0, 2.0)
     _build(tree)
+    live, live_rot = _head(obj), _world_rot(obj)
 
     marker_node, marker = _wire_transform(tree, node)
     _build(tree, BUILDS)
-    _assert_close(_head(obj), rest + Vector((0.5, 0.0, 0.0)), "bone jumped on wiring")
-    _assert_close(marker.position, (0.5, 0.0, 0.0), "Translation from the field")
-    _assert_close(marker.scale, (1.0, 1.0, 1.0), "Scale from the field")
-    for name in ("Translation", "Rotation", "Scale"):
+    _assert_close(marker.position, live, "marker did not take the live location")
+    _assert_turn(Euler(marker.rotation, "XYZ").to_quaternion(), live_rot, "live rotation")
+    _assert_close(marker.scale, (1.0, 1.0, 1.0), "live scale")
+    _assert_close(_head(obj), live, "bone jumped on wiring")
+    _assert_turn(_world_rot(obj), live_rot, "bone turned on wiring")
+    for name in ("Location", "Rotation", "Scale"):
         assert node.inputs[name].hide, f"{name} field still shown while the wire drives"
 
     handle = _handle(marker_node, marker)
+    _assert_close(handle.location, live, "handle on the bone")
     assert not any(handle.lock_location), "handle cannot move"
     assert not any(handle.lock_rotation), "handle cannot turn"
     assert not any(handle.lock_scale), "handle cannot scale"
 
     # Marker -> rig: move, turn and scale the one handle.
     spin = Euler((0.0, 0.0, math.radians(30.0))).to_quaternion()
-    handle.location = rest + Vector((0.0, 1.0, 0.0))
-    handle.rotation_euler = (spin @ rest_rot).to_euler("XYZ")
+    handle.location = (0.0, 1.0, 2.0)
+    handle.rotation_euler = (spin @ live_rot).to_euler("XYZ")
     handle.scale = (2.0, 2.0, 2.0)
     _full_tick()
     _build(tree)
-    _assert_close(_head(obj), rest + Vector((0.0, 1.0, 0.0)), "bone location")
-    _assert_turn(_world_rot(obj), spin @ rest_rot, "bone rotation")
+    _assert_close(_head(obj), (0.0, 1.0, 2.0), "bone location")
+    _assert_turn(_world_rot(obj), spin @ live_rot, "bone rotation")
     _assert_close(pb.matrix.to_scale(), (2.0, 2.0, 2.0), "bone scale")
-    _assert_close(marker.position, (0.0, 1.0, 0.0), "Translation")
-    _assert_turn(Euler(marker.rotation, "XYZ").to_quaternion(), spin, "Rotation")
+    _assert_close(marker.position, (0.0, 1.0, 2.0), "Location")
+    _assert_turn(Euler(marker.rotation, "XYZ").to_quaternion(), spin @ live_rot, "Rotation")
     _assert_close(marker.scale, (2.0, 2.0, 2.0), "Scale")
 
     # Rig -> marker: grab and scale the bone.
-    _grab(obj, rest + Vector((1.0, 1.0, 0.0)))
+    _grab(obj, (1.0, 1.0, 2.0))
     pb.scale = (3.0, 3.0, 3.0)
     _full_tick()
-    _assert_close(marker.position, (1.0, 1.0, 0.0), "Translation after grab")
+    _assert_close(marker.position, (1.0, 1.0, 2.0), "Location after grab")
     _assert_close(marker.scale, (3.0, 3.0, 3.0), "Scale after scaling the bone")
-    _assert_close(handle.location, _head(obj), "handle after grab")
+    _assert_close(handle.location, (1.0, 1.0, 2.0), "handle after grab")
     _build(tree, BUILDS)
-    _assert_close(_head(obj), rest + Vector((1.0, 1.0, 0.0)), "grab snapped back")
+    _assert_close(_head(obj), (1.0, 1.0, 2.0), "grab snapped back")
 
 
-def test_unplugging_the_transform_input_hands_all_three_back():
+def test_transform_input_scale_is_the_bones_not_the_objects():
+    """A scaled armature object must not have its scale applied twice."""
+    obj, tree, _s, _o, node = _fresh("ArmatureNodesTransformNode")
+    obj.scale = (2.0, 2.0, 2.0)
+    bpy.context.view_layer.update()
+    node.bone = "bone.002"
+    _build(tree)
+    _marker_node, marker = _wire_transform(tree, node)
+    _build(tree, BUILDS)
+    _assert_close(marker.scale, (1.0, 1.0, 1.0), "Scale")
+    _assert_close(obj.pose.bones["bone.002"].matrix.to_scale(), (1.0, 1.0, 1.0), "bone scale")
+
+
+def test_unplugging_the_transform_input_keeps_the_bone():
+    """The fields take the wire's values, set, so the bone stays put."""
     obj, tree, _s, _o, node = _fresh("ArmatureNodesTransformNode")
     obj.pose.bones["bone.002"].lock_scale = (False, False, False)
     node.bone = "bone.002"
-    marker_node, marker = _wire_transform(tree, node)
+    rest, rest_rot = _head(obj), _world_rot(obj)
+    _marker_node, marker = _wire_transform(tree, node)
     _build(tree)
-    marker.position = (0.0, 0.7, 0.0)
-    marker.rotation = (0.0, 0.0, math.radians(20.0))
+    spin = Euler((0.0, 0.0, math.radians(20.0))).to_quaternion()
+    marker.position = rest + Vector((0.0, 0.7, 0.0))
+    marker.rotation = (spin @ rest_rot).to_euler("XYZ")
     marker.scale = (1.5, 1.5, 1.5)
     _build(tree)
     placed, turned = _head(obj), _world_rot(obj)
@@ -662,27 +684,31 @@ def test_unplugging_the_transform_input_hands_all_three_back():
     for link in list(node.inputs["Transform"].links):
         tree.links.remove(link)
     _build(tree, BUILDS)
-    _assert_close(node.inputs["Translation"].default_value, (0.0, 0.7, 0.0), "Translation")
-    _assert_close(node.inputs["Rotation"].default_value, (0.0, 0.0, math.radians(20.0)), "Rotation")
+    rotation = Euler(node.inputs["Rotation"].default_value, "XYZ").to_quaternion()
+    _assert_close(node.inputs["Location"].default_value, rest + Vector((0.0, 0.7, 0.0)), "Location")
+    _assert_turn(rotation, spin @ rest_rot, "Rotation")
     _assert_close(node.inputs["Scale"].default_value, (1.5, 1.5, 1.5), "Scale")
-    for name in ("Translation", "Rotation", "Scale"):
+    for name in ("Location", "Rotation", "Scale"):
         assert not node.inputs[name].hide, f"{name} field still hidden after unplugging"
+    assert node.use_location and node.use_rotation and node.use_scale, "not set"
     _assert_close(_head(obj), placed, "bone moved when unplugged")
     _assert_turn(_world_rot(obj), turned, "bone turned when unplugged")
 
 
 def test_transform_input_takes_a_skeleton_landmark():
-    """Any node's marker output feeds it, not only the Marker node's."""
+    """Any node's marker output feeds it -- and a landmark with rotation off
+    is a position, so it moves the bone without turning it."""
     obj, tree, _s, _o, node = _fresh("ArmatureNodesTransformNode")
     node.bone = "bone.002"
-    rest = _head(obj)
+    rest_rot = _world_rot(obj)
     skel = tree.nodes.new("ArmatureNodesSkeletonNode")
     marker = skel.markers[0]
-    marker.set_position((0.0, 0.4, 0.0))
+    marker.set_position((0.0, 0.4, 1.5))
     sock = next(s for s in skel.outputs if s.marker_key == marker.key)
     tree.links.new(sock, node.inputs["Transform"])
     _build(tree, BUILDS)
-    _assert_close(_head(obj), rest + Vector((0.0, 0.4, 0.0)), "bone offset by the landmark")
+    _assert_close(_head(obj), (0.0, 0.4, 1.5), "bone on the landmark")
+    _assert_turn(_world_rot(obj), rest_rot, "a position-only landmark turned the bone")
 
 
 def test_an_old_marker_output_becomes_a_transform_and_keeps_its_wire():
@@ -727,37 +753,65 @@ def test_rotation_set_follows_a_turn():
 # --- Transform ----------------------------------------------------------------
 
 
-def test_transform_world_picks_up_a_grab():
+def test_transform_fields_follow_the_bone_until_set():
+    """Unset, the fields are readouts: the node shows the bone, live."""
     obj, tree, _s, _o, node = _fresh("ArmatureNodesTransformNode")
     node.bone = "bone.002"
     _build(tree)
-    rest = _head(obj)
-
-    _grab(obj, rest + Vector((1.0, 0.0, 0.0)))
+    _grab(obj, (1.0, 0.0, 2.0))
     _tick()
-    _assert_close(node.inputs["Translation"].default_value, (1.0, 0.0, 0.0), "Translation")
+    _assert_close(node.inputs["Location"].default_value, (1.0, 0.0, 2.0), "readout")
+    assert not node.use_location, "a readout must not take the bone over"
     _build(tree, BUILDS)
-    _assert_close(_head(obj), rest + Vector((1.0, 0.0, 0.0)), "bone kept")
+    _assert_close(_head(obj), (1.0, 0.0, 2.0), "unset bone left alone")
 
-    _grab(obj, rest + Vector((1.0, 2.0, 0.0)))
+
+def test_transform_set_location_follows_a_grab():
+    obj, tree, _s, _o, node = _fresh("ArmatureNodesTransformNode")
+    node.bone = "bone.002"
+    node.use_location = True
+    _build(tree)
+
+    _grab(obj, (1.0, 0.0, 2.0))
     _tick()
-    _assert_close(node.inputs["Translation"].default_value, (1.0, 2.0, 0.0), "second grab")
+    _assert_close(node.inputs["Location"].default_value, (1.0, 0.0, 2.0), "Location")
+    _build(tree, BUILDS)
+    _assert_close(_head(obj), (1.0, 0.0, 2.0), "bone kept")
+
+    _grab(obj, (1.0, 2.0, 2.0))
+    _tick()
+    _assert_close(node.inputs["Location"].default_value, (1.0, 2.0, 2.0), "second grab")
 
 
-def test_transform_does_not_jump_a_hand_posed_bone():
-    """A bone posed before the node existed must not snap back on first grab."""
+def test_transform_starts_from_a_hand_posed_bone():
+    """Posed before the node existed: the node reads that, and setting one
+    part does not snap the bone back."""
     obj, tree, _s, _o, node = _fresh("ArmatureNodesTransformNode")
     obj.pose.bones["bone.002"].location = (0.0, 0.0, 0.7)  # hand-posed earlier
     bpy.context.view_layer.update()
+    posed = _head(obj)
     node.bone = "bone.002"
+    _assert_close(node.inputs["Location"].default_value, posed, "fields read the pose")
+    node.use_location = True  # set it: starts from where the bone is
+    _build(tree, BUILDS)
+    _assert_close(_head(obj), posed, "bone jumped when its location was set")
+
+
+def test_setting_a_constrained_bones_location_does_not_move_it():
+    """The readout shows the bone after its constraint; setting the value has
+    to start from before it, or the constraint is applied twice."""
+    obj, tree, _s, _o, node = _fresh("ArmatureNodesTransformNode", keep_constraints=True)
+    node.bone = "bone.003"  # 50% Copy Transforms to a still empty
     _build(tree)
     _tick()
-    posed = _head(obj)
-
-    _grab(obj, posed + Vector((0.5, 0.0, 0.0)))
-    _tick()
+    before = _head(obj, "bone.003")
+    node.use_location = True
     _build(tree, BUILDS)
-    _assert_close(_head(obj), posed + Vector((0.5, 0.0, 0.0)), "bone jumped")
+    # A build can write nothing when the target matches; a nudge forces it.
+    sock = node.inputs["Location"]
+    sock.default_value = Vector(sock.default_value) + Vector((0.2, 0.0, 0.0))
+    _build(tree)
+    _assert_close(_head(obj, "bone.003"), before + Vector((0.1, 0.0, 0.0)), "nudged bone")
 
 
 def test_transform_local_mirrors_the_location_channel():
@@ -767,7 +821,7 @@ def test_transform_local_mirrors_the_location_channel():
     _build(tree)
     obj.pose.bones["bone.002"].location = (0.0, 0.3, 0.0)
     _tick()
-    _assert_close(node.inputs["Translation"].default_value, (0.0, 0.3, 0.0), "Translation")
+    _assert_close(node.inputs["Location"].default_value, (0.0, 0.3, 0.0), "Location")
 
 
 # --- Bone -------------------------------------------------------------------

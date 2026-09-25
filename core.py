@@ -78,6 +78,10 @@ class BoneDef:
     # The same, along the bone's own axes -- its Location / Rotation channels.
     pose_local_offset: tuple = (0.0, 0.0, 0.0)
     pose_local_rotation: tuple = (0.0, 0.0, 0.0)
+    # Which local channels a node SET outright ("location", "rotation"),
+    # rather than added to. A zero offset normally means "no request" -- but
+    # a channel set to zero means "at rest", and has to reach the rig.
+    pose_local_set: tuple = ()
 
 
 def unique_names(bones):
@@ -210,6 +214,7 @@ def copy_bone(b):
         pose_rotation_offset=tuple(b.pose_rotation_offset),
         pose_local_offset=tuple(b.pose_local_offset),
         pose_local_rotation=tuple(b.pose_local_rotation),
+        pose_local_set=tuple(b.pose_local_set),
         constraints=[
             ConstraintDef(type=c.type, name=c.name, params=dict(c.params))
             for c in b.constraints

@@ -1291,23 +1291,26 @@ def _parse_links(text):
     return bone, {p for p in rest.split("\n") if p}
 
 
-def _world_part(matrix, attr, compat):
-    """One of a world matrix's parts, as a marker stores it."""
-    loc, rot, scale = matrix.decompose()
+def _bone_part(obj, world, attr, compat):
+    """One part of a bone's world matrix, as a marker stores it.
+
+    Location and rotation in world space. Scale in the rig's own space --
+    the pose scale, 1 at rest -- because that is what a pose writes: taken
+    from the world matrix, a rig whose object is scaled to 0.01 would have
+    that 0.01 applied to its bones a second time.
+    """
     if attr == "position":
-        return tuple(loc)
+        return tuple(world.to_translation())
     if attr == "rotation":
-        e = rot.to_euler("XYZ", compat)
+        e = world.decompose()[1].to_euler("XYZ", compat)
         return (e.x, e.y, e.z)
-    return tuple(scale)
+    return tuple((obj.matrix_world.inverted_safe() @ world).to_scale())
 
 
-def _marker_field(consumer, socket_name, attr):
-    """The input whose own field ``attr`` of a marker in ``socket_name`` stands
-    in for. Usually that socket; for a Transform input, the matching
-    Translation / Rotation / Scale field -- a Transform socket has none."""
-    field_of = getattr(consumer, "marker_field", None)
-    return field_of(socket_name, attr) if field_of is not None else socket_name
+def _marker_label(consumer, socket_name, attr):
+    """What the Marker node calls a value it feeds into ``socket_name``."""
+    label_of = getattr(consumer, "marker_label", None)
+    return label_of(socket_name, attr) if label_of is not None else socket_name
 
 
 def _turn_between(a, b):
@@ -1528,12 +1531,13 @@ class MarkerNode(MarkerHolderMixin, ArmatureNodeBase, Node):
         for consumer, name, attr, kind, _driving in state.wired:
             key = f"{consumer.name}\t{name}"
             if key in fresh and kind == "relative":
-                field = consumer.inputs.get(_marker_field(consumer, name, attr))
+                field = consumer.inputs.get(name)
                 if field is None or not hasattr(field, "default_value"):
                     continue
                 value = tuple(field.default_value)
             elif key in fresh or (key in rebound and kind == "absolute"):
-                value = _world_part(driven, attr, Euler(marker.rotation, "XYZ"))
+                # The bone's live value: wiring the marker in takes it first.
+                value = _bone_part(obj, driven, attr, Euler(marker.rotation, "XYZ"))
             else:
                 continue
             changed |= self.write_marker(marker, attr, value)
@@ -1543,7 +1547,13 @@ class MarkerNode(MarkerHolderMixin, ArmatureNodeBase, Node):
         return changed
 
     def _hand_back(self, pairs, linked_too=False):
-        """The inputs in ``pairs`` lost this marker: their fields take its values."""
+        """The inputs in ``pairs`` lost this marker: their fields take over.
+
+        Ordinarily the field takes the marker's value. A node whose field
+        means something else than the wire did -- the Transform node's world
+        transform, against its relative fields -- says so in
+        ``marker_unplugged``.
+        """
         marker, tree = self.marker, self.id_data
         if marker is None or tree is None:
             return False
@@ -1554,10 +1564,13 @@ class MarkerNode(MarkerHolderMixin, ArmatureNodeBase, Node):
             sock = consumer.inputs.get(socket_name) if consumer is not None else None
             if sock is None:
                 continue
-            for attr in marker_attrs(sock):
-                field = _marker_field(consumer, socket_name, attr)
-                value = getattr(marker, attr)
-                changed |= _write_socket_value(consumer, field, value, linked_too)
+            unplugged = getattr(consumer, "marker_unplugged", None)
+            handled = unplugged(socket_name, marker, linked_too) if unplugged else None
+            if handled is not None:
+                changed |= handled
+                continue
+            value = getattr(marker, marker_attrs(sock)[0])
+            changed |= _write_socket_value(consumer, socket_name, value, linked_too)
         return changed
 
     def _read_idle(self, state):
@@ -1570,7 +1583,7 @@ class MarkerNode(MarkerHolderMixin, ArmatureNodeBase, Node):
         for attr in _MARKER_ATTRS:
             if state.modes[attr] != "idle":
                 continue
-            value = _world_part(world, attr, Euler(marker.rotation, "XYZ"))
+            value = _bone_part(state.obj, world, attr, Euler(marker.rotation, "XYZ"))
             if not _same_vec(getattr(marker, attr), value):
                 getattr(marker, "set_" + attr)(value)
                 changed = True
@@ -1717,11 +1730,11 @@ class MarkerNode(MarkerHolderMixin, ArmatureNodeBase, Node):
         state = self.link_state()
         live = state.pbone is not None
         move, turn, grow, show_turn = self._flags(state)
-        # Each value is labelled by the field it stands in for -- "Translation"
-        # on a Transform node reads as the offset it is, not as a position.
+        # Each value is labelled by what it feeds -- "Translation" on a
+        # Transform node reads as the offset it is, not as a position.
         labels = {}
         for consumer, name, attr, _k, _d in state.wired:
-            labels.setdefault(attr, _marker_field(consumer, name, attr))
+            labels.setdefault(attr, _marker_label(consumer, name, attr))
         for attr, shown, editable in (
             ("position", True, move),
             ("rotation", live or show_turn, turn),
@@ -2096,11 +2109,16 @@ class _TransformNodeBase(_LiveLinkMixin, _ModifierNodeBase):
     _INPUTS = ()  # (name, socket class, default or None)
 
     def init(self, context):
+        from .tree import suspend_live_update
+
         super().init(context)
-        for name, cls, default in self._INPUTS:
-            sock = self.inputs.new(cls.bl_idname, name)
-            if default is not None:
-                sock.default_value = default
+        # Suspended: a socket's default is the node setting itself up, not
+        # the user typing -- which would turn a Set toggle on (Scale's 1).
+        with suspend_live_update():
+            for name, cls, default in self._INPUTS:
+                sock = self.inputs.new(cls.bl_idname, name)
+                if default is not None:
+                    sock.default_value = default
 
     def ensure_inputs(self):
         """Returns the names of sockets that did not exist before."""
@@ -2118,10 +2136,13 @@ class _TransformNodeBase(_LiveLinkMixin, _ModifierNodeBase):
             else:
                 created.add(name)
             sock = self.inputs.new(cls.bl_idname, name)
-            if carried is not None and len(carried) == 3:
-                sock.default_value = carried
-            elif default is not None:
-                sock.default_value = default
+            from .tree import suspend_live_update
+
+            with suspend_live_update():  # not an edit, as in init()
+                if carried is not None and len(carried) == 3:
+                    sock.default_value = carried
+                elif default is not None:
+                    sock.default_value = default
             try:
                 self.inputs.move(len(self.inputs) - 1, index)
             except (AttributeError, RuntimeError, TypeError, ValueError):
@@ -2450,73 +2471,218 @@ class RotationNode(_TransformNodeBase, Node):
         return bones
 
 
+#: The Transform node's fields, and the toggle that sets each.
+_TRANSFORM_FLAGS = {"Location": "use_location", "Rotation": "use_rotation", "Scale": "use_scale"}
+
+
+def _on_transform_set_toggled(field):
+    """Update for one of the Transform node's Set toggles.
+
+    Turned on, the value starts from where the bone is, so turning it on
+    never moves the bone.
+    """
+
+    def update(self, context):
+        if not _seeding_suspended and getattr(self, _TRANSFORM_FLAGS[field]):
+            self.seed_from_bone((field,))
+        self.schedule_rebuild()
+
+    return update
+
+
+def _on_transform_space_changed(self, context):
+    """The values mean something else in the other space: re-read the bone."""
+    self.seed_from_bone()
+    self.schedule_rebuild()
+
+
+def _unset_local(bone, part):
+    """``part`` is no longer a local channel set outright."""
+    bone.pose_local_set = tuple(p for p in bone.pose_local_set if p != part)
+
+
 class TransformNode(_TransformNodeBase, Node):
-    """Transform -- move, turn and scale the selected bones relative to rest.
+    """Transform -- the bone's location, rotation and scale, live.
 
-    Like Geometry Nodes' Transform Geometry: nothing is absolute, so several
-    Transform nodes stack, and each build resolves against the rest pose
-    rather than the live one -- rebuilding never applies the move twice.
+    Pick a bone and the fields fill with where it is. **Space** says in what
+    terms:
 
-    **Space** decides the axes:
+    * **World**: its world Location and Rotation.
+    * **Local**: its own channels -- the Location and Rotation in the
+      N-panel, which follow the parent the way hand-posing does.
 
-    * **World**: along the scene axes, whatever way the bone points.
-    * **Local**: along the bone's own axes -- these are its Location and
-      Rotation channels, the values in the N-panel, and they follow the
-      parent the way hand-posing does.
+    Scale is the bone's own in both, 1 at rest -- never the armature object's.
 
-    Rotation is about each bone's own head. Scale multiplies what earlier
-    nodes set, and 1 means unchanged.
+    Nothing is applied until asked. A value you have not set is a readout
+    that follows the bone, so a fresh node changes nothing. Type a value, or
+    turn on its Set toggle, and the node sets that part of the bone; turning
+    it on starts from where the bone is, so it never jumps. A later node that
+    sets the same part wins.
 
-    The **Transform** input takes all three on one wire -- from a Marker, the
-    handle's location, rotation and scale. While it is wired it replaces the
-    three fields, which are hidden; unplugged, they take its last values.
+    The **Transform** input is the whole world transform on one wire. Wire a
+    Marker into it and the marker first takes the bone's live Location,
+    Rotation and Scale -- nothing moves -- and from then on the handle and the
+    bone follow each other. While it is wired the fields are hidden and Space
+    does not apply. Unplugged, the fields take over, set, holding the bone
+    where the wire left it.
     """
 
     bl_idname = "ArmatureNodesTransformNode"
     bl_label = "Transform"
     bl_icon = "ORIENTATION_GLOBAL"
 
-    bone: _bone_select_prop()
+    bone: _bone_select_prop(update=_on_transform_select_changed)
     space: EnumProperty(
         name="Space",
         items=(
-            ("WORLD", "World", "Along the scene axes"),
-            ("LOCAL", "Local", "Along the bone's own axes: its Location and Rotation channels"),
+            ("WORLD", "World", "The bone's world location and rotation"),
+            ("LOCAL", "Local", "The bone's own Location and Rotation channels, as in the N-panel"),
         ),
         default="WORLD",
+        update=_on_transform_space_changed,
     )
+    use_location: BoolProperty(
+        name="Location",
+        description="Set the bone's location to the value below. Off, the field shows where the bone is",
+        default=False,
+        update=_on_transform_set_toggled("Location"),
+    )
+    use_rotation: BoolProperty(
+        name="Rotation",
+        description="Set the bone's rotation to the value below. Off, the field shows the bone's rotation",
+        default=False,
+        update=_on_transform_set_toggled("Rotation"),
+    )
+    use_scale: BoolProperty(
+        name="Scale",
+        description="Set the bone's scale to the value below. Off, the field shows the bone's scale",
+        default=False,
+        update=_on_transform_set_toggled("Scale"),
+    )
+    layout_version: IntProperty(name="Layout", default=0, options={"HIDDEN"})
 
     _INPUTS = (
         ("Transform", TransformSocket, None),
-        ("Translation", VectorSocket, None),
+        ("Location", VectorSocket, None),
         ("Rotation", RotationSocket, None),
         ("Scale", ScaleSocket, (1.0, 1.0, 1.0)),
     )
+    _FIELDS = ("Location", "Rotation", "Scale")
+    #: How the Marker node labels the parts of the Transform wire.
+    _WORLD_LABELS = {"position": "Location", "rotation": "Rotation", "scale": "Scale"}
+    #: 2: the fields are the bone's own values. Before, offsets from rest.
+    _LAYOUT = 2
 
-    #: Which field each part of the Transform input stands in for.
-    _PARTS = (("position", "Translation"), ("rotation", "Rotation"), ("scale", "Scale"))
+    def init(self, context):
+        super().init(context)
+        self.layout_version = self._LAYOUT
+
+    def ensure_inputs(self):
+        # Location was called Translation while it was an offset. Renamed in
+        # place, it keeps its wires; migrate() converts the value.
+        old = self.inputs.get("Translation")
+        if old is not None and self.inputs.get("Location") is None:
+            old.name = "Location"
+        return super().ensure_inputs()
+
+    def migrate(self):
+        """Bring a node saved when the fields were offsets from rest up to date.
+
+        Such a node applied every value that was not zero. Here a value is the
+        bone's own and is applied when set. So each part it applied is set,
+        and re-read from the bone -- which is exactly where those offsets put
+        it. Nothing moves.
+        """
+        if self.layout_version >= self._LAYOUT:
+            return
+        obj, pbone = self.single_bone()
+        if obj is not None and obj.mode == "EDIT":
+            return  # the pose is stale in Edit mode: read it on the way out
+        self.ensure_inputs()
+        applied = [
+            field
+            for field, used in (
+                ("Location", _nonzero(self.socket_value("Location"))),
+                ("Rotation", _nonzero(self.socket_value("Rotation"))),
+                ("Scale", _not_unit(self.socket_value("Scale", (1.0, 1.0, 1.0)))),
+            )
+            if used or self.socket_linked(field)
+        ]
+        if pbone is not None:
+            for field in applied:
+                _set_without_seeding(self, _TRANSFORM_FLAGS[field], True)
+            self.seed_from_bone(applied)
+        elif applied:
+            # Several bones cannot share one set of values the way they could
+            # share an offset: leave them unset rather than pile every bone
+            # onto one point.
+            print(
+                f"[Armature Nodes] '{self.name}' moved several bones by an offset; "
+                "Transform now sets values, so those moves were dropped"
+            )
+        self.layout_version = self._LAYOUT
+
+    # -- Values ----------------------------------------------------------------
 
     def uses_transform(self):
         return self.socket_linked("Transform")
 
-    def parts(self):
-        """(translation, rotation, scale): from the Transform wire, or the fields."""
+    def wired_transform(self):
+        """(location, rotation, scale) in world space from the Transform wire,
+        None for a part the source does not carry; None when unwired."""
         sock = self.inputs.get("Transform")
-        wired = sock.get_transform() if sock is not None else None
-        if wired is not None:
-            return wired
+        return sock.get_transform() if sock is not None else None
+
+    def drives(self, field):
+        """Whether the node sets this part: toggled on, or a wire into it."""
+        return getattr(self, _TRANSFORM_FLAGS[field]) or self.socket_linked(field)
+
+    def fields(self):
         return (
-            self.socket_value("Translation"),
+            self.socket_value("Location"),
             self.socket_value("Rotation"),
             self.socket_value("Scale", (1.0, 1.0, 1.0)),
         )
 
-    def write_part(self, field, value):
-        """Write one part where it lives: the Transform wire, or its field."""
+    def bone_values(self, obj, pbone, evaluated=False):
+        """(location, rotation, scale) of the bone, as the fields hold them.
+
+        Before constraints by default: the values to set so that nothing
+        moves. ``evaluated`` gives what the bone shows, constraints and all,
+        for a readout. Local is the channels either way, as the N-panel shows.
+        """
+        from mathutils import Euler
+
+        from . import livelink
+
+        if evaluated:
+            world = obj.matrix_world @ pbone.matrix
+        else:
+            world = livelink.driven_world(obj, pbone)
+        if self.space == "LOCAL":
+            loc, rot, _s = pbone.matrix_basis.decompose()
+        else:
+            loc, rot, _s = world.decompose()
+        e = rot.to_euler("XYZ", Euler(self.socket_value("Rotation"), "XYZ"))
+        scale = (obj.matrix_world.inverted_safe() @ world).to_scale()
+        return tuple(loc), (e.x, e.y, e.z), tuple(scale)
+
+    def seed_from_bone(self, fields=None):
+        """Fill ``fields`` (all by default) with where the bone is now."""
         if self.uses_transform():
-            attr = next(a for a, f in self._PARTS if f == field)
-            return _write_input(self, "Transform", value, attr)
-        return self.write_socket(field, value)
+            return
+        obj, pbone = self.single_bone()
+        if pbone is None or obj.mode == "EDIT":
+            return
+        values = dict(zip(self._FIELDS, self.bone_values(obj, pbone)))
+        for field in fields or self._FIELDS:
+            self.write_socket(field, values[field])
+
+    def on_socket_edited(self, sock):
+        # Typing a value is asking for it: that part is now set.
+        flag = _TRANSFORM_FLAGS.get(sock.name)
+        if flag and not getattr(self, flag):
+            _set_without_seeding(self, flag, True)
 
     def update(self):
         """Links changed: show the three fields only while they are in use."""
@@ -2524,111 +2690,186 @@ class TransformNode(_TransformNodeBase, Node):
 
     def show_fields(self):
         hide = self.uses_transform()
-        for _attr, field in self._PARTS:
+        for field in self._FIELDS:
             sock = self.inputs.get(field)
             if sock is not None and sock.hide != hide and not sock.is_linked:
                 sock.hide = hide
 
+    # -- Markers ---------------------------------------------------------------
+
     def marker_role(self, socket_name):
-        # Every input here is relative to rest, and so is a marker in one.
-        if socket_name in ("Transform", "Translation", "Rotation", "Scale"):
-            return ("relative", True)
+        if socket_name == "Transform":
+            return ("absolute", True)  # the bone's world transform
+        if socket_name in _TRANSFORM_FLAGS:
+            # A wired field is set, like a typed one. In Local space its
+            # values are channels -- offsets from rest along the bone -- so
+            # the marker's handle is placed through the rest frame.
+            return ("relative" if self.space == "LOCAL" else "absolute", True)
         return None
 
-    def marker_field(self, socket_name, attr):
-        if socket_name == "Transform":
-            return dict(self._PARTS)[attr]
-        return socket_name
+    def marker_label(self, socket_name, attr):
+        return self._WORLD_LABELS[attr] if socket_name == "Transform" else socket_name
 
     def marker_frame(self, socket_name, obj, pbone):
-        """Rest, along world axes or the bone's own, as Space says."""
+        """Local channels are measured from rest, along the bone's own axes."""
         from . import livelink
 
-        return livelink.rest_world(obj, pbone), self.space == "LOCAL"
+        return livelink.rest_world(obj, pbone), True
+
+    def marker_unplugged(self, socket_name, marker, linked_too=False):
+        """A wire came off: the fields take over, holding the bone.
+
+        Set, not left as readouts: a part nothing sets goes back to the rig's
+        own pose, and the bone would jump there.
+        """
+        if socket_name == "Transform":
+            for field in self._FIELDS:
+                _set_without_seeding(self, _TRANSFORM_FLAGS[field], True)
+            obj, pbone = self.single_bone()
+            if pbone is None:
+                return False
+            changed = False
+            for field, value in zip(self._FIELDS, self.bone_values(obj, pbone)):
+                changed |= _write_socket_value(self, field, value, linked_too)
+            return changed
+        flag = _TRANSFORM_FLAGS.get(socket_name)
+        if flag is None:
+            return None
+        _set_without_seeding(self, flag, True)
+        value = getattr(marker, marker_attrs(self.inputs[socket_name])[0])
+        return _write_socket_value(self, socket_name, value, linked_too)
+
+    # -- Live link -------------------------------------------------------------
 
     def follow_live(self):
+        self.migrate()
         self.show_fields()  # backstop: update() is not called for every edit
         return super().follow_live()
 
     def absorb(self, obj, pbone, delta):
-        """Fold the user's move in, per component.
+        """The user moved the bone: the parts the node sets take the move.
 
-        A component the node already drives takes the delta, which is safe on
-        a constrained bone because the delta never contains the node's own
-        write. A component it does not drive yet takes the bone's whole
-        current offset from rest instead -- otherwise a bone that was already
-        hand-posed would jump back by that amount the moment the node started
-        driving it.
+        Only the move -- never the pose the node wrote -- so a constrained
+        bone does not chase itself. Parts it does not set are readouts.
         """
-        from mathutils import Euler
-
         from . import livelink
 
+        wired = self.wired_transform()
+        if wired is not None:
+            return self._absorb_world(wired, delta)
         local = self.space == "LOCAL"
-        now = delta.now
-        t, r, s = self.parts()
+        loc_step = delta.local_loc if local else delta.world_loc
+        rot_step = delta.local_rot if local else delta.world_rot
+        loc, rot, scale = self.fields()
         changed = False
-
-        if local:
-            loc_step, rot_step = delta.local_loc, delta.local_rot
-            basis_loc, basis_rot, _ = now.basis.decompose()
-            loc_whole = basis_loc
-            rot_whole = basis_rot
-        else:
-            loc_step, rot_step = delta.rel_loc, delta.rel_rot
-            wl, wr, _ = now.world.decompose()
-            rl, rr, _ = now.rest.decompose()
-            loc_whole = wl - rl
-            rot_whole = wr @ rr.inverted()
-
-        if loc_step.length > 1e-5:
-            value = Vector(t) + loc_step if _nonzero(t) else loc_whole
-            changed |= self.write_part("Translation", value)
-        if 2.0 * _acos_w(rot_step) > 1e-5:
-            if _nonzero(r):
-                value = livelink.compose(rot_step, r)
-            else:
-                e = rot_whole.to_euler("XYZ", Euler(r, "XYZ"))
-                value = (e.x, e.y, e.z)
-            changed |= self.write_part("Rotation", value)
-        if (delta.scale_ratio - Vector((1.0, 1.0, 1.0))).length > 1e-5:
-            value = tuple(a * b for a, b in zip(s, delta.scale_ratio))
-            changed |= self.write_part("Scale", value)
+        if self.drives("Location") and loc_step.length > 1e-5:
+            changed |= self.write_socket("Location", Vector(loc) + loc_step)
+        if self.drives("Rotation") and 2.0 * _acos_w(rot_step) > 1e-5:
+            changed |= self.write_socket("Rotation", livelink.compose(rot_step, rot))
+        if self.drives("Scale") and (delta.scale_ratio - Vector((1.0, 1.0, 1.0))).length > 1e-5:
+            value = tuple(a * b for a, b in zip(scale, delta.scale_ratio))
+            changed |= self.write_socket("Scale", value)
         return changed
+
+    def _absorb_world(self, wired, delta):
+        """A move of the bone, into the world transform on the wire."""
+        from . import livelink
+
+        loc, rot, scale = wired
+        changed = False
+        if loc is not None and delta.world_loc.length > 1e-5:
+            value = Vector(loc) + delta.world_loc
+            changed |= _write_input(self, "Transform", value, "position")
+        if rot is not None and 2.0 * _acos_w(delta.world_rot) > 1e-5:
+            value = livelink.compose(delta.world_rot, rot)
+            changed |= _write_input(self, "Transform", value, "rotation")
+        if scale is not None and (delta.scale_ratio - Vector((1.0, 1.0, 1.0))).length > 1e-5:
+            value = tuple(a * b for a, b in zip(scale, delta.scale_ratio))
+            changed |= _write_input(self, "Transform", value, "scale")
+        return changed
+
+    def readout(self, obj, pbone):
+        """Parts the node does not set show where the bone is."""
+        if self.uses_transform():
+            return False
+        changed = False
+        for field, value in zip(self._FIELDS, self.bone_values(obj, pbone, evaluated=True)):
+            if not self.drives(field):
+                changed |= _write_socket_value(self, field, value)
+        return changed
+
+    # -- UI and evaluation -------------------------------------------------------
 
     def draw_buttons(self, context, layout):
         super().draw_buttons(context, layout)
-        layout.prop(self, "space", expand=True)
         if self.uses_transform():
-            layout.label(text="Translation, Rotation, Scale from the wire", icon="LINKED")
+            layout.label(text="World transform from the wire", icon="LINKED")
+        else:
+            layout.prop(self, "space", expand=True)
+            row = layout.row(align=True)
+            row.label(text="Set")
+            for field in self._FIELDS:
+                row.prop(self, _TRANSFORM_FLAGS[field], toggle=True)
+            names = [n for n in self.bone.split(";") if n.strip()]
+            if self.space == "WORLD" and self.drives("Location") and len(names) != 1:
+                layout.label(text="Every bone goes to one point", icon="ERROR")
         _draw_live_state(self, layout)
 
     def eval_bones(self, ctx):
         bones = self.stream(ctx)
-        translation, rotation, scale = self.parts()
-        move, turn, grow = _nonzero(translation), _nonzero(rotation), _not_unit(scale)
-        if not (move or turn or grow):
-            return bones
-        local = self.space == "LOCAL"
-        chosen = self.selected(bones)
-        # Local is channel semantics -- every bone's own Location / Rotation,
-        # which do accumulate down a chain, exactly as typing the same value
-        # into each bone's N-panel would. World moves each bone once.
-        targets = chosen if local else self.top_level(bones, chosen)
-        for b in targets:
-            if move:
-                if local:
-                    b.pose_local_offset = _add(b.pose_local_offset, translation)
-                else:
-                    b.pose_offset = _add(b.pose_offset, translation)
-            if turn:
-                if local:
-                    b.pose_local_rotation = _compose(rotation, b.pose_local_rotation)
-                else:
-                    b.pose_rotation_offset = _compose(rotation, b.pose_rotation_offset)
-            if grow:
-                base = b.pose_scale or (1.0, 1.0, 1.0)
-                b.pose_scale = tuple(x * y for x, y in zip(base, scale))
+        wired = self.wired_transform()
+        if wired is not None:
+            return self._set_world(bones, wired)
+        loc, rot, scale = self.fields()
+        parts = (
+            loc if self.drives("Location") else None,
+            rot if self.drives("Rotation") else None,
+            scale if self.drives("Scale") else None,
+        )
+        if all(p is None for p in parts):
+            return bones  # nothing set: a fresh node changes nothing
+        if self.space == "LOCAL":
+            return self._set_local(bones, parts)
+        return self._set_world(bones, parts)
+
+    def _set_world(self, bones, parts):
+        """World values, set outright. As with Set Position, a set value
+        replaces any offset an earlier node applied."""
+        loc, rot, scale = parts
+        for b in self.selected(bones):
+            if loc is not None:
+                b.pose_location = tuple(loc)
+                b.pose_offset = _ZERO
+                b.pose_local_offset = _ZERO
+                _unset_local(b, "location")
+            if rot is not None:
+                b.pose_rotation = tuple(rot)
+                b.pose_rotation_offset = _ZERO
+                b.pose_local_rotation = _ZERO
+                _unset_local(b, "rotation")
+            if scale is not None:
+                b.pose_scale = tuple(scale)
+        return bones
+
+    def _set_local(self, bones, parts):
+        """The bones' own channels, set outright -- exactly as typing the same
+        values into each bone's N-panel would."""
+        loc, rot, scale = parts
+        for b in self.selected(bones):
+            local_set = set(b.pose_local_set)
+            if loc is not None:
+                b.pose_local_offset = tuple(loc)
+                b.pose_location = None
+                b.pose_offset = _ZERO
+                local_set.add("location")
+            if rot is not None:
+                b.pose_local_rotation = tuple(rot)
+                b.pose_rotation = None
+                b.pose_rotation_offset = _ZERO
+                local_set.add("rotation")
+            if scale is not None:
+                b.pose_scale = tuple(scale)
+            b.pose_local_set = tuple(sorted(local_set))
         return bones
 
 
@@ -3004,6 +3245,7 @@ _NO_REBUILD_PROPS = {
     "lock_depth",
     "symmetric",
     "live_links",  # bookkeeping for the marker's live link
+    "layout_version",  # the Transform node's one-time migration
 }
 
 
