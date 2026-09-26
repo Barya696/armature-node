@@ -41,6 +41,7 @@ _SUBMODULES = (
     "primary_rig",
     "handles",
     "nodes",
+    "groups",
     "build",
     "decompile",
     "operators",
@@ -70,12 +71,13 @@ def _reload_submodules():
 
 def register():
     _reload_submodules()
-    from . import ops, sockets, tree, nodes, operators, primary_rig, handles, ui, sync
+    from . import ops, sockets, tree, nodes, groups, operators, primary_rig, handles, ui, sync
 
     ops.register()
     sockets.register()
     tree.register()
     nodes.register()
+    groups.register()
     operators.register()
     primary_rig.register()
     handles.register()
@@ -84,13 +86,14 @@ def register():
 
 
 def unregister():
-    from . import ops, sockets, tree, nodes, operators, primary_rig, handles, ui, sync
+    from . import ops, sockets, tree, nodes, groups, operators, primary_rig, handles, ui, sync
 
     sync.unregister()
     ui.unregister()
     handles.unregister()
     primary_rig.unregister()
     operators.unregister()
+    groups.unregister()
     nodes.unregister()
     tree.unregister()
     sockets.unregister()

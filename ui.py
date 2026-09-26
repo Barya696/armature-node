@@ -19,6 +19,12 @@ class ArmatureNodeCategory(NodeCategory):
         )
 
 
+def _group_items(context):
+    from .groups import add_menu_items
+
+    return add_menu_items(context) if context is not None else []
+
+
 NODE_CATEGORIES = [
     ArmatureNodeCategory(
         "ARMATURE_NODES_IO",
@@ -69,6 +75,8 @@ NODE_CATEGORIES = [
             NodeItem("ArmatureNodesGenericConstraintNode"),
         ],
     ),
+    # Filled when the menu opens: the groups that exist change as you work.
+    ArmatureNodeCategory("ARMATURE_NODES_GROUP", "Group", items=_group_items),
 ]
 
 

@@ -208,9 +208,34 @@ class ArmatureNodeTree(NodeTree):
         options={"HIDDEN"},
     )
 
-    def mark_dirty(self):
-        """Flag the tree and schedule a debounced apply (safe from any context)."""
+    @classmethod
+    def valid_socket_type(cls, idname):
+        """What a node group's inputs and outputs can be: this tree's own
+        socket types. Blender lists these when you add one."""
+        from .sockets import classes as socket_classes
+
+        return idname in {c.bl_idname for c in socket_classes}
+
+    def mark_dirty(self, _seen=None):
+        """Flag the tree and schedule a debounced apply (safe from any context).
+
+        A node group builds nothing itself. Changing one changes every tree
+        that uses it, so those are marked instead -- and they pass it on up,
+        through groups inside groups, to the trees that build a rig. Each
+        tree once: Blender lets two groups use each other, and passing it on
+        around that loop would never stop.
+        """
         if _updating:
+            return
+        seen = set() if _seen is None else _seen
+        if self.name in seen:
+            return
+        seen.add(self.name)
+        from .groups import group_users, is_group_tree
+
+        for user in group_users(self):
+            user.mark_dirty(_seen=seen)
+        if is_group_tree(self):
             return
         self.is_dirty = True
         if not self.live_update:
@@ -222,7 +247,12 @@ class ArmatureNodeTree(NodeTree):
         _schedule(self.update_delay)
 
     def update(self):
-        """Called by Blender when links or nodes in the tree change."""
+        """Called by Blender when links or nodes in the tree change -- and,
+        for a node group, when its inputs or outputs change."""
+        from .groups import sync_group_users
+
+        if not _updating:
+            sync_group_users(self)
         self.mark_dirty()
 
 

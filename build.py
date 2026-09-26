@@ -180,8 +180,17 @@ def _apply_graph_pose(obj, bone_defs, tree_name=""):
     return writer.writes
 
 
+def _live_nodes(tree):
+    """The tree's nodes and those of every node group it runs: a node inside
+    a group poses the rig as much as one outside it."""
+    from .groups import trees_in_use
+
+    for current in trees_in_use(tree):
+        yield from current.nodes
+
+
 def _follow_live(tree):
-    for node in tree.nodes:
+    for node in _live_nodes(tree):
         if hasattr(node, "follow_live"):
             try:
                 node.follow_live()
@@ -191,7 +200,7 @@ def _follow_live(tree):
 
 def _note_built(tree):
     """Whatever the linked bones look like now is the graph's own doing."""
-    for node in tree.nodes:
+    for node in _live_nodes(tree):
         if hasattr(node, "note_built"):
             try:
                 node.note_built()

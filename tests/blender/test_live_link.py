@@ -204,6 +204,43 @@ def test_ticking_set_on_a_constrained_bone_does_not_move_it():
     _assert_close(_head(obj, "bone.003"), before + Vector((0.1, 0.0, 0.0)), "nudged bone")
 
 
+def test_setting_position_with_an_offset_does_not_move_the_bone():
+    """Position is taken as the bone's place less the node's own Offset,
+    which is added on top: taking the place as it is moved the bone by it."""
+    obj, tree, _s, _o, node = _fresh("ArmatureNodesPositionNode")
+    node.bone = "bone.002"
+    node.inputs["Offset"].default_value = (1.0, 0.0, 0.0)
+    _build(tree)
+    before = _head(obj)
+    node.use_position = True
+    _build(tree, BUILDS)
+    _assert_close(_head(obj), before, "ticking Set Position with an Offset")
+
+
+def test_wiring_a_marker_under_an_offset_does_not_move_the_bone():
+    obj, tree, _s, _o, node = _fresh("ArmatureNodesPositionNode")
+    node.bone = "bone.002"
+    node.inputs["Offset"].default_value = (1.0, 0.0, 0.0)
+    _build(tree)
+    before = _head(obj)
+    _wire_marker(tree, node)
+    _build(tree, BUILDS)
+    _assert_close(_head(obj), before, "wiring a marker into Position with an Offset")
+
+
+def test_setting_rotation_with_an_offset_does_not_turn_the_bone():
+    obj, tree, _s, _o, node = _fresh("ArmatureNodesRotationNode")
+    node.bone = "bone.002"
+    node.inputs["Offset"].default_value = (0.0, 0.0, math.radians(30.0))
+    _build(tree)
+    before = (obj.matrix_world @ obj.pose.bones["bone.002"].matrix).to_quaternion()
+    node.use_rotation = True
+    _build(tree, BUILDS)
+    now = (obj.matrix_world @ obj.pose.bones["bone.002"].matrix).to_quaternion()
+    angle = math.degrees(2.0 * math.acos(min(1.0, abs(now.dot(before)))))
+    assert angle < 1e-2, f"ticking Set Rotation with an Offset turned the bone {angle:.2f} degrees"
+
+
 def test_undo_does_not_double_apply():
     """Snapshots are not in the undo stack, so undo must clear them."""
     from armature_nodes import livelink

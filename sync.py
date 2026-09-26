@@ -213,7 +213,10 @@ def _deferred_sync():
     an RNA notification when a Node Editor area changes its editor subtype,
     so keep this lightweight watcher alive while the addon is enabled."""
     try:
+        from .groups import sync_all_group_nodes
+
         sync_editors_to_active()
+        sync_all_group_nodes()  # group nodes follow interface edits Blender did not report
         watch_tree_topology()  # catches node/link removals update() misses
         sync_marker_handles()  # catches drags that emit no depsgraph event
         sync_bone_nodes()  # Bone nodes follow the bones they do not drive
@@ -267,6 +270,22 @@ def _trees_to_track():
     return list(trees.values())
 
 
+def _nodes_to_track():
+    """Every node of the tracked trees and of the node groups they run,
+    through groups inside groups -- each tree once, even when two rigs share
+    a group. A marker or live node inside a group is as much the rig's as
+    one outside it."""
+    from .groups import trees_in_use
+
+    seen = set()
+    for root in _trees_to_track():
+        for tree in trees_in_use(root):
+            if tree.name in seen:
+                continue
+            seen.add(tree.name)
+            yield from tree.nodes
+
+
 def sync_marker_handles():
     """Read dragged marker handles back into their nodes.
 
@@ -286,29 +305,28 @@ def sync_marker_handles():
     )
 
     changed = False
-    for tree in _trees_to_track():
-        for node in tree.nodes:
-            if node.bl_idname not in _MARKER_NODES:
+    for node in _nodes_to_track():
+        if node.bl_idname not in _MARKER_NODES:
+            continue
+        try:
+            # Handles follow visibility both ways. Create them whenever one
+            # is missing -- on a new node, on file load, or after the empty
+            # was deleted by hand -- and drop them again as soon as the node
+            # stops feeding a displaying Armature Output, so unwiring a
+            # marker clears it from the viewport.
+            visible = marker_node_visible(node) and len(node.markers)
+            shown = node.markers_shown()
+            if visible and not shown:
+                ensure_marker_empties(node)
+                changed = True
+            elif shown and not visible:
+                remove_marker_empties(node)
+                changed = True
                 continue
-            try:
-                # Handles follow visibility both ways. Create them whenever
-                # one is missing -- on a new node, on file load, or after the
-                # empty was deleted by hand -- and drop them again as soon as
-                # the node stops feeding a displaying Armature Output, so
-                # unwiring a marker clears it from the viewport.
-                visible = marker_node_visible(node) and len(node.markers)
-                shown = node.markers_shown()
-                if visible and not shown:
-                    ensure_marker_empties(node)
-                    changed = True
-                elif shown and not visible:
-                    remove_marker_empties(node)
-                    changed = True
-                    continue
-                if node.sync_from_empties():
-                    changed = True
-            except Exception as exc:  # noqa: BLE001
-                print(f"[Armature Nodes] Marker sync failed on '{node.name}': {exc}")
+            if node.sync_from_empties():
+                changed = True
+        except Exception as exc:  # noqa: BLE001
+            print(f"[Armature Nodes] Marker sync failed on '{node.name}': {exc}")
     if changed:
         for _space, area in _armature_node_spaces():
             area.tag_redraw()
@@ -352,15 +370,14 @@ def sync_bone_nodes():
     if is_updating() or lock.is_held():
         return  # mid-build: matrices are half-applied, and it is our own write
     changed = False
-    for tree in _trees_to_track():
-        for node in tree.nodes:
-            if not hasattr(node, "follow_live"):
-                continue
-            try:
-                if node.follow_live():
-                    changed = True
-            except Exception as exc:  # noqa: BLE001
-                print(f"[Armature Nodes] Live link failed on '{node.name}': {exc}")
+    for node in _nodes_to_track():
+        if not hasattr(node, "follow_live"):
+            continue
+        try:
+            if node.follow_live():
+                changed = True
+        except Exception as exc:  # noqa: BLE001
+            print(f"[Armature Nodes] Live link failed on '{node.name}': {exc}")
     if changed:
         for _space, area in _armature_node_spaces():
             area.tag_redraw()

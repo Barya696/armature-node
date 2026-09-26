@@ -349,6 +349,43 @@ How the relative moves behave:
 - **IK Constraint** and **Constraint** (copy/limit/track/stretch) — wired into
   the Constraints input of a Bone, Chain or Marker node.
 
+### Node groups
+
+The same principle as Blender's own node groups. A group is a node tree of its
+own (a data-block in *Blender File > Node Groups*), used from other trees
+through a **group node**:
+
+- **Ctrl+G** puts the selected nodes into a new group and opens it. Every wire
+  that crossed the edge of the selection becomes one of the group's inputs or
+  outputs — one per source, named after the socket it feeds — and the group
+  node takes the nodes' place, wired as they were. The rig does not change.
+- **Tab** goes into the selected group node, and back out; **Ctrl+Tab** only
+  goes out. **Ctrl+Alt+G** puts a group node's nodes back in its place.
+- Inside, **Group Input** puts the group's inputs on wires and **Group
+  Output** takes its outputs. Drag a wire into their empty socket to add one;
+  rename, reorder or remove them in the sidebar's **Group** tab (*Group
+  Sockets*), as in any Blender node group.
+- **Shift+A > Group** adds Group Input / Output (inside a group) and any
+  existing group — except one that would end up inside itself.
+- One group can be used by any number of group nodes, on any rig. **Edit it
+  once and every one of them changes**, and every rig using it rebuilds.
+- Values cross the edge the way wires do: a marker outside wired into a group
+  node drives the node inside, and a value typed on the group node's socket
+  is used when nothing is wired in. Groups can hold groups.
+
+**Markers go into groups too.** A marker inside a group shows its handle in
+the viewport when the group node using it feeds an Armature Output, and you
+drag it as usual. Like any value inside a Blender node group, it is shared:
+every group node running the group uses the same marker.
+
+**A group used once is live**, exactly like the rig's own tree: a marker
+wired in takes the bone's place, grabbing the bone moves the marker, picking
+a bone fills the fields. A group used by several group nodes cannot know
+which bone to follow — so there its markers and values still drive the rig,
+but nothing follows a grab (the Bone field still lists a rig's bones). A
+marker left outside and wired into a group node drives the nodes inside, but
+is not live with them.
+
 ## Execution model
 
 0. **Baseline** — the Armature Input emits the rig's stored unmodified state,
@@ -384,6 +421,7 @@ node, which marks the tree dirty, which re-poses the rig.
 | `nodes.py` | Every node type |
 | `primary_rig.py` | Marker handles and locks, viewport overlay, MediaPipe preset table, marker operators |
 | `handles.py` | The grabbable marker gizmo: hit-testing, move / turn / scale drags, rings and name label |
+| `groups.py` | Node groups: the group node, Make Group / Ungroup / Tab, group sockets kept in step, Shift+A > Group |
 | `widgets.py` | `WGTS_rig` widget library and Rigify-style preset generation |
 | `build.py` | Forward compile: evaluate → edit pass → pose pass → pose-transform pass |
 | `decompile.py` | Reverse: the two-node stack that targets a rig |

@@ -108,16 +108,112 @@ def unique_names(bones):
     return bones
 
 
+# ---------------------------------------------------------------------------
+# Node groups: evaluation as a function call
+# ---------------------------------------------------------------------------
+#
+# A group node runs its group's tree the way a function call runs a function:
+# what is wired into the group node arrives inside at the Group Input node,
+# and what reaches the Group Output node comes back out of the group node.
+# While a group is running it sits on this stack. A Group Input node reads
+# from the group node on top of it -- and does so *outside* it, in the frame
+# the group node itself lives in, which is what makes groups inside groups
+# work. One group tree used by several group nodes is evaluated once per
+# group node, each with its own inputs.
+
+GROUP_INPUT = "NodeGroupInput"
+GROUP_OUTPUT = "NodeGroupOutput"
+REROUTE = "NodeReroute"
+# Deeper than this is a group that contains itself through another group.
+MAX_GROUP_DEPTH = 32
+
+_frames = []
+
+
+def current_group():
+    """The group node whose group is being evaluated, or None at top level."""
+    return _frames[-1] if _frames else None
+
+
+class entering:
+    """``with entering(group_node):`` -- evaluate inside that group node."""
+
+    def __init__(self, group_node):
+        self.group_node = group_node
+
+    def __enter__(self):
+        tree = self.group_node.node_tree
+        if len(_frames) >= MAX_GROUP_DEPTH or any(g.node_tree == tree for g in _frames):
+            raise RuntimeError(
+                f"Node group '{tree.name if tree else '?'}' contains itself"
+            )
+        _frames.append(self.group_node)
+        return self.group_node
+
+    def __exit__(self, *exc):
+        _frames.pop()
+        return False
+
+
+class outside:
+    """``with outside():`` -- step out of the current group, into the frame
+    of the group node that runs it. Where a Group Input node reads from."""
+
+    def __enter__(self):
+        self.group_node = _frames.pop() if _frames else None
+        return self.group_node
+
+    def __exit__(self, *exc):
+        if self.group_node is not None:
+            _frames.append(self.group_node)
+        return False
+
+
+def _frame_key():
+    return tuple((g.id_data.name, g.name) for g in _frames)
+
+
+def socket_by_identifier(sockets, identifier):
+    """A node socket by its identifier -- names are labels and may repeat."""
+    for sock in sockets:
+        if sock.identifier == identifier:
+            return sock
+    return None
+
+
+def group_output_node(tree):
+    """The group's active Group Output node, or None."""
+    if tree is None:
+        return None
+    outputs = [n for n in tree.nodes if n.bl_idname == GROUP_OUTPUT]
+    for node in outputs:
+        if getattr(node, "is_active_output", False):
+            return node
+    return outputs[0] if outputs else None
+
+
+def _live_links(sock):
+    return [l for l in sock.links if l.is_valid and not l.is_muted]
+
+
 class EvalContext:
-    """Per-build memoization so shared upstream nodes evaluate once."""
+    """Per-build memoization so shared upstream nodes evaluate once.
+
+    Keyed by where a node sits -- which group node, in which tree -- as well
+    as by the node: a group's nodes run once for every group node using it,
+    and two trees are free to use the same node names.
+    """
 
     def __init__(self):
         self._bone_cache = {}
         self._constraint_cache = {}
         self._visiting = set()
 
+    def _key(self, node, identifier=""):
+        return (_frame_key(), node.id_data.name, node.name, identifier)
+
     def bones_from_node(self, node):
-        key = node.name
+        key = self._key(node)
         if key in self._visiting:
             raise RuntimeError(f"Cycle detected at node '{node.name}'")
         if key in self._bone_cache:
@@ -131,7 +227,7 @@ class EvalContext:
         return result
 
     def constraints_from_node(self, node):
-        key = node.name
+        key = self._key(node)
         if key in self._constraint_cache:
             return self._constraint_cache[key]
         result = (
@@ -140,18 +236,59 @@ class EvalContext:
         self._constraint_cache[key] = result
         return result
 
+    def bones_from_socket(self, sock):
+        """The rig coming out of one output socket."""
+        return self._from_socket(sock, "bones")
+
+    def constraints_from_socket(self, sock):
+        return self._from_socket(sock, "constraints")
+
+    def _from_socket(self, sock, kind):
+        node = sock.node
+        if node.bl_idname == REROUTE:
+            return self._gather(node.inputs[0], kind)
+        if node.bl_idname == GROUP_INPUT:
+            # The value wired into the running group node, read where that
+            # group node lives.
+            with outside() as group_node:
+                if group_node is None:
+                    return []  # a group tree opened on its own: no caller
+                outer = socket_by_identifier(group_node.inputs, sock.identifier)
+                return self._gather(outer, kind) if outer is not None else []
+        if getattr(node, "is_armature_group", False):
+            return self._from_group(node, sock.identifier, kind)
+        if kind == "bones":
+            return self.bones_from_node(node)
+        return self.constraints_from_node(node)
+
+    def _from_group(self, group_node, identifier, kind):
+        """Run the group: what reaches its Group Output, for this output."""
+        cache = self._bone_cache if kind == "bones" else self._constraint_cache
+        key = self._key(group_node, identifier)
+        if key in cache:
+            return cache[key]
+        output = group_output_node(group_node.node_tree)
+        inner = socket_by_identifier(output.inputs, identifier) if output else None
+        result = []
+        if inner is not None:
+            with entering(group_node):
+                result = self._gather(inner, kind)
+        cache[key] = result
+        return result
+
+    def _gather(self, sock, kind):
+        out = []
+        for link in _live_links(sock):
+            out.extend(self._from_socket(link.from_socket, kind))
+        return out
+
 
 def gather_input_bones(node, socket_name, ctx):
     """Collect BoneDefs from every link into the named input socket."""
     sock = node.inputs.get(socket_name)
     if sock is None:
         return []
-    bones = []
-    for link in sock.links:
-        if not link.is_valid:
-            continue
-        bones.extend(ctx.bones_from_node(link.from_node))
-    return bones
+    return ctx._gather(sock, "bones")
 
 
 def gather_input_constraints(node, socket_name, ctx):
@@ -159,12 +296,7 @@ def gather_input_constraints(node, socket_name, ctx):
     sock = node.inputs.get(socket_name)
     if sock is None:
         return []
-    out = []
-    for link in sock.links:
-        if not link.is_valid:
-            continue
-        out.extend(ctx.constraints_from_node(link.from_node))
-    return out
+    return ctx._gather(sock, "constraints")
 
 
 def bone_roll(bone):

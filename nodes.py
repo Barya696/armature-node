@@ -109,10 +109,40 @@ class ArmatureNodeBase:
                 src = getattr(node, "source", None)
                 if src is not None and getattr(src, "type", "") == "ARMATURE":
                     return src
+        # Inside a node group: the rig the group is used on, when exactly one
+        # uses it. That is still the binding -- found through the group node
+        # -- and it is what makes a node inside a group live with its bone.
+        from .groups import unique_rig
+
         # No fallback to the Output's armature_name. The target follows the
         # BINDING, never the selection or a typed name: a tree that quietly
         # retargeted itself to whichever armature was active is how a rig
         # ended up modified by a graph that was never pointed at it.
+        return unique_rig(tree)
+
+    def rig_for_ui(self):
+        """The rig to list bone names from, for a dropdown.
+
+        This tree's own rig, or -- inside a node group, which has none -- the
+        rig of a tree that uses the group. For display only: a group can be
+        used on several rigs, so nothing that writes a rig goes through here.
+        """
+        obj = self.resolve_armature()
+        if obj is not None:
+            return obj
+        from .groups import group_users
+
+        seen, todo = set(), list(group_users(self.id_data))
+        while todo:
+            tree = todo.pop()
+            if tree.name in seen:
+                continue
+            seen.add(tree.name)
+            for node in tree.nodes:
+                src = getattr(node, "source", None) if node.bl_idname == "ArmatureNodesInputNode" else None
+                if src is not None and getattr(src, "type", "") == "ARMATURE":
+                    return src
+            todo.extend(group_users(tree))
         return None
 
     def draw_bone_select(self, layout):
@@ -121,7 +151,7 @@ class ArmatureNodeBase:
         A searchable dropdown of the rig's real bones when there is a rig to
         search, plain text otherwise. Empty means every bone on the wire.
         """
-        obj = self.resolve_armature()
+        obj = self.rig_for_ui()
         row = layout.row(align=True)
         if obj is not None:
             row.prop_search(self, "bone", obj.data, "bones", text="", icon="BONE_DATA")
@@ -1129,7 +1159,7 @@ class BoneNode(_LiveLinkMixin, _ModifierNodeBase, Node):
 
     def draw_buttons(self, context, layout):
         layout.context_pointer_set("node", self)
-        obj = self.resolve_armature()
+        obj = self.rig_for_ui()
         row = layout.row(align=True)
         if obj is not None:
             # Every bone, whatever its role: a DEF or MCH bone is as valid a
@@ -1562,8 +1592,13 @@ class MarkerNode(MarkerHolderMixin, ArmatureNodeBase, Node):
                     continue
                 value = tuple(field.default_value)
             elif key in fresh or (key in rebound and kind == "absolute"):
-                # The bone's live value: wiring the marker in takes it first.
+                # The bone's live value: wiring the marker in takes it first --
+                # less whatever the node adds on top of it (Position's Offset),
+                # or the bone would move by that.
                 value = _bone_part(obj, driven, attr, Euler(marker.rotation, "XYZ"))
+                seed = getattr(consumer, "marker_seed", None)
+                if seed is not None:
+                    value = seed(name, attr, value)
             else:
                 continue
             changed |= self.write_marker(marker, attr, value)
@@ -2302,7 +2337,16 @@ class PositionNode(_TransformNodeBase, Node):
             return
         obj, pbone = self.single_bone()
         if pbone is not None:
-            self.write_socket("Position", livelink.driven_world(obj, pbone).to_translation())
+            here = livelink.driven_world(obj, pbone).to_translation()
+            self.write_socket("Position", self.marker_seed("Position", "position", here))
+
+    def marker_seed(self, socket_name, attr, value):
+        """The Position that keeps the bone at ``value``: this node adds its
+        own Offset on top, so taking the bone's place as it is would move it
+        by the Offset."""
+        if socket_name == "Position" and attr == "position":
+            return tuple(Vector(value) - Vector(self.socket_value("Offset")))
+        return value
 
     def on_socket_edited(self, sock):
         # Typing a position is asking for it: take the bone over, rather than
@@ -2427,7 +2471,19 @@ class RotationNode(_TransformNodeBase, Node):
         obj, pbone = self.single_bone()
         if pbone is not None:
             e = livelink.driven_world(obj, pbone).to_euler("XYZ")
-            self.write_socket("Rotation", (e.x, e.y, e.z))
+            self.write_socket("Rotation", self.marker_seed("Rotation", "rotation", (e.x, e.y, e.z)))
+
+    def marker_seed(self, socket_name, attr, value):
+        """The Rotation that keeps the bone turned as ``value``: this node's
+        own Offset turns it further, so that is taken back out first."""
+        from mathutils import Euler
+
+        if socket_name == "Rotation" and attr == "rotation":
+            own = Euler(self.socket_value("Offset"), "XYZ").to_quaternion()
+            q = own.inverted() @ Euler(value, "XYZ").to_quaternion()
+            e = q.to_euler("XYZ", Euler(value, "XYZ"))
+            return (e.x, e.y, e.z)
+        return value
 
     def on_socket_edited(self, sock):
         if sock.name == "Rotation" and not self.use_rotation:

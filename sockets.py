@@ -40,6 +40,57 @@ def _on_socket_value_changed(self, context):
         tree.mark_dirty()
 
 
+def value_source(sock):
+    """Where the value on input ``sock`` is made. ``sock`` itself when nothing
+    is wired in; otherwise the output socket at the far end of the wire --
+    a marker, say -- or the input field of a group node it passes through.
+
+    Follows reroutes and node-group boundaries. A Group Input stands for the
+    group node running the group, so it is walked on a copy of the group
+    call stack (``core``): the UI and the live link read values outside any
+    evaluation, and must not disturb one that is in progress.
+    """
+    from . import core
+
+    frames = list(core._frames)
+    for _step in range(256):  # a wire loop through groups would never end
+        links = [l for l in sock.links if l.is_valid and not l.is_muted] if sock.is_linked else []
+        if not links:
+            return sock
+        out = links[0].from_socket
+        node = out.node
+        if node.bl_idname == core.REROUTE:
+            sock = node.inputs[0]
+        elif node.bl_idname == core.GROUP_INPUT:
+            if not frames:
+                return None  # a group tree on its own: no group node feeding it
+            outer = core.socket_by_identifier(frames.pop().inputs, out.identifier)
+            if outer is None:
+                return None
+            sock = outer
+        elif getattr(node, "is_armature_group", False):
+            output = core.group_output_node(node.node_tree)
+            inner = core.socket_by_identifier(output.inputs, out.identifier) if output else None
+            if inner is None:
+                return None
+            frames.append(node)
+            sock = inner
+        else:
+            return out
+    return None
+
+
+def source_marker(source):
+    """(marker node, marker) when ``source`` is a marker's output, else (None, None)."""
+    if source is None or not source.is_output:
+        return None, None
+    key = getattr(source, "marker_key", "")
+    node = source.node
+    if not key or not hasattr(node, "marker_by_key"):
+        return None, None
+    return node, node.marker_by_key(key)
+
+
 class _SocketDrawMixin:
     def draw(self, context, layout, node, text):
         if self.is_output or self.is_linked or not hasattr(self, "default_value"):
@@ -49,6 +100,11 @@ class _SocketDrawMixin:
 
     def draw_color(self, context, node):
         return self.socket_color
+
+    @classmethod
+    def draw_color_simple(cls):
+        """The colour a node group's interface shows for this socket type."""
+        return cls.socket_color
 
 
 class RigSocket(_SocketDrawMixin, NodeSocket):
@@ -89,19 +145,16 @@ class _ValueSocketMixin:
     _marker_attr = "position"
 
     def get_value(self):
-        """The vector on this socket: from the link if there is one, from a
-        marker when the link names one, otherwise the typed default."""
-        if self.is_linked and self.links:
-            link = self.links[0]
-            from_sock = link.from_socket
-            key = getattr(from_sock, "marker_key", "")
-            node = link.from_node
-            if key and hasattr(node, "marker_by_key"):
-                marker = node.marker_by_key(key)
-                if marker is not None:
-                    return tuple(getattr(marker, self._marker_attr))
-            if hasattr(from_sock, "default_value"):
-                v = from_sock.default_value
+        """The vector on this socket: from the wire if there is one -- a
+        marker's value when it comes from a marker, through reroutes and node
+        groups -- otherwise the typed default."""
+        source = value_source(self)
+        if source is not None and source is not self:
+            _node, marker = source_marker(source)
+            if marker is not None:
+                return tuple(getattr(marker, self._marker_attr))
+            v = getattr(source, "default_value", None)
+            if v is not None:
                 try:
                     return (float(v[0]), float(v[1]), float(v[2]))
                 except (TypeError, IndexError):
@@ -207,25 +260,24 @@ class TransformSocket(_SocketDrawMixin, NodeSocket):
         position, and must not turn the bone to face world zero. From any
         other value, only the part its type stands for.
         """
-        if not self.is_linked or not self.links:
+        source = value_source(self)
+        if source is None or source is self:
             return None
-        link = self.links[0]
-        from_sock, node = link.from_socket, link.from_node
-        key = getattr(from_sock, "marker_key", "")
-        if key and hasattr(node, "marker_by_key"):
-            marker = node.marker_by_key(key)
-            if marker is not None:
-                turns = node.marker_uses_rotation(key)
-                scales = node.marker_uses_scale(key)
-                return (
-                    tuple(marker.position),
-                    tuple(marker.rotation) if turns else None,
-                    tuple(marker.scale) if scales else None,
-                )
+        node, marker = source_marker(source)
+        if marker is not None:
+            turns = node.marker_uses_rotation(marker.key)
+            scales = node.marker_uses_scale(marker.key)
+            return (
+                tuple(marker.position),
+                tuple(marker.rotation) if turns else None,
+                tuple(marker.scale) if scales else None,
+            )
         parts = dict.fromkeys(("position", "rotation", "scale"))
-        value = getattr(from_sock, "default_value", None)
+        value = getattr(source, "default_value", None)
         if value is not None:
-            parts[getattr(from_sock, "_marker_attr", "position")] = tuple(value)
+            parts[getattr(source, "_marker_attr", "position")] = tuple(value)
+        if all(p is None for p in parts.values()):
+            return None  # an empty group input: nothing is wired in
         return parts["position"], parts["rotation"], parts["scale"]
 
 

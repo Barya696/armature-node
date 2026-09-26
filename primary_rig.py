@@ -314,12 +314,18 @@ _draw_handle = None
 
 def _reaches_output(node, seen=None):
     """True when following this node's output links arrives at an Armature
-    Output whose marker display is on."""
+    Output whose marker display is on.
+
+    Out of a node group too: what reaches the group's Group Output comes out
+    of every group node running the group, so the walk carries on from there
+    -- which is what shows a marker that sits inside a group.
+    """
     if seen is None:
         seen = set()
-    if node.name in seen:
+    key = (node.id_data.name, node.name)
+    if key in seen:
         return False  # graphs can rejoin; never walk a node twice
-    seen.add(node.name)
+    seen.add(key)
     for sock in node.outputs:
         for link in sock.links:
             if not link.is_valid:
@@ -329,6 +335,12 @@ def _reaches_output(node, seen=None):
                 if getattr(nxt, "show_markers", True):
                     return True
                 continue  # this output hides markers; another may not
+            if nxt.bl_idname == "NodeGroupOutput":
+                from .groups import group_nodes_using
+
+                if any(_reaches_output(g, seen) for g in group_nodes_using(nxt.id_data)):
+                    return True
+                continue
             if _reaches_output(nxt, seen):
                 return True
     return False
