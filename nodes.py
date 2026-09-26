@@ -301,6 +301,18 @@ class _ModifierNodeBase(ArmatureNodeBase):
 _syncing_markers = False
 
 
+def _handle_size_prop():
+    """Size of a marker node's handles on screen. Display only: no rebuild."""
+    return FloatProperty(
+        name="Size",
+        description="How big this node's marker handles are drawn in the viewport",
+        default=1.0,
+        min=0.5,
+        max=3.0,
+        update=lambda self, context: _redraw_viewports(),
+    )
+
+
 def _slug(text):
     """A key-safe token from a display name."""
     out = "".join(c if c.isalnum() else "_" for c in (text or "").strip().lower())
@@ -420,6 +432,19 @@ class SkeletonMarker(bpy.types.PropertyGroup):
         default=(1.0, 1.0, 1.0),
         subtype="XYZ",
         update=_on_marker_changed,
+    )
+    color: FloatVectorProperty(
+        name="Color",
+        description=(
+            "Glow colour of this marker's handle. MediaPipe landmarks keep "
+            "their side colours"
+        ),
+        size=3,
+        min=0.0,
+        max=1.0,
+        default=(0.95, 0.45, 0.75),
+        subtype="COLOR",
+        update=lambda self, context: _redraw_viewports(),
     )
 
     def set_position(self, value):
@@ -1366,6 +1391,7 @@ class MarkerNode(MarkerHolderMixin, ArmatureNodeBase, Node):
         default=True,
         update=lambda self, ctx: self.refresh_handles(),
     )
+    handle_size: _handle_size_prop()
     live_links: StringProperty(
         name="Live Links",
         description="The bone and inputs this marker fed on the last look",
@@ -1726,6 +1752,10 @@ class MarkerNode(MarkerHolderMixin, ArmatureNodeBase, Node):
             depress=marker.use_rotation,
         )
         op.marker = marker.key
+        # How the handle looks: its glow colour and its size on screen.
+        row = layout.row(align=True)
+        row.prop(marker, "color", text="")
+        row.prop(self, "handle_size", slider=True)
 
         state = self.link_state()
         live = state.pbone is not None
@@ -1802,6 +1832,7 @@ class SkeletonNode(MarkerHolderMixin, ArmatureNodeBase, Node):
         default=True,
         update=lambda self, ctx: self.refresh_handles(),
     )
+    handle_size: _handle_size_prop()
     show_markers: BoolProperty(name="Markers", default=True)
     show_detail: BoolProperty(name="Face / Hands / Feet", default=False)
     show_advanced: BoolProperty(name="Advanced", default=False)
@@ -1938,6 +1969,7 @@ class SkeletonNode(MarkerHolderMixin, ArmatureNodeBase, Node):
         row.prop(self, "lock_depth", toggle=True)
         row.prop(self, "symmetric", toggle=True)
         row.prop(self, "show_handles", toggle=True, icon="HIDE_OFF")
+        col.prop(self, "handle_size", slider=True)
 
         row = layout.row(align=True)
         row.operator("armature_nodes.skeleton_add_marker", text="Add Marker", icon="ADD")

@@ -147,9 +147,33 @@ armature data, and are written by the marker nodes.)
 
 ### Marker
 
-A marker is a world position with a stable key, drawn as a glowing sphere and
-a draggable empty in the `MRKS_rig` collection. Placing things by dragging a
+A marker is a world position with a stable key, drawn as a glowing light and
+backed by an empty in the `MRKS_rig` collection. Placing things by dragging a
 handle beats typing coordinates, which is the only reason markers exist.
+
+**Grab the glow — in any mode, Pose mode included.** The glow is a viewport
+gizmo, like the ones on a light or a camera, so it does not need the empty to
+be clickable (Blender will not let you click another object while the
+armature is in Pose mode). It stays the same size on screen at any zoom, and
+lights up with the marker's name beside it when the mouse is over it.
+
+- **Drag the glow** to move the marker. **Ctrl** drops it onto the surface
+  under the cursor, **Shift** moves it finely, **X / Y / Z** lock the move to
+  that axis. **Esc** or right-click puts it back.
+- **Drag the ring** — there when the marker supplies a rotation — to turn it
+  about the view, or with X / Y / Z about that axis. Ctrl: 5° steps.
+- **Drag the square** on the ring — there when it supplies a scale — to scale
+  it. X / Y / Z: that axis only. Ctrl: steps of 0.1.
+- A marker whose position is only a readout of the bone turns (or scales)
+  when you drag its glow instead.
+- Every drag is one undo step.
+
+The drag moves the marker's empty, exactly as grabbing the empty would, so
+locks, mirroring, rigid groups and the live link to the bone all apply.
+
+Each marker node has a **Size** slider for its handles, and a Marker node has
+a **colour** swatch for its glow (MediaPipe landmarks keep their side
+colours).
 
 Markers are displayed **through the Armature Output they feed**, the way a
 value in Geometry Nodes only matters once it reaches the output. An
@@ -359,6 +383,7 @@ node, which marks the tree dirty, which re-poses the rig.
 | `tree.py` | `ArmatureNodeTree` data-block, dirty tracking, live update |
 | `nodes.py` | Every node type |
 | `primary_rig.py` | Marker handles and locks, viewport overlay, MediaPipe preset table, marker operators |
+| `handles.py` | The grabbable marker gizmo: hit-testing, move / turn / scale drags, rings and name label |
 | `widgets.py` | `WGTS_rig` widget library and Rigify-style preset generation |
 | `build.py` | Forward compile: evaluate → edit pass → pose pass → pose-transform pass |
 | `decompile.py` | Reverse: the two-node stack that targets a rig |

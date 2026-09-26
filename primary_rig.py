@@ -130,6 +130,15 @@ def side_color(key):
     return {"L": COLOR_LEFT, "R": COLOR_RIGHT}.get(LM_SIDE[key], COLOR_CENTER)
 
 
+def marker_color(node, marker):
+    """The glow colour of one marker: MediaPipe's side colours for the
+    landmarks, the marker's own colour for everything else."""
+    if is_landmark(marker.key):
+        return side_color(marker.key)
+    color = getattr(marker, "color", None)
+    return (*color, 1.0) if color is not None else COLOR_CUSTOM
+
+
 def is_landmark(key):
     """True when ``key`` is one of the 33 MediaPipe landmarks."""
     return key in LM_SIDE
@@ -158,7 +167,10 @@ def marker_collection(create=True):
             return None
         coll = bpy.data.collections.new(MARKER_COLLECTION)
         scene.collection.children.link(coll)
-    elif scene is not None and coll.name not in scene.collection.children_recursive:
+    elif scene is not None and coll not in scene.collection.children_recursive:
+        # Compared as collections, not by name: a name is never "in" a list
+        # of collections, so this used to re-link on every call -- and fail,
+        # which left every handle after the first one uncreated.
         scene.collection.children.link(coll)
     return coll
 
@@ -300,13 +312,6 @@ def remove_marker_empties(node):
 _draw_handle = None
 
 
-def _shader():
-    try:
-        return gpu.shader.from_builtin("UNIFORM_COLOR")
-    except (ValueError, SystemError):
-        return gpu.shader.from_builtin("3D_UNIFORM_COLOR")
-
-
 def _reaches_output(node, seen=None):
     """True when following this node's output links arrives at an Armature
     Output whose marker display is on."""
@@ -343,13 +348,17 @@ def marker_node_visible(node):
     return _reaches_output(node)
 
 
-def _overlay_nodes():
+def displayed_marker_nodes():
     """Every marker-holding node currently displayed.
 
     Both the Skeleton node and the single Marker node draw here -- a Marker
     node that drew nothing was invisible in the viewport, which defeats the
-    point of a marker.
+    point of a marker. The grabbable handles (``handles``) use the same list.
     """
+    return _overlay_nodes()
+
+
+def _overlay_nodes():
     from .core import TREE_IDNAME
 
     for tree in bpy.data.node_groups:
@@ -362,88 +371,99 @@ def _overlay_nodes():
                 yield node
 
 
-# Round, soft-edged points. The builtin UNIFORM_COLOR shader draws points as
-# hard squares, which read as debug gizmos rather than markers; this discards
-# outside the radius and falls the alpha off towards the edge, so a stack of
-# additively blended sizes bloom into a glowing sphere.
-_GLOW_VERT = """
-uniform mat4 ModelViewProjectionMatrix;
-uniform float pointSize;
-in vec3 pos;
-void main()
-{
-    gl_Position = ModelViewProjectionMatrix * vec4(pos, 1.0);
-    gl_PointSize = pointSize;
-}
-"""
+# The glow: a disc facing the camera, fading from the marker's colour at the
+# centre to nothing at the rim, with a solid core and a near-white centre on
+# top so it reads as a light rather than a dot.
+#
+# Built from triangles with per-vertex colour (the SMOOTH_COLOR builtin), not
+# points. It used to be a hand-written GLSL point shader, which Blender 5 no
+# longer builds (``gpu.types.GPUShader`` refuses), and Blender's own point
+# shader draws square points on some GPUs -- a stack of them read as nested
+# squares, not a glow. Triangles are round and soft on every backend.
 
-_GLOW_FRAG = """
-uniform vec4 color;
-out vec4 fragColor;
-void main()
-{
-    vec2 d = gl_PointCoord - vec2(0.5);
-    float r = length(d) * 2.0;
-    if (r > 1.0) {
-        discard;
-    }
-    float falloff = pow(1.0 - r, 1.5);
-    fragColor = vec4(color.rgb, color.a * falloff);
-}
-"""
-
-_glow_shader = None
-_glow_failed = False
+# Radii in pixels at 100% UI scale.
+_GLOW_RADIUS = 22.0
+_CORE_RADIUS = 5.5
+_HOT_RADIUS = 2.4
+_GLOW_ALPHA = 0.55
+_SEGMENTS = 32
+# How much bigger and brighter the handle under the mouse is drawn.
+_HOVER_GROWTH = 1.3
 
 
-def _glow():
-    """The round-point shader, or None when this build will not compile it.
+def _band(pos, col, center, right, up, r0, r1, c0, c1):
+    """Append triangles filling the band between radii r0 and r1, shading
+    from colour c0 on the inside to c1 on the outside (r0 = 0: a disc)."""
+    import math
 
-    Custom GLSL is not guaranteed across Blender's GPU backends, so a failure
-    here is not fatal: the caller falls back to square builtin points rather
-    than losing the whole overlay.
-    """
-    global _glow_shader, _glow_failed
-
-    if _glow_shader is not None or _glow_failed:
-        return _glow_shader
-    try:
-        _glow_shader = gpu.types.GPUShader(_GLOW_VERT, _GLOW_FRAG)
-    except Exception as exc:  # noqa: BLE001
-        _glow_failed = True
-        print(f"[Armature Nodes] Glow shader unavailable, using flat points: {exc}")
-    return _glow_shader
+    for i in range(_SEGMENTS):
+        a0 = 2.0 * math.pi * i / _SEGMENTS
+        a1 = 2.0 * math.pi * (i + 1) / _SEGMENTS
+        d0 = right * math.cos(a0) + up * math.sin(a0)
+        d1 = right * math.cos(a1) + up * math.sin(a1)
+        p00, p01 = center + d0 * r0, center + d1 * r0
+        p10, p11 = center + d0 * r1, center + d1 * r1
+        pos.extend((p00, p10, p11, p00, p11, p01))
+        col.extend((c0, c1, c1, c0, c1, c0))
 
 
-# Halo rings drawn under the core, biggest and faintest first.
-_GLOW_LAYERS = ((26.0, 0.10), (18.0, 0.16), (12.0, 0.30))
-_CORE_SIZE = 7.0
+def _draw_glow_points(coords, color, scale=1.0, bright=False):
+    """One glowing light per position, the same size on screen at any zoom."""
+    from mathutils import Vector
 
+    from .handles import View
 
-def _draw_glow_points(coords, color, scale=1.0):
-    """One glowing sphere per position."""
     if not coords:
         return
-    shader = _glow()
-    if shader is None:  # fallback: flat square points, still colour-coded
-        flat = _shader()
-        gpu.state.point_size_set(_CORE_SIZE * scale * 1.6)
-        flat.uniform_float("color", color)
-        batch_for_shader(flat, "POINTS", {"pos": coords}).draw(flat)
+    context = bpy.context
+    region, rv3d = context.region, context.region_data
+    if region is None or rv3d is None:
         return
-    batch = batch_for_shader(shader, "POINTS", {"pos": coords})
-    shader.bind()
-    gpu.state.blend_set("ADDITIVE")
-    for size, alpha in _GLOW_LAYERS:
-        shader.uniform_float("pointSize", size * scale)
-        shader.uniform_float("color", (color[0], color[1], color[2], alpha))
-        batch.draw(shader)
-    # Opaque core on top, so the marker still reads as a solid point against
-    # a bright background where additive blending washes out.
+    view = View(region, rv3d)
+    right, up = view.right_up()
+    r, g, b = color[0], color[1], color[2]
+    alpha = min(1.0, _GLOW_ALPHA * (1.6 if bright else 1.0))
+    hot = (0.75 + 0.25 * r, 0.75 + 0.25 * g, 0.75 + 0.25 * b, 1.0)
+    solid = (r, g, b, 1.0)
+    pos, col = [], []
+    for co in coords:
+        co = Vector(co)
+        wpp = view.world_per_pixel(co)
+        if wpp is None:
+            continue
+        k = wpp * scale
+        glow, mid = _GLOW_RADIUS * k, _GLOW_RADIUS * k * 0.35
+        # Halo: bright near the core, falling away smoothly to the rim.
+        _band(pos, col, co, right, up, 0.0, mid, (r, g, b, alpha), (r, g, b, alpha * 0.45))
+        _band(pos, col, co, right, up, mid, glow, (r, g, b, alpha * 0.45), (r, g, b, 0.0))
+        # Solid core with a one-pixel soft edge, then the white-hot centre.
+        core = _CORE_RADIUS * k
+        _band(pos, col, co, right, up, 0.0, core, solid, solid)
+        _band(pos, col, co, right, up, core, core + k, solid, (r, g, b, 0.0))
+        _band(pos, col, co, right, up, 0.0, _HOT_RADIUS * k, hot, hot)
+    if not pos:
+        return
+    shader = gpu.shader.from_builtin("SMOOTH_COLOR")
     gpu.state.blend_set("ALPHA")
-    shader.uniform_float("pointSize", _CORE_SIZE * scale)
-    shader.uniform_float("color", (color[0], color[1], color[2], 1.0))
-    batch.draw(shader)
+    batch_for_shader(shader, "TRIS", {"pos": pos, "color": col}).draw(shader)
+
+
+def _ui_scale():
+    try:
+        scale = bpy.context.preferences.system.ui_scale
+    except AttributeError:
+        scale = 1.0
+    return scale or 1.0
+
+
+def _hovered_marker(node):
+    """The marker of ``node`` under the mouse or being dragged, or None."""
+    from .handles import hovered_ident
+
+    ident = hovered_ident()
+    if ident is None or ident[:2] != (node.id_data.name, node.name):
+        return None
+    return node.marker_by_key(ident[2])
 
 
 def _draw_skeleton_overlay():
@@ -452,7 +472,6 @@ def _draw_skeleton_overlay():
     nodes = list(_overlay_nodes())
     if not nodes:
         return
-    flat = _shader()
     gpu.state.blend_set("ALPHA")
     gpu.state.depth_test_set("NONE")
     try:
@@ -471,24 +490,37 @@ def _draw_skeleton_overlay():
                 color = side_color(ka) if LM_SIDE[ka] == LM_SIDE[kb] else COLOR_LINK
                 by_color.setdefault(color, []).extend((pos[ka], pos[kb]))
             if by_color:
-                gpu.state.line_width_set(3.0)
-                flat.bind()
-                for color, coords in by_color.items():
-                    flat.uniform_float("color", color)
-                    batch_for_shader(flat, "LINES", {"pos": coords}).draw(flat)
+                from .handles import draw_lines, line_shader
 
-            # Glowing spheres. Rigid-group members (face, fingers, toes) are
-            # drawn smaller so the joints you actually place stand out.
+                line = line_shader(bpy.context.region)
+                for color, coords in by_color.items():
+                    draw_lines(line, coords, color, 3.0 * _ui_scale())
+
+            # Glowing spheres, sized by the node's Size and the UI scale.
+            # Rigid-group members (face, fingers, toes) are drawn smaller so
+            # the joints you actually place stand out.
+            base = float(getattr(node, "handle_size", 1.0)) * _ui_scale()
             side_colors = {"L": COLOR_LEFT, "R": COLOR_RIGHT, "C": COLOR_CENTER}
             for scale, keys in ((1.0, PRIMARY_KEYS), (0.55, tuple(GROUP_ANCHOR))):
                 for side, color in side_colors.items():
                     coords = [k for k in keys if k in pos and LM_SIDE[k] == side]
-                    _draw_glow_points([pos[k] for k in coords], color, scale)
-            custom = [pos[k] for k in pos if not is_landmark(k)]
-            _draw_glow_points(custom, COLOR_CUSTOM)
+                    _draw_glow_points([pos[k] for k in coords], color, scale * base)
+            # Markers you added: each in its own colour.
+            by_color = {}
+            for marker in node.markers:
+                if marker.key in pos and not is_landmark(marker.key):
+                    color = marker_color(node, marker)
+                    by_color.setdefault(color, []).append(pos[marker.key])
+            for color, coords in by_color.items():
+                _draw_glow_points(coords, color, base)
+            # The handle under the mouse, or being dragged: bigger, brighter.
+            hot = _hovered_marker(node)
+            if hot is not None and hot.key in pos:
+                small = is_landmark(hot.key) and hot.key in GROUP_ANCHOR
+                scale = base * (0.55 if small else 1.0) * _HOVER_GROWTH
+                _draw_glow_points([pos[hot.key]], marker_color(node, hot), scale, bright=True)
     finally:
         gpu.state.line_width_set(1.0)
-        gpu.state.point_size_set(1.0)
         gpu.state.blend_set("NONE")
         gpu.state.depth_test_set("LESS_EQUAL")
 
