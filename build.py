@@ -190,12 +190,16 @@ def _live_nodes(tree):
 
 
 def _follow_live(tree):
-    for node in _live_nodes(tree):
-        if hasattr(node, "follow_live"):
-            try:
-                node.follow_live()
-            except Exception as exc:  # noqa: BLE001
-                print(f"[Armature Nodes] Live link failed on '{node.name}': {exc}")
+    from .nodes import deferred_marker_writes
+
+    # Parents first, together at the end: see deferred_marker_writes.
+    with deferred_marker_writes():
+        for node in _live_nodes(tree):
+            if hasattr(node, "follow_live"):
+                try:
+                    node.follow_live()
+                except Exception as exc:  # noqa: BLE001
+                    print(f"[Armature Nodes] Live link failed on '{node.name}': {exc}")
 
 
 def _note_built(tree):

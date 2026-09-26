@@ -14,8 +14,8 @@ property callbacks call ``mark_dirty``) schedules a deferred rebuild.
 import contextlib
 
 import bpy
-from bpy.types import NodeTree
-from bpy.props import BoolProperty, FloatProperty, StringProperty
+from bpy.types import NodeTree, PropertyGroup
+from bpy.props import BoolProperty, CollectionProperty, FloatProperty, StringProperty
 
 from .core import TREE_IDNAME
 
@@ -171,10 +171,27 @@ def _flush_pending():
     return None
 
 
+class MarkerLink(PropertyGroup):
+    """A line between two Marker nodes -- drawn, nothing more (``marker_links``).
+
+    The nodes are named by their ``uid``, which survives renaming a node.
+    Stored once per pair, in either order.
+    """
+
+    a: StringProperty(name="A", default="")
+    b: StringProperty(name="B", default="")
+
+
 class ArmatureNodeTree(NodeTree):
     bl_idname = TREE_IDNAME
     bl_label = "Armature Nodes"
     bl_icon = "ARMATURE_DATA"
+
+    marker_links: CollectionProperty(
+        type=MarkerLink,
+        name="Marker Links",
+        description="Lines between Marker nodes, drawn in the viewport and in this editor",
+    )
 
     live_update: BoolProperty(
         name="Live Update",
@@ -257,6 +274,7 @@ class ArmatureNodeTree(NodeTree):
 
 
 def register():
+    bpy.utils.register_class(MarkerLink)
     bpy.utils.register_class(ArmatureNodeTree)
 
 
@@ -266,3 +284,4 @@ def unregister():
     _pending.clear()
     _pending_removal.clear()
     bpy.utils.unregister_class(ArmatureNodeTree)
+    bpy.utils.unregister_class(MarkerLink)

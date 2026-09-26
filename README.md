@@ -175,6 +175,53 @@ Each marker node has a **Size** slider for its handles, and a Marker node has
 a **colour** swatch for its glow (MediaPipe landmarks keep their side
 colours).
 
+**Parent and child, like bones.** A Marker node has a **Parent** input. Wire
+another marker's output into it — a Marker node, or a Skeleton landmark — and
+this marker becomes its child:
+
+- Its values become **relative to the parent**, like a child bone's Location
+  and Rotation in the N-panel; the node says *Relative to its parent*.
+- It **moves, turns and scales with the parent**: move the parent and it
+  follows, turn the parent and it swings around it. Drag the child on its own
+  and only the child moves.
+- A **line** is drawn from the parent to the child, in the child's colour.
+  Chain as many as you like: root → middle → tip.
+- Connecting or removing a parent **keeps the marker where it is** (like
+  Ctrl+P / Alt+P with Keep Transform).
+- The nodes a child feeds still get its **world** transform, so a child
+  marker drives its bone to where you see it.
+
+With the markers live on a bone chain, grabbing the parent bone carries the
+child bone — and the child marker comes along exactly once, not also by the
+carry: marker updates in a live pass land together, parents first.
+
+**Lines between markers, as many as you like.** A line joins two Marker
+nodes, and a marker can be joined to any number of others. A line is only a
+line: nothing follows anything (for a marker that moves with another, use
+Parent).
+
+- **In the node editor** each end of a line is a port on the node's border,
+  facing the other node, and it slides round the node as either one moves —
+  the way DaVinci Resolve's Fusion page draws its connections. On a node's
+  sides the ports stay below Blender's own sockets, so they never cover one.
+- **To join two markers**, drag from the small ring at the bottom of a
+  Marker node and drop on another Marker node. While you drag, the wire snaps
+  to the node it would join and outlines it.
+- **Drag a line's end** onto another Marker node to move it there, or onto
+  empty space to remove it. A click leaves it alone. Every drag is one undo
+  step.
+- **In the viewport** the line runs between the two handles, shading from one
+  marker's colour to the other's, whenever both are shown.
+- **Node menu / right-click:** *Join Markers* joins the active Marker node to
+  every other selected one; *Remove Marker Lines* removes the lines among the
+  selected. The sidebar (N › Node) lists a Marker node's lines, each with a
+  remove button.
+- Lines survive renaming. A deleted marker takes its lines with it. Shift+D
+  copies the lines among the markers it copies. Making a group or ungrouping
+  takes a line along when both its markers go; a line to a marker left
+  outside a group is removed, because a line joins two markers in the same
+  tree.
+
 Markers are displayed **through the Armature Output they feed**, the way a
 value in Geometry Nodes only matters once it reaches the output. An
 unconnected Marker node draws nothing; wire it in and it appears. Each node's

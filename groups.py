@@ -313,7 +313,26 @@ def copy_node(src, tree):
         # A marker's record of what it was wired to names nodes of the old
         # tree; the copy starts afresh and adopts its new wires as they are.
         dst.live_links = ""
+    if getattr(dst, "uid", ""):
+        # Its own ID: the lines among the copied markers are copied by
+        # _copy_joins, and two markers never answer to one.
+        from .marker_links import new_uid
+
+        dst.uid = new_uid()
     return dst
+
+
+def _copy_joins(src_tree, dst_tree, originals, copies):
+    """The lines among the Marker nodes copied from ``src_tree``."""
+    from .marker_links import copy_joins
+
+    uid_map = {
+        n.uid: copies[n.name].uid
+        for n in originals
+        if getattr(n, "uid", "") and n.name in copies
+    }
+    if uid_map:
+        copy_joins(src_tree, dst_tree, uid_map)
 
 
 def _where(node):
@@ -413,6 +432,9 @@ def make_group(tree, nodes, name="NodeGroup"):
     with suspend_live_update():
         group = bpy.data.node_groups.new(name, TREE_IDNAME)
         copies = _copy_nodes(nodes, group, Vector((0.0, 0.0)))
+        # Lines go in with both their markers; one to a marker left outside
+        # has nowhere to go and goes with the original.
+        _copy_joins(tree, group, nodes, copies)
         gin = group.nodes.new(GROUP_INPUT)
         gout = group.nodes.new(GROUP_OUTPUT)
         _place(gin, Vector((left - _MARGIN, middle_y)))
@@ -511,6 +533,7 @@ def ungroup(tree, group_node):
 
     with suspend_live_update():
         copies = _copy_nodes(inner, tree, offset)
+        _copy_joins(group, tree, inner, copies)
 
         def sources_of(from_node, from_id):
             """What feeds this inside socket, seen from ``tree``."""

@@ -369,15 +369,20 @@ def sync_bone_nodes():
 
     if is_updating() or lock.is_held():
         return  # mid-build: matrices are half-applied, and it is our own write
+    from .nodes import deferred_marker_writes
+
     changed = False
-    for node in _nodes_to_track():
-        if not hasattr(node, "follow_live"):
-            continue
-        try:
-            if node.follow_live():
-                changed = True
-        except Exception as exc:  # noqa: BLE001
-            print(f"[Armature Nodes] Live link failed on '{node.name}': {exc}")
+    # Marker writes land together at the end, parents first, so a child
+    # marker carried by its parent is not also moved by its own bone's carry.
+    with deferred_marker_writes():
+        for node in _nodes_to_track():
+            if not hasattr(node, "follow_live"):
+                continue
+            try:
+                if node.follow_live():
+                    changed = True
+            except Exception as exc:  # noqa: BLE001
+                print(f"[Armature Nodes] Live link failed on '{node.name}': {exc}")
     if changed:
         for _space, area in _armature_node_spaces():
             area.tag_redraw()

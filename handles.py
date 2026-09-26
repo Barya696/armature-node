@@ -541,6 +541,21 @@ def draw_lines(line, coords, color, width):
     batch_for_shader(shader, "LINES", {"pos": coords}).draw(shader)
 
 
+def draw_smooth_lines(region, coords, colors, width):
+    """LINES through ``coords`` (3D), each end in its own colour, so a line
+    shades from one to the other -- ``width`` pixels wide."""
+    try:
+        shader = gpu.shader.from_builtin("POLYLINE_SMOOTH_COLOR")
+    except (ValueError, SystemError):
+        shader = gpu.shader.from_builtin("SMOOTH_COLOR")
+        gpu.state.line_width_set(width)
+    else:
+        shader.bind()
+        shader.uniform_float("viewportSize", (float(region.width), float(region.height)))
+        shader.uniform_float("lineWidth", width)
+    batch_for_shader(shader, "LINES", {"pos": coords, "color": colors}).draw(shader)
+
+
 class ARMATURE_NODES_GGT_marker_handles(bpy.types.GizmoGroup):
     bl_idname = "ARMATURE_NODES_GGT_marker_handles"
     bl_label = "Marker Handles"

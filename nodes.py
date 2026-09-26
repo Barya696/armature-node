@@ -23,6 +23,7 @@ Every bone-producing node implements eval_bones(ctx) -> list[BoneDef].
 Every constraint node implements eval_constraints(ctx) -> list[ConstraintDef].
 """
 
+import contextlib
 from collections import namedtuple
 
 import bpy
@@ -508,6 +509,49 @@ class SkeletonMarker(bpy.types.PropertyGroup):
             _syncing_markers = was
 
 
+# While a live pass runs (``deferred_marker_writes``): the world values nodes
+# write into markers, waiting to be applied parent-first. None otherwise.
+_deferred = None
+
+
+@contextlib.contextmanager
+def deferred_marker_writes():
+    """Hold marker writes until a live pass is over, then apply them
+    parent-first.
+
+    Why: grab a parent bone and Blender carries its child bone with it. The
+    parent's marker takes the parent bone's move and the child's marker takes
+    the child bone's -- which already contains the carry. If the child's
+    marker is parented to the parent's, applying the two one after the other
+    moves it twice: once through its parent, once itself. So every node
+    reads the markers as they were when the pass began, and the writes land
+    together at the end, each child re-expressed against its parent's new
+    place.
+    """
+    global _deferred
+    if _deferred is not None:
+        yield  # already inside a pass: the outer one applies
+        return
+    _deferred = {}
+    try:
+        yield
+    finally:
+        pending, _deferred = _deferred, None
+        _apply_deferred(pending)
+
+
+def _apply_deferred(pending):
+    moved = []
+    for node, marker, parts in sorted(pending.values(), key=lambda e: e[0].parent_depth()):
+        try:
+            node.apply_world(marker, parts)
+            moved.append(node)
+        except ReferenceError:
+            continue  # the node went away during the pass
+    for node in moved:
+        node.push_markers_to_empties()
+
+
 class MarkerHolderMixin:
     """Shared marker list, viewport handles and sockets.
 
@@ -620,19 +664,58 @@ class MarkerHolderMixin:
     def marker_uses_scale(self, key):
         return False  # only a Marker node wired into a Scale input scales
 
+    # -- World values ------------------------------------------------------
+    #
+    # What the rest of the graph sees of a marker is its WORLD transform. A
+    # marker's own values are world values too -- except on a Marker node
+    # with a parent, where they are relative to the parent, like a bone's
+    # (MarkerNode overrides these).
+
+    def marker_matrix(self, marker, _seen=None):
+        """The marker's world transform, as a matrix."""
+        from mathutils import Euler, Matrix
+
+        return Matrix.LocRotScale(
+            Vector(marker.position), Euler(marker.rotation, "XYZ"), Vector(marker.scale)
+        )
+
+    def marker_value(self, marker, attr):
+        """One part of the marker's world transform: position, rotation or scale."""
+        from mathutils import Euler
+
+        loc, rot, scale = self.marker_matrix(marker).decompose()
+        if attr == "position":
+            return tuple(loc)
+        if attr == "rotation":
+            e = rot.to_euler("XYZ", Euler(marker.rotation, "XYZ"))
+            return (e.x, e.y, e.z)
+        return tuple(scale)
+
+    def apply_world(self, marker, parts):
+        """Give the marker these world values ({attr: value}); the rest of
+        its world transform stays as it is."""
+        for attr, value in parts.items():
+            if not _same_vec(getattr(marker, attr), value):
+                getattr(marker, "set_" + attr)(value)
+
+    def parent_depth(self):
+        """How many parents up the marker's chain goes: parents are updated first."""
+        return 0
+
     def write_marker(self, marker, attr, value):
-        """Set one of a marker's values from code and move its handle.
+        """Set one of a marker's world values from code and move its handle.
 
         This is how a node writes through a wired marker (``_write_input``).
         No rebuild: the value comes from the rig, which is already there.
+        During a live pass the write waits (``deferred_marker_writes``).
         """
-        if _same_vec(getattr(marker, attr), value):
+        if _same_vec(self.marker_value(marker, attr), value):
             return False
-        {
-            "position": marker.set_position,
-            "rotation": marker.set_rotation,
-            "scale": marker.set_scale,
-        }[attr](value)
+        if _deferred is not None:
+            key = (self.id_data.name, self.name, marker.key)
+            _deferred.setdefault(key, [self, marker, {}])[2][attr] = tuple(value)
+            return True
+        self.apply_world(marker, {attr: value})
         self.push_markers_to_empties()
         return True
 
@@ -1078,8 +1161,7 @@ class BoneNode(_LiveLinkMixin, _ModifierNodeBase, Node):
         # handle lands on the bone and you drag from there.
         marker_node, marker = self.linked_marker()
         if marker is not None:
-            marker.set_position(loc)
-            marker_node.push_markers_to_empties()
+            marker_node.write_marker(marker, "position", tuple(loc))
         return True
 
     def live_bone(self):
@@ -1428,23 +1510,218 @@ class MarkerNode(MarkerHolderMixin, ArmatureNodeBase, Node):
         default="",
         options={"HIDDEN"},
     )
+    parent_link: StringProperty(
+        name="Parent Link",
+        description="The output feeding Parent on the last look",
+        default="",
+        options={"HIDDEN"},
+    )
+    uid: StringProperty(
+        name="ID",
+        description="What this node's lines to other markers are attached to",
+        default="",
+        options={"HIDDEN"},
+    )
+    parent_seen: FloatVectorProperty(
+        name="Parent Seen",
+        description="The parent's world transform on the last look",
+        size=16,
+        default=(1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0),
+        options={"HIDDEN"},
+    )
 
     def init(self, context):
+        from .marker_links import new_uid
+
         self.width = 180
         # Tracked from birth, so its first wire is recognised as new. A node
         # from before tracking has "" and adopts whatever it is wired to.
         self.live_links = _LINKS_TAG + "\n"
+        self.uid = new_uid()
+        self.inputs.new(TransformSocket.bl_idname, "Parent")
         self.add_marker(name="Marker")
+
+    def copy(self, node):
+        """Shift+D, paste, or a copy of the whole tree.
+
+        A copy next to its original needs its own ID, or the original's lines
+        would be drawn to it too; the lines among the nodes copied together
+        are copied once they all exist. In a tree of its own it keeps its ID,
+        which is what the lines copied with that tree name.
+        """
+        from .marker_links import new_uid, note_copy
+
+        clash = any(
+            n != self and getattr(n, "uid", "") == self.uid for n in self.id_data.nodes
+        )
+        if self.uid and not clash:
+            return
+        self.uid = new_uid()
+        note_copy(node, self)
 
     @property
     def marker(self):
         return self.markers[0] if len(self.markers) else None
 
+    # -- Parent and child, like bones ------------------------------------------
+    #
+    # Wire one marker's output into another's Parent input and the second
+    # becomes the child: its values are relative to the parent, and it moves,
+    # turns and scales with it, as a child bone does. What the rest of the
+    # graph receives from the child is still its world transform.
+
+    def ensure_parent_socket(self):
+        """A Marker node saved before parenting existed gets its Parent input."""
+        if self.inputs.get("Parent") is None:
+            self.inputs.new(TransformSocket.bl_idname, "Parent")
+
+    def _parent_source(self):
+        """The output socket feeding Parent -- through reroutes and groups -- or None."""
+        from .sockets import value_source
+
+        sock = self.inputs.get("Parent")
+        if sock is None or not sock.is_linked:
+            return None
+        source = value_source(sock)
+        return None if source is None or source == sock else source
+
+    def parent_matrix(self, _seen=None):
+        """The parent's world transform, or None when there is no parent.
+
+        A marker parent brings its whole transform -- itself relative to its
+        own parent, and so on up. Any other value brings a location. A loop
+        of parents is cut where it closes.
+        """
+        from mathutils import Matrix
+
+        from .sockets import source_marker
+
+        source = self._parent_source()
+        if source is None:
+            return None
+        seen = set() if _seen is None else _seen
+        me = (self.id_data.name, self.name)
+        if me in seen:
+            return None
+        seen.add(me)
+        node, marker = source_marker(source)
+        if marker is not None:
+            return node.marker_matrix(marker, seen)
+        value = getattr(source, "default_value", None)
+        if value is not None and len(value) == 3:
+            return Matrix.Translation(Vector(value))
+        return None
+
+    def parent_depth(self):
+        depth, node, seen = 0, self, set()
+        from .sockets import source_marker
+
+        while node is not None and hasattr(node, "_parent_source"):
+            key = (node.id_data.name, node.name)
+            if key in seen:
+                break
+            seen.add(key)
+            source = node._parent_source()
+            if source is None:
+                break
+            depth += 1
+            node = source_marker(source)[0]
+        return depth
+
+    def _local_matrix(self, marker):
+        from mathutils import Euler, Matrix
+
+        return Matrix.LocRotScale(
+            Vector(marker.position), Euler(marker.rotation, "XYZ"), Vector(marker.scale)
+        )
+
+    def marker_matrix(self, marker, _seen=None):
+        """Parent times own, as for a bone. Just its own values without a parent."""
+        local = self._local_matrix(marker)
+        parent = self.parent_matrix(_seen)
+        return local if parent is None else parent @ local
+
+    def apply_world(self, marker, parts):
+        """Give the marker these world values, stored relative to the parent."""
+        from mathutils import Euler, Matrix
+
+        parent = self.parent_matrix()
+        if parent is None:
+            return super().apply_world(marker, parts)
+        loc, rot, scale = self.marker_matrix(marker).decompose()
+        if "position" in parts:
+            loc = Vector(parts["position"])
+        if "rotation" in parts:
+            rot = Euler(parts["rotation"], "XYZ").to_quaternion()
+        if "scale" in parts:
+            scale = Vector(parts["scale"])
+        self._set_local(marker, parent.inverted_safe() @ Matrix.LocRotScale(loc, rot, scale))
+
+    def _set_local(self, marker, matrix):
+        from mathutils import Euler
+
+        loc, rot, scale = matrix.decompose()
+        e = rot.to_euler("XYZ", Euler(marker.rotation, "XYZ"))
+        for attr, value in (("position", tuple(loc)), ("rotation", (e.x, e.y, e.z)), ("scale", tuple(scale))):
+            if not _same_vec(getattr(marker, attr), value):
+                getattr(marker, "set_" + attr)(value)
+
+    def _track_parent(self, _seen=None):
+        """Connecting or removing a parent keeps the marker where it is.
+
+        Its values are re-expressed against the new parent -- the parent's
+        world transform last seen standing in for a parent that is gone --
+        as Blender's Ctrl+P and Alt+P do with Keep Transform. Returns True if
+        they changed.
+
+        The parent is settled first, all the way up: nodes are visited in the
+        order they were made, and a child measured against a parent that has
+        not yet re-expressed itself against *its* new parent would be put in
+        the wrong place.
+        """
+        from mathutils import Matrix
+
+        seen = set() if _seen is None else _seen
+        me = (self.id_data.name, self.name)
+        if me in seen:
+            return False
+        seen.add(me)
+        source = self._parent_source()
+        if source is not None and hasattr(source.node, "_track_parent"):
+            source.node._track_parent(seen)
+        ident = f"{source.node.id_data.name}\t{source.node.name}\t{source.identifier}" if source else ""
+        current = self.parent_matrix()
+        changed = False
+        if ident != self.parent_link:
+            old = None
+            if self.parent_link:
+                flat = list(self.parent_seen)
+                old = Matrix([flat[0:4], flat[4:8], flat[8:12], flat[12:16]])
+            for marker in self.markers:
+                local = self._local_matrix(marker)
+                world = local if old is None else old @ local
+                self._set_local(marker, world if current is None else current.inverted_safe() @ world)
+            self.parent_link = ident
+            changed = True
+        if current is not None:
+            flat = [v for row in current for v in row]
+            if not _same_vec(self.parent_seen, flat):
+                self.parent_seen = flat
+        return changed
+
+    def parent_position(self):
+        """Where the line to this marker starts: its parent's world position."""
+        parent = self.parent_matrix()
+        return None if parent is None else parent.to_translation()
+
     def free(self):
+        from .marker_links import forget
+
         # Deleted while wired: the inputs it fed take its values, as they do
         # when it is unplugged, so the bones stay where they are.
         _bone, pairs = _parse_links(self.live_links)
         self._hand_back(pairs, linked_too=True)
+        forget(self)  # and its lines to other markers go with it
         super().free()
 
     # -- What the wires add up to ----------------------------------------------
@@ -1545,11 +1822,17 @@ class MarkerNode(MarkerHolderMixin, ArmatureNodeBase, Node):
         if self.marker is None:
             return False
         self.sync_marker_sockets()  # an older node's Vector output becomes a Transform
+        self.ensure_parent_socket()  # and an older node gets its Parent input
+        if not self.uid:  # and an ID for its lines to other markers
+            from .marker_links import new_uid
+
+            self.uid = new_uid()
+        reparented = self._track_parent()  # before anything reads the values
         self.sync_from_empties()  # a drag not read back yet goes first
         state = self.link_state()
         if state.frozen:
-            return False  # pose matrices are stale in Edit mode
-        changed = self._track_links(state)
+            return reparented  # pose matrices are stale in Edit mode
+        changed = self._track_links(state) or reparented
         if state.pbone is not None:
             changed |= self._read_idle(state)
         self._place_handle(state)
@@ -1630,7 +1913,8 @@ class MarkerNode(MarkerHolderMixin, ArmatureNodeBase, Node):
             if handled is not None:
                 changed |= handled
                 continue
-            value = getattr(marker, marker_attrs(sock)[0])
+            # What the input received: the marker's world value.
+            value = self.marker_value(marker, marker_attrs(sock)[0])
             changed |= _write_socket_value(consumer, socket_name, value, linked_too)
         return changed
 
@@ -1645,9 +1929,7 @@ class MarkerNode(MarkerHolderMixin, ArmatureNodeBase, Node):
             if state.modes[attr] != "idle":
                 continue
             value = _bone_part(state.obj, world, attr, Euler(marker.rotation, "XYZ"))
-            if not _same_vec(getattr(marker, attr), value):
-                getattr(marker, "set_" + attr)(value)
-                changed = True
+            changed |= self.write_marker(marker, attr, value)
         return changed
 
     # -- The handle ------------------------------------------------------------
@@ -1673,11 +1955,8 @@ class MarkerNode(MarkerHolderMixin, ArmatureNodeBase, Node):
         sit near the world origin; instead it goes where the offset puts the
         bone -- rest carried by the value -- and a drag maps back the same way.
         """
-        from mathutils import Euler
-
-        marker = self.marker
-        loc = Vector(marker.position)
-        rot = Euler(marker.rotation, "XYZ").to_quaternion()
+        # The marker's world transform: through its parent, if it has one.
+        loc, rot, scale = self.marker_matrix(self.marker).decompose()
         frame = self._frame(state, "position")
         if frame is not None:
             matrix, local = frame
@@ -1687,7 +1966,7 @@ class MarkerNode(MarkerHolderMixin, ArmatureNodeBase, Node):
             matrix, local = frame
             base = matrix.decompose()[1]
             rot = base @ rot if local else rot @ base
-        return loc, rot, Vector(marker.scale)
+        return loc, rot, scale
 
     def _values_from_handle(self, state, loc, rot):
         """``_handle_target`` backwards: the values a handle pose stands for."""
@@ -1750,22 +2029,23 @@ class MarkerNode(MarkerHolderMixin, ArmatureNodeBase, Node):
         loc, rot = self._values_from_handle(
             state, Vector(handle.location), handle.rotation_euler.to_quaternion()
         )
-        changed = False
-        if move and not _same_vec(marker.position, loc):
-            marker.set_position(loc)
-            changed = True
+        # The handle is in the world; a child marker keeps its values
+        # relative to its parent, so they go in through apply_world.
+        parts = {}
+        if move and not _same_vec(self.marker_value(marker, "position"), loc):
+            parts["position"] = tuple(loc)
         if turn:
-            e = rot.to_euler("XYZ", Euler(marker.rotation, "XYZ"))
-            if not _same_vec(marker.rotation, (e.x, e.y, e.z)):
-                marker.set_rotation((e.x, e.y, e.z))
-                changed = True
-        if grow and not _same_vec(marker.scale, handle.scale):
-            marker.set_scale(tuple(handle.scale))
-            changed = True
+            e = rot.to_euler("XYZ", Euler(self.marker_value(marker, "rotation"), "XYZ"))
+            if not _same_vec(self.marker_value(marker, "rotation"), (e.x, e.y, e.z)):
+                parts["rotation"] = (e.x, e.y, e.z)
+        if grow and not _same_vec(self.marker_value(marker, "scale"), handle.scale):
+            parts["scale"] = tuple(handle.scale)
+        if parts:
+            self.apply_world(marker, parts)
         _remember_handle(handle)
-        if changed:
+        if parts:
             self.schedule_rebuild()
-        return changed
+        return bool(parts)
 
     # -- UI -------------------------------------------------------------------
 
@@ -1814,11 +2094,31 @@ class MarkerNode(MarkerHolderMixin, ArmatureNodeBase, Node):
             sub.enabled = editable
             sub.prop(marker, attr, text="")
 
+        if self._parent_source() is not None:
+            # Like a child bone's Location / Rotation in the N-panel.
+            layout.label(text="Relative to its parent", icon="CON_CHILDOF")
         if state.wired:
             if live:
                 layout.label(text=f"Live: {state.pbone.name}", icon="LINKED")
             else:
                 layout.label(text="Live link needs one bone", icon="UNLINKED")
+
+    def draw_buttons_ext(self, context, layout):
+        """The sidebar: what the node shows, and its lines to other markers."""
+        from .marker_links import partners
+
+        self.draw_buttons(context, layout)
+        others = partners(self)
+        box = layout.box()
+        box.label(text=f"Lines ({len(others)})", icon="IPO_LINEAR")
+        if not others:
+            box.label(text="Drag from the ring under the node")
+        for other in others:
+            row = box.row(align=True)
+            name = other.marker.name if other.marker is not None else ""
+            row.label(text=name or other.label or other.name, icon="EMPTY_AXIS")
+            op = row.operator("armature_nodes.marker_unjoin", text="", icon="X")
+            op.a, op.b = self.uid, other.uid
 
 
 class SkeletonNode(MarkerHolderMixin, ArmatureNodeBase, Node):
@@ -2824,7 +3124,9 @@ class TransformNode(_TransformNodeBase, Node):
         if flag is None:
             return None
         _set_without_seeding(self, flag, True)
-        value = getattr(marker, marker_attrs(self.inputs[socket_name])[0])
+        attr = marker_attrs(self.inputs[socket_name])[0]
+        owner = _marker_owner(marker)
+        value = owner.marker_value(marker, attr) if owner is not None else getattr(marker, attr)
         return _write_socket_value(self, socket_name, value, linked_too)
 
     # -- Live link -------------------------------------------------------------
@@ -3333,6 +3635,9 @@ _NO_REBUILD_PROPS = {
     "lock_depth",
     "symmetric",
     "live_links",  # bookkeeping for the marker's live link
+    "parent_link",  # bookkeeping for a marker's parent
+    "parent_seen",
+    "uid",  # what a marker's lines to other markers attach to
     "layout_version",  # the Transform node's one-time migration
 }
 

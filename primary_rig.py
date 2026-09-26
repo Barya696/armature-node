@@ -478,6 +478,61 @@ def _hovered_marker(node):
     return node.marker_by_key(ident[2])
 
 
+def marker_lines(nodes):
+    """[(colour, [p0, p1, ...])] -- the lines between markers, in pairs.
+
+    Two kinds: the MediaPipe skeleton between a Skeleton node's landmarks,
+    coloured by side (grey where it crosses the middle), and one from every
+    child marker to its parent, in the child's colour -- a Marker node with
+    another marker wired into its Parent input.
+    """
+    out = {}
+    for node in nodes:
+        pos = {m.key: tuple(node.marker_value(m, "position")) for m in node.markers if m.key}
+        # Only between two landmarks that are both present: the MediaPipe set
+        # is a preset, so a graph may hold part of it, or none of it.
+        for a, b in POSE_CONNECTIONS:
+            ka, kb = LM_BY_INDEX[a], LM_BY_INDEX[b]
+            if ka not in pos or kb not in pos:
+                continue
+            color = side_color(ka) if LM_SIDE[ka] == LM_SIDE[kb] else COLOR_LINK
+            out.setdefault(color, []).extend((pos[ka], pos[kb]))
+        start = node.parent_position() if hasattr(node, "parent_position") else None
+        if start is not None:
+            for marker in node.markers:
+                if marker.key in pos:
+                    color = marker_color(node, marker)
+                    out.setdefault(color, []).extend((tuple(start), pos[marker.key]))
+    return list(out.items())
+
+
+def join_segments(nodes):
+    """[(p0, p1, colour at p0, colour at p1)] -- a line between every two
+    joined Marker nodes that are both on screen (see ``marker_links``),
+    shading from one marker's colour to the other's."""
+    from .marker_links import links_of
+
+    shown = {(n.id_data.name, n.name) for n in nodes}
+    trees = {n.id_data.name: n.id_data for n in nodes}
+    out = []
+    for tree in trees.values():
+        for a, b in links_of(tree):
+            if (tree.name, a.name) not in shown or (tree.name, b.name) not in shown:
+                continue
+            ma, mb = a.marker, b.marker
+            if ma is None or mb is None:
+                continue
+            out.append(
+                (
+                    tuple(a.marker_value(ma, "position")),
+                    tuple(b.marker_value(mb, "position")),
+                    marker_color(a, ma),
+                    marker_color(b, mb),
+                )
+            )
+    return out
+
+
 def _draw_skeleton_overlay():
     if gpu is None or batch_for_shader is None:
         return
@@ -487,27 +542,29 @@ def _draw_skeleton_overlay():
     gpu.state.blend_set("ALPHA")
     gpu.state.depth_test_set("NONE")
     try:
+        # Every line first, then every glow: a line never covers a marker,
+        # whichever node it belongs to.
+        lines = marker_lines(nodes)
+        if lines:
+            from .handles import draw_lines, line_shader
+
+            line = line_shader(bpy.context.region)
+            for color, coords in lines:
+                draw_lines(line, coords, color, 3.0 * _ui_scale())
+        joins = join_segments(nodes)
+        if joins:
+            from .handles import draw_smooth_lines
+
+            coords, colors = [], []
+            for p0, p1, c0, c1 in joins:
+                coords += [p0, p1]
+                colors += [c0, c1]
+            draw_smooth_lines(bpy.context.region, coords, colors, 3.0 * _ui_scale())
+
         for node in nodes:
-            pos = {m.key: tuple(m.position) for m in node.markers if m.key}
+            pos = {m.key: tuple(node.marker_value(m, "position")) for m in node.markers if m.key}
             if not pos:
                 continue
-            # Skeleton bones, coloured by side (mixed = grey). Only drawn
-            # between two landmarks that are both present: the MediaPipe set
-            # is a preset, so a graph may hold part of it, or none of it.
-            by_color = {}
-            for a, b in POSE_CONNECTIONS:
-                ka, kb = LM_BY_INDEX[a], LM_BY_INDEX[b]
-                if ka not in pos or kb not in pos:
-                    continue
-                color = side_color(ka) if LM_SIDE[ka] == LM_SIDE[kb] else COLOR_LINK
-                by_color.setdefault(color, []).extend((pos[ka], pos[kb]))
-            if by_color:
-                from .handles import draw_lines, line_shader
-
-                line = line_shader(bpy.context.region)
-                for color, coords in by_color.items():
-                    draw_lines(line, coords, color, 3.0 * _ui_scale())
-
             # Glowing spheres, sized by the node's Size and the UI scale.
             # Rigid-group members (face, fingers, toes) are drawn smaller so
             # the joints you actually place stand out.

@@ -150,9 +150,11 @@ class _ValueSocketMixin:
         groups -- otherwise the typed default."""
         source = value_source(self)
         if source is not None and source is not self:
-            _node, marker = source_marker(source)
+            node, marker = source_marker(source)
             if marker is not None:
-                return tuple(getattr(marker, self._marker_attr))
+                # Its world value: a child marker's own values are relative
+                # to its parent marker.
+                return tuple(node.marker_value(marker, self._marker_attr))
             v = getattr(source, "default_value", None)
             if v is not None:
                 try:
@@ -268,9 +270,9 @@ class TransformSocket(_SocketDrawMixin, NodeSocket):
             turns = node.marker_uses_rotation(marker.key)
             scales = node.marker_uses_scale(marker.key)
             return (
-                tuple(marker.position),
-                tuple(marker.rotation) if turns else None,
-                tuple(marker.scale) if scales else None,
+                tuple(node.marker_value(marker, "position")),
+                tuple(node.marker_value(marker, "rotation")) if turns else None,
+                tuple(node.marker_value(marker, "scale")) if scales else None,
             )
         parts = dict.fromkeys(("position", "rotation", "scale"))
         value = getattr(source, "default_value", None)
