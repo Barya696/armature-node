@@ -267,3 +267,98 @@ def test_handle_size_and_colour_are_the_nodes():
     [h] = [h for h in visible_handles() if h.key == marker.key]
     assert h.size == 2.0
     live._assert_close(h.color[:3], (0.1, 0.9, 0.3), "colour")
+
+
+# --- sized in the scene, like the character ------------------------------------------
+
+
+class ZoomView(FrontView):
+    """The front view at ``ppm`` pixels per metre: zoomed in, or out."""
+
+    def __init__(self, ppm):
+        self.ppm = ppm
+
+    def to_screen(self, co):
+        return Vector((500.0 + self.ppm * co[0], 300.0 + self.ppm * co[2]))
+
+    def on_plane(self, xy, depth):
+        return Vector(((xy[0] - 500.0) / self.ppm, depth[1], (xy[1] - 300.0) / self.ppm))
+
+    def world_per_pixel(self, co):
+        return 1.0 / self.ppm
+
+
+def test_a_handle_grows_as_you_zoom_in():
+    from armature_nodes.handles import screen_scale
+
+    near = screen_scale(ZoomView(4000.0), (0.0, 0.0, 1.0), 1.0, 1.8)
+    far = screen_scale(ZoomView(1000.0), (0.0, 0.0, 1.0), 1.0, 1.8)
+    assert abs(near / far - 4.0) < 1e-6, (near, far)
+
+
+def test_a_full_body_view_shows_a_handle_at_its_sizes():
+    """Framed so the figure is FIGURE_PIXELS tall, one size pixel is one pixel,
+    and the node's Size still multiplies it."""
+    from armature_nodes.handles import FIGURE_PIXELS, screen_scale
+
+    view = ZoomView(FIGURE_PIXELS / 1.8)
+    assert abs(screen_scale(view, (0.0, 0.0, 1.0), 1.0, 1.8) - 1.0) < 1e-6
+    assert abs(screen_scale(view, (0.0, 0.0, 1.0), 2.0, 1.8) - 2.0) < 1e-6
+
+
+def test_a_handle_is_a_share_of_its_figure():
+    from armature_nodes.handles import screen_scale
+
+    view = ZoomView(2000.0)
+    small = screen_scale(view, (0.0, 0.0, 1.0), 1.0, 0.9)
+    tall = screen_scale(view, (0.0, 0.0, 1.0), 1.0, 1.8)
+    assert abs(tall / small - 2.0) < 1e-6, (small, tall)
+
+
+def test_zoomed_far_out_a_handle_can_still_be_grabbed():
+    from armature_nodes.handles import SMALLEST, screen_scale, ui_scale
+
+    tiny = screen_scale(ZoomView(1.0), (0.0, 0.0, 1.0), 1.0, 1.8)
+    assert abs(tiny - SMALLEST * ui_scale()) < 1e-6, tiny
+
+
+def test_what_you_can_grab_follows_the_zoom():
+    """The same press, 30 pixels from the handle: on it zoomed in, off it
+    zoomed out -- the gizmo's hit test uses the size it is drawn at. And
+    that size is the figure's: this rig is 3.8 m tall, so 20 pixels out is
+    still on it where a 1.8 m figure's handle would have ended."""
+    import types
+
+    from armature_nodes import handles
+
+    _obj, _tree, _node, _mn, _marker, handle = _marker_on("ArmatureNodesPositionNode")
+    gizmo = handles.ARMATURE_NODES_GT_marker_handles
+    context = types.SimpleNamespace(region=object(), region_data=object())
+    real = handles.View
+    try:
+        found = {}
+        for ppm, gap in ((4000.0, 30.0), (400.0, 30.0), (400.0, 20.0)):
+            handles.View = lambda region, rv3d, ppm=ppm: ZoomView(ppm)
+            press = ZoomView(ppm).to_screen(handle.location) + Vector((gap, 0.0))
+            found[ppm, gap] = gizmo.test_select(types.SimpleNamespace(hit=None), context, press)
+    finally:
+        handles.View = real
+        handles._set_hovered(None)
+    assert found[4000.0, 30.0] == handles.MOVE, "zoomed in, the handle is under the press"
+    assert found[400.0, 30.0] == -1, "zoomed out, the handle is smaller than 30 pixels"
+    assert found[400.0, 20.0] == handles.MOVE, "sized to its 3.8 m rig, it reaches 20 pixels"
+
+
+def test_a_marker_is_sized_to_its_rig_at_rest():
+    from armature_nodes import primary_rig
+
+    obj, _tree, _node, marker_node, _marker, _handle = _marker_on("ArmatureNodesPositionNode")
+    primary_rig._rig_sizes.clear()
+    # The fixture's four bones stand one above the other, from z = 0 to 3.8.
+    assert abs(primary_rig.rig_size(obj) - 3.8) < 1e-4, primary_rig.rig_size(obj)
+    assert abs(marker_node.effective_height() - 3.8) < 1e-4
+    # Posing moves no handle size: it is the rig at rest.
+    obj.pose.bones["bone.003"].location = (0.0, 2.0, 0.0)
+    bpy.context.view_layer.update()
+    primary_rig._rig_sizes.clear()
+    assert abs(primary_rig.rig_size(obj) - 3.8) < 1e-4

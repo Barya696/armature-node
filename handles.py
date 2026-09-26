@@ -7,8 +7,13 @@ posing a bone and placing its marker are the same job.
 
 So the glow you see is now the handle: a gizmo, like the ones on a light or
 a camera. A gizmo belongs to the viewport, not the scene, so it works in
-Object, Pose and Edit mode alike, stays the same size on screen however far
-you zoom, and lights up under the mouse with the marker's name beside it.
+Object, Pose and Edit mode alike, and lights up under the mouse with the
+marker's name beside it.
+
+It is sized in the scene, though, like the character it sits on: zoom in
+and it grows, zoom out and it shrinks (see ``screen_scale``). A gizmo's
+usual fixed size on screen made the handles a blob over a zoomed-out figure
+and specks on a zoomed-in hand.
 
 * **Drag the glow** to move the marker. **Ctrl** drops it onto the surface
   under the cursor, **Shift** moves it finely, **X / Y / Z** lock the move to
@@ -44,11 +49,17 @@ except ImportError:  # outside Blender (unit tests)
 MOVE, ROTATE, SCALE = 0, 1, 2
 _MODE_NAMES = ("Move", "Rotate", "Scale")
 
-# Sizes on screen, in pixels at 100% UI scale, before the node's Size.
+# Sizes in pixels, before the node's Size -- the pixels of a full-body view,
+# where the figure is FIGURE_PIXELS tall on screen. Zoomed in or out, the
+# handle scales with the figure (``screen_scale``).
 CORE_RADIUS = 10.0  # the glow you grab
 RING_RADIUS = 22.0  # the rotation ring
 KNOB_HALF = 5.0  # half the scale square
 SLACK = 4.0  # how far outside a shape still counts as on it
+FIGURE_PIXELS = 700.0
+# Zoomed far out, a handle stops shrinking at this share of those sizes on
+# screen, so it can still be seen and grabbed.
+SMALLEST = 0.4
 
 _AXES = {"X": Vector((1.0, 0.0, 0.0)), "Y": Vector((0.0, 1.0, 0.0)), "Z": Vector((0.0, 0.0, 1.0))}
 
@@ -62,6 +73,20 @@ def ui_scale():
     return scale or 1.0  # 0 without a window (background mode)
 
 
+def screen_scale(view, co, size, height):
+    """Screen pixels per pixel of the sizes above, for a handle at ``co``.
+
+    ``size`` is the node's Size and ``height`` the figure's: a handle is a
+    size in the scene, a fixed share of its figure, so it grows as you zoom
+    in and shrinks as you zoom out -- down to ``SMALLEST``. None when ``co``
+    is behind the view.
+    """
+    wpp = view.world_per_pixel(co)
+    if not wpp:
+        return None
+    return max(size * height / (FIGURE_PIXELS * wpp), SMALLEST * size * ui_scale())
+
+
 # ---------------------------------------------------------------------------
 # What there is to grab
 # ---------------------------------------------------------------------------
@@ -70,15 +95,21 @@ def ui_scale():
 class Handle:
     """One grabbable marker, as the viewport sees it."""
 
-    __slots__ = ("tree", "node", "key", "label", "obj", "color", "size", "move", "turn", "grow")
+    __slots__ = (
+        "tree", "node", "key", "label", "obj", "color", "size", "height", "move", "turn", "grow",
+    )
 
-    def __init__(self, tree, node, key, label, obj, color, size, move, turn, grow):
+    def __init__(self, tree, node, key, label, obj, color, size, move, turn, grow, height=1.8):
         self.tree, self.node, self.key, self.label = tree, node, key, label
-        self.obj, self.color, self.size = obj, color, size
+        self.obj, self.color, self.size, self.height = obj, color, size, height
         self.move, self.turn, self.grow = move, turn, grow
 
     def ident(self):
         return (self.tree, self.node, self.key)
+
+    def scale(self, view):
+        """Screen pixels per size pixel, here and now; None when behind the view."""
+        return screen_scale(view, self.obj.location, self.size, self.height)
 
     def core_mode(self):
         """What dragging the glow does: move, or failing that turn or scale."""
@@ -100,6 +131,7 @@ def visible_handles():
     for node in displayed_marker_nodes():
         empties = find_marker_empties(node)
         size = float(getattr(node, "handle_size", 1.0))
+        height = node.effective_height()
         for marker in node.markers:
             obj = empties.get(marker.key)
             if obj is None:
@@ -121,6 +153,7 @@ def visible_handles():
                     move,
                     turn,
                     grow,
+                    height,
                 )
             )
     return out
@@ -394,11 +427,10 @@ class ARMATURE_NODES_GT_marker_handles(bpy.types.Gizmo):
             _set_hovered(None)
             return -1
         view = View(region, rv3d)
-        scale = ui_scale()
-        points = [
-            (view.to_screen(h.obj.location), h.size * scale, h.core_mode(), h.turn, h.grow)
-            for h in handles
-        ]
+        points = []
+        for h in handles:
+            xy, s = view.to_screen(h.obj.location), h.scale(view)
+            points.append((xy if s else None, s or 0.0, h.core_mode(), h.turn, h.grow))
         found = pick(points, location)
         if found is None:
             self.hit = None
@@ -470,10 +502,9 @@ def _draw_rings(context, hit):
     try:
         for handle in visible_handles():
             co = Vector(handle.obj.location)
-            wpp = view.world_per_pixel(co)
-            if wpp is None:
+            wpp, s = view.world_per_pixel(co), handle.scale(view)
+            if not wpp or not s:
                 continue
-            s = handle.size * scale
             hot = handle.ident() == hot_ident
             r, g, b, _a = handle.color
             shapes = []
@@ -599,14 +630,15 @@ def _draw_label():
     handle = next((h for h in visible_handles() if h.ident() == ident), None)
     if handle is None:
         return
-    xy = View(region, rv3d).to_screen(handle.obj.location)
-    if xy is None:
+    view = View(region, rv3d)
+    xy, s = view.to_screen(handle.obj.location), handle.scale(view)
+    if xy is None or not s:
         return
     scale = ui_scale()
     text = handle.label
     if _active and _active[0] == ident:
         text = f"{text}  ·  {_active[2].describe()}"
-    offset = (RING_RADIUS * handle.size + 8.0) * scale
+    offset = RING_RADIUS * s + 8.0 * scale  # beside the ring, however big it is now
     font = 0
     blf.size(font, 13.0 * scale)
     blf.position(font, xy.x + offset, xy.y + offset * 0.4, 0.0)

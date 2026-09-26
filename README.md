@@ -162,8 +162,15 @@ handle beats typing coordinates, which is the only reason markers exist.
 **Grab the glow — in any mode, Pose mode included.** The glow is a viewport
 gizmo, like the ones on a light or a camera, so it does not need the empty to
 be clickable (Blender will not let you click another object while the
-armature is in Pose mode). It stays the same size on screen at any zoom, and
-lights up with the marker's name beside it when the mouse is over it.
+armature is in Pose mode). It lights up with the marker's name beside it
+when the mouse is over it.
+
+**Handles are sized in the scene, like the character they sit on**: zoom in
+and they grow, zoom out and they shrink — so a zoomed-out figure is not
+buried under glows, and a zoomed-in hand gets handles you can tell apart. A
+handle is a fixed share of its figure (the Skeleton's landmarks, or a Marker
+node's rig at rest), times the node's **Size**. Zoomed far out it stops
+shrinking at a size you can still see and grab.
 
 - **Drag the glow** to move the marker. **Ctrl** drops it onto the surface
   under the cursor, **Shift** moves it finely, **X / Y / Z** lock the move to

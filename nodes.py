@@ -1563,6 +1563,15 @@ class MarkerNode(MarkerHolderMixin, ArmatureNodeBase, Node):
     def marker(self):
         return self.markers[0] if len(self.markers) else None
 
+    def effective_height(self):
+        """How big the figure is, for sizing the handle. One marker has no
+        spread of its own to measure, so its rig's size, at rest."""
+        from .primary_rig import DEFAULT_HEIGHT, rig_size
+
+        obj = self.rig_for_ui()
+        size = rig_size(obj) if obj is not None else 0.0
+        return size if size > 1e-3 else DEFAULT_HEIGHT
+
     # -- Parent and child, like bones ------------------------------------------
     #
     # Wire one marker's output into another's Parent input and the second

@@ -35,6 +35,35 @@ MARKER_COLLECTION = "MRKS_rig"
 MARKER_NODE_IDNAMES = ("ArmatureNodesSkeletonNode", "ArmatureNodesMarkerNode")
 DEFAULT_HEIGHT = 1.8
 
+# (object, armature, bone count) -> (when it was measured, its size)
+_rig_sizes = {}
+
+
+def rig_size(obj):
+    """How big a rig is at rest: its largest extent in the scene.
+
+    Handles are sized to their figure, and this is asked on every redraw --
+    a Rigify rig has hundreds of bones -- so it is measured at most once a
+    second. At rest, so posing an arm up does not grow every handle.
+    """
+    import time
+
+    if obj.type != "ARMATURE":
+        return 0.0
+    bones = obj.data.bones
+    key = (obj.name, obj.data.name, len(bones))
+    now = time.monotonic()
+    cached = _rig_sizes.get(key)
+    if cached is not None and now - cached[0] < 1.0:
+        return cached[1]
+    size = 0.0
+    if len(bones):
+        mw = obj.matrix_world
+        points = [mw @ b.head_local for b in bones] + [mw @ b.tail_local for b in bones]
+        size = max(max(p[i] for p in points) - min(p[i] for p in points) for i in range(3))
+    _rig_sizes[key] = (now, size)
+    return size
+
 # ---------------------------------------------------------------------------
 # MediaPipe Pose topology
 # ---------------------------------------------------------------------------
@@ -393,7 +422,8 @@ def _overlay_nodes():
 # shader draws square points on some GPUs -- a stack of them read as nested
 # squares, not a glow. Triangles are round and soft on every backend.
 
-# Radii in pixels at 100% UI scale.
+# Radii in the pixels of a full-body view, like the handles' own sizes: the
+# glow is a size in the scene and scales with the zoom (handles.screen_scale).
 _GLOW_RADIUS = 22.0
 _CORE_RADIUS = 5.5
 _HOT_RADIUS = 2.4
@@ -419,11 +449,12 @@ def _band(pos, col, center, right, up, r0, r1, c0, c1):
         col.extend((c0, c1, c1, c0, c1, c0))
 
 
-def _draw_glow_points(coords, color, scale=1.0, bright=False):
-    """One glowing light per position, the same size on screen at any zoom."""
+def _draw_glow_points(coords, color, size=1.0, height=DEFAULT_HEIGHT, bright=False):
+    """One glowing light per position: ``size`` (the node's Size) on a figure
+    ``height`` tall, bigger as you zoom in and smaller as you zoom out."""
     from mathutils import Vector
 
-    from .handles import View
+    from .handles import View, screen_scale
 
     if not coords:
         return
@@ -440,10 +471,10 @@ def _draw_glow_points(coords, color, scale=1.0, bright=False):
     pos, col = [], []
     for co in coords:
         co = Vector(co)
-        wpp = view.world_per_pixel(co)
-        if wpp is None:
+        wpp, s = view.world_per_pixel(co), screen_scale(view, co, size, height)
+        if not wpp or not s:
             continue
-        k = wpp * scale
+        k = wpp * s  # the world length of one pixel of the radii above
         glow, mid = _GLOW_RADIUS * k, _GLOW_RADIUS * k * 0.35
         # Halo: bright near the core, falling away smoothly to the rim.
         _band(pos, col, co, right, up, 0.0, mid, (r, g, b, alpha), (r, g, b, alpha * 0.45))
@@ -565,15 +596,16 @@ def _draw_skeleton_overlay():
             pos = {m.key: tuple(node.marker_value(m, "position")) for m in node.markers if m.key}
             if not pos:
                 continue
-            # Glowing spheres, sized by the node's Size and the UI scale.
+            # Glowing spheres, sized by the node's Size and its figure.
             # Rigid-group members (face, fingers, toes) are drawn smaller so
             # the joints you actually place stand out.
-            base = float(getattr(node, "handle_size", 1.0)) * _ui_scale()
+            base = float(getattr(node, "handle_size", 1.0))
+            height = node.effective_height()
             side_colors = {"L": COLOR_LEFT, "R": COLOR_RIGHT, "C": COLOR_CENTER}
             for scale, keys in ((1.0, PRIMARY_KEYS), (0.55, tuple(GROUP_ANCHOR))):
                 for side, color in side_colors.items():
                     coords = [k for k in keys if k in pos and LM_SIDE[k] == side]
-                    _draw_glow_points([pos[k] for k in coords], color, scale * base)
+                    _draw_glow_points([pos[k] for k in coords], color, scale * base, height)
             # Markers you added: each in its own colour.
             by_color = {}
             for marker in node.markers:
@@ -581,13 +613,15 @@ def _draw_skeleton_overlay():
                     color = marker_color(node, marker)
                     by_color.setdefault(color, []).append(pos[marker.key])
             for color, coords in by_color.items():
-                _draw_glow_points(coords, color, base)
+                _draw_glow_points(coords, color, base, height)
             # The handle under the mouse, or being dragged: bigger, brighter.
             hot = _hovered_marker(node)
             if hot is not None and hot.key in pos:
                 small = is_landmark(hot.key) and hot.key in GROUP_ANCHOR
                 scale = base * (0.55 if small else 1.0) * _HOVER_GROWTH
-                _draw_glow_points([pos[hot.key]], marker_color(node, hot), scale, bright=True)
+                _draw_glow_points(
+                    [pos[hot.key]], marker_color(node, hot), scale, height, bright=True
+                )
     finally:
         gpu.state.line_width_set(1.0)
         gpu.state.blend_set("NONE")
