@@ -202,29 +202,68 @@ class EvalContext:
     Keyed by where a node sits -- which group node, in which tree -- as well
     as by the node: a group's nodes run once for every group node using it,
     and two trees are free to use the same node names.
+
+    **Several rigs into one input** (the Output's) are chained, in the order
+    the wires come in: each branch runs again on top of what the wires before
+    it made, from the point where it split off from them. So two Transform
+    nodes side by side end up exactly as if one were plugged into the other,
+    and a node the branches share still runs once. Each branch is a copy of
+    the whole rig, so putting them side by side instead -- which is what this
+    used to do -- kept one copy of every bone and threw the rest away, and
+    with them every other branch's changes.
+
+    That needs to know where each rig came from: every rig value is named by
+    the node output it came out of (``_key``), and ``_made_from`` records the
+    rigs each one was made from.
     """
 
     def __init__(self):
         self._bone_cache = {}
         self._constraint_cache = {}
         self._visiting = set()
+        self._made_from = {}  # key of a rig -> keys of the rigs it was made from
+        self._making = []  # keys of the rigs being made, innermost last
+        self._order = {}  # key of a rig -> when it was first finished
+        # A branch run again on top of other branches is a replay: a scope
+        # of its own, where the rig it split off from is stood in for.
+        self._scope = ()
+        self._stand_ins = {}  # scope -> (key, rig standing in for it)
+        self._replays = 0
+        self._reads = 0
 
     def _key(self, node, identifier=""):
         return (_frame_key(), node.id_data.name, node.name, identifier)
 
-    def bones_from_node(self, node):
-        key = self._key(node)
-        if key in self._visiting:
-            raise RuntimeError(f"Cycle detected at node '{node.name}'")
-        if key in self._bone_cache:
-            return self._bone_cache[key]
-        self._visiting.add(key)
+    def _rig(self, key, make):
+        """The rig ``key`` names: made once per scope, where it came from noted."""
+        if self._making:
+            self._made_from.setdefault(self._making[-1], set()).add(key)
+        scope = self._scope
+        for depth in range(len(scope), 0, -1):  # a replay inside a replay: both apply
+            stand_in = self._stand_ins.get(scope[:depth])
+            if stand_in is not None and stand_in[0] == key:
+                return stand_in[1]
+        cache_key = (scope, key)
+        if cache_key in self._visiting:
+            raise RuntimeError(f"Cycle detected at node '{key[2]}'")
+        if cache_key in self._bone_cache:
+            return self._bone_cache[cache_key]
+        self._visiting.add(cache_key)
+        self._making.append(key)
         try:
-            result = node.eval_bones(self) if hasattr(node, "eval_bones") else []
+            result = make()
         finally:
-            self._visiting.discard(key)
-        self._bone_cache[key] = result
+            self._making.pop()
+            self._visiting.discard(cache_key)
+        self._bone_cache[cache_key] = result
+        self._order.setdefault(key, len(self._order))
         return result
+
+    def bones_from_node(self, node):
+        return self._rig(
+            self._key(node),
+            lambda: node.eval_bones(self) if hasattr(node, "eval_bones") else [],
+        )
 
     def constraints_from_node(self, node):
         key = self._key(node)
@@ -263,24 +302,94 @@ class EvalContext:
 
     def _from_group(self, group_node, identifier, kind):
         """Run the group: what reaches its Group Output, for this output."""
-        cache = self._bone_cache if kind == "bones" else self._constraint_cache
         key = self._key(group_node, identifier)
-        if key in cache:
-            return cache[key]
         output = group_output_node(group_node.node_tree)
         inner = socket_by_identifier(output.inputs, identifier) if output else None
-        result = []
-        if inner is not None:
+
+        def run():
+            if inner is None:
+                return []
             with entering(group_node):
-                result = self._gather(inner, kind)
-        cache[key] = result
-        return result
+                return self._gather(inner, kind)
+
+        if kind == "bones":
+            return self._rig(key, run)
+        if key not in self._constraint_cache:
+            self._constraint_cache[key] = run()
+        return self._constraint_cache[key]
 
     def _gather(self, sock, kind):
+        links = _live_links(sock)
+        if kind == "bones" and len(links) > 1:
+            return self._chain(sock, links)
         out = []
-        for link in _live_links(sock):
+        for link in links:
             out.extend(self._from_socket(link.from_socket, kind))
         return out
+
+    # -- Several rigs into one input -------------------------------------------
+
+    def _chain(self, sock, links):
+        """The rigs on ``links``, chained in order (see the class docstring)."""
+        node = sock.node
+        key = ("chain", _frame_key(), node.id_data.name, node.name, sock.identifier)
+
+        def make():
+            merged, came_from = None, set()
+            for link in links:
+                rig, keys = self._read(link.from_socket)
+                ancestry = self._ancestry(keys)
+                if merged is None:
+                    merged, came_from = list(rig), ancestry
+                    continue
+                shared = came_from & ancestry
+                if shared:
+                    split = max(shared, key=lambda k: self._order.get(k, -1))
+                    merged = list(self._replay(link.from_socket, split, merged))
+                else:
+                    # Nothing in common -- two rigs built from scratch, say:
+                    # side by side, as before.
+                    merged = merged + list(rig)
+                came_from |= ancestry
+            return merged or []
+
+        return self._rig(key, make)
+
+    def _read(self, sock):
+        """(the rig out of ``sock``, the keys of the rigs it is)."""
+        self._reads += 1
+        probe = ("read", self._reads)
+        self._making.append(probe)
+        try:
+            rig = self._from_socket(sock, "bones")
+        finally:
+            self._making.pop()
+        keys = self._made_from.pop(probe, set())
+        if self._making:
+            self._made_from.setdefault(self._making[-1], set()).update(keys)
+        return rig, keys
+
+    def _ancestry(self, keys):
+        """``keys`` and every rig they were made from, all the way up."""
+        out, todo = set(), list(keys)
+        while todo:
+            key = todo.pop()
+            if key not in out:
+                out.add(key)
+                todo.extend(self._made_from.get(key, ()))
+        return out
+
+    def _replay(self, sock, split, base):
+        """The rig out of ``sock`` made again with ``base`` in place of the
+        rig ``split`` -- the branch's own nodes, run on top of ``base``."""
+        self._replays += 1
+        scope = self._scope + (self._replays,)
+        self._stand_ins[scope] = (split, base)
+        outer, self._scope = self._scope, scope
+        try:
+            return self._from_socket(sock, "bones")
+        finally:
+            self._scope = outer
 
 
 def gather_input_bones(node, socket_name, ctx):

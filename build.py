@@ -46,9 +46,10 @@ def evaluate_tree(tree, strict=True):
             raise RuntimeError("Armature Output node has no bones wired into it")
         return output.target_name(), []
 
-    # Deduplicate: shared lineages (a parent emitted through several branches)
-    # may appear multiple times. Keep the LAST occurrence of each name so
-    # downstream modifiers (DeformGroup etc.) win, then restore order.
+    # Deduplicate. Branches of one rig no longer repeat bones -- the Output
+    # chains them (EvalContext._chain) -- but rigs with nothing in common,
+    # built side by side, can still share a name. Keep the LAST occurrence of
+    # each name, then restore order.
     by_name = {}
     order = []
     for b in bones:

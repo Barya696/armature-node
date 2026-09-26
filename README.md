@@ -57,6 +57,14 @@ graph has written so far. Not one bone: one rig.
   whole-rig value every other node receives.
 - **Armature Output** takes the last one and writes it back.
 
+Several wires can go into the Output — one branch per Transform node, say,
+each moving its own bone. They are **chained, in the order they were plugged
+in**: each branch runs on top of the ones before it, from the node where it
+split off from them. So nodes side by side do exactly what they would one
+after another: every branch's changes arrive, offsets on the same bone add
+up, a value two branches both set is taken from the wire plugged in last,
+and a node the branches share runs once.
+
 Every modifier node has a **Bone** field. Leave it empty and the node affects
 every bone on the wire; name one (or several, semicolon separated) and it
 affects only those. When the graph has a rig to look at, the field is a
