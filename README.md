@@ -486,7 +486,7 @@ node, which marks the tree dirty, which re-poses the rig.
 | `livelink.py` | Telling the graph's own pose writes from the user's, for the two-way live link |
 | `sockets.py` | Rig (the whole armature, the stream), Constraint, Vector / Rotation / Scale / Transform sockets |
 | `tree.py` | `ArmatureNodeTree` data-block, dirty tracking, debounced live update, graph version |
-| `nodes.py` | Every node type |
+| `nodes/` | The node types, one module per Shift+A category (`armature_io`, `bone`, `marker`, `transform`, `shape`, `constraint`); `base.py` and `marker_base.py` hold what they share, `__init__.py` registers them |
 | `primary_rig.py` | Marker handles and locks, viewport overlay, MediaPipe preset table, marker operators |
 | `handles.py` | The grabbable marker gizmo: hit-testing, move / turn / scale drags, rings and name label |
 | `marker_links.py` | Lines between Marker nodes: the joins, Fusion-style ports, their drawing and drag gizmo |
@@ -528,6 +528,8 @@ python tests/run_pure.py
 ```
 
 The Blender suite takes one module by name: `... run.py -- test_groups`.
+A new node goes in the `nodes/` module of its Shift+A category, and into
+`classes` in `nodes/__init__.py`.
 Warnings go to the system console through the `armature_nodes` logger.
 Disabling the add-on drops all of its modules, so enabling it again (or
 Reload Scripts) runs the code as it is on disk.

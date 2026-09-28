@@ -23,9 +23,9 @@ def _on_socket_value_changed(self, context):
     """Typing into an unconnected socket's default_value must rebuild too.
 
     Node-level properties get their ``update`` callback injected by
-    ``nodes.py`` at register time, but a NodeSocket is a different bpy_struct
-    hierarchy that injection never touches -- without this a typed vector
-    would change silently and the armature would never follow.
+    ``nodes/__init__.py`` at register time, but a NodeSocket is a different
+    bpy_struct hierarchy that injection never touches -- without this a typed
+    vector would change silently and the armature would never follow.
     """
     from .tree import is_updating
 
