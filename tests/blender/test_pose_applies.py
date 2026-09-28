@@ -118,17 +118,14 @@ def test_unchecked_components_are_left_alone():
 def test_convert_rig_produces_modify_mode():
     """A generated rig must not be handed to the bone-rebuilding path."""
     from armature_nodes.build import find_output_node
-    from armature_nodes.sync import resync_tree_from_armature
 
     obj = fixtures.make_rig()
     fixtures.ensure_registered()
-    tree = resync_tree_from_armature(obj, shapes_only=False, full=True)
-    out = find_output_node(tree)
-    # resync_tree_from_armature(full=True) is the low-level call; the operator
-    # now passes full=False. Assert the operator's own default instead.
-    tree2 = resync_tree_from_armature(obj, shapes_only=False, full=False)
-    assert find_output_node(tree2).mode == "MODIFY"
-    assert out is not None
+    bpy.context.view_layer.objects.active = obj
+    assert bpy.ops.armature_nodes.convert_rig(open_editor=False) == {"FINISHED"}
+    tree = obj.armature_nodes_tree
+    assert tree is not None, "the rig was given no tree"
+    assert find_output_node(tree).mode == "MODIFY"
 
 
 def test_a_blocked_pose_is_reported_not_silently_dropped():
@@ -138,7 +135,7 @@ def test_a_blocked_pose_is_reported_not_silently_dropped():
     as a successful write is why the addon looked broken: no error, no motion.
     """
     from armature_nodes.apply import pipeline
-    from armature_nodes.model import ops
+    import record_ops as ops
     from armature_nodes.ops.bind import bind
     from armature_nodes.store import record as record_store
 

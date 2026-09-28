@@ -3,7 +3,7 @@
 from conftest import FakeObject, make_record, make_widgets
 
 from armature_nodes.model import diff as M_diff
-from armature_nodes.model import ops
+import record_ops as ops
 from armature_nodes.model.schema import (
     RECORD_VERSION,
     RecordError,

@@ -184,15 +184,6 @@ def copy_joins(src_tree, dst_tree, uid_map):
                 new.a, new.b = a, b
 
 
-def prune(tree):
-    """Drop joins naming a node the tree no longer has."""
-    uids = {n.uid for n in marker_nodes(tree) if n.uid}
-    links = tree.marker_links
-    for index in reversed(range(len(links))):
-        if links[index].a not in uids or links[index].b not in uids:
-            links.remove(index)
-
-
 # Shift+D copies nodes one at a time; the joins among them are copied once
 # it has finished. {(source tree name, tree name): {uid: uid of the copy}}
 _copied = {}

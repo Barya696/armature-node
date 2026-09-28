@@ -2,7 +2,6 @@
 
 import bpy
 
-from .. import compat
 from .widgets import ensure_widget
 
 __all__ = ["apply_display", "apply_pose", "pose_target", "pose_pass"]
@@ -39,19 +38,39 @@ def apply_display(obj, bone, pbone, leaf, value, library, writer):
             writer.set(pbone, "custom_shape_transform", target)
         return
     if leaf == "wire_width":
-        writer.count(compat.set_wire_width(pbone, value))
+        writer.set(pbone, "custom_shape_wire_width", float(value))
         return
     if leaf == "show_wire":
         writer.set(bone, "show_wire", bool(value))
         return
     if leaf == "color":
-        writer.count(compat.set_bone_color(bone, value))
+        writer.count(_set_bone_color(bone, value))
         return
     if leaf == "preset":
         return  # generator hint, not a property of the rig
     attr = _DISPLAY_TO_ATTR.get(leaf)
     if attr is not None:
         writer.set(pbone, attr, value)
+
+
+def _set_bone_color(bone, data):
+    """Write a colour captured by ``capture.pose_display.bone_color``."""
+    color = bone.color
+    if not data:
+        if color.palette == "DEFAULT":
+            return False
+        color.palette = "DEFAULT"
+        return True
+    palette = data.get("palette", "DEFAULT")
+    changed = color.palette != palette
+    color.palette = palette
+    custom = data.get("custom")
+    if palette == "CUSTOM" and custom:
+        for key in ("normal", "select", "active"):
+            if key in custom:
+                setattr(color.custom, key, custom[key])
+        changed = True
+    return changed
 
 
 def apply_pose(pbone, leaf, value, writer):

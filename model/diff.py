@@ -92,7 +92,10 @@ def diff(base, target):
     base_names = set(base.bones)
     target_names = set(target.bones)
     for name in target_names & base_names:
-        changes = diff_bone(base.bones[name], target.bones[name])
+        old, new = base.bones[name], target.bones[name]
+        if old is new:
+            continue  # the same frozen bone: most of a rig, on most builds
+        changes = diff_bone(old, new)
         if changes:
             bones[name] = changes
     return ChangeSet(
@@ -131,7 +134,7 @@ def value_at(bone, path):
 def with_value(bone, path, value):
     """A copy of ``bone`` with ``path`` set to ``value``.
 
-    Used by restoration and by ``model.ops``; a record is never mutated, so
+    Used by restoration; a record is never mutated, so
     every write rebuilds the small frozen dataclass that owns the field.
     """
     from dataclasses import replace

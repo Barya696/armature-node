@@ -44,8 +44,6 @@ def test_capture_records_display_and_flags():
 
 def test_capture_records_collections():
     obj = fixtures.make_rig(n_bones=4)
-    if not hasattr(obj.data, "collections"):
-        return  # 3.6: no collections to record
     rec = capture.capture_record(obj)
     assert "Controls" in rec.armature.collections
     assert "Controls" in rec.bones["bone.001"].membership.collections

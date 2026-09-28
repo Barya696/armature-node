@@ -24,6 +24,7 @@ Every constraint node implements eval_constraints(ctx) -> list[ConstraintDef].
 """
 
 import contextlib
+import logging
 from collections import namedtuple
 
 import bpy
@@ -43,10 +44,11 @@ from .core import (
     TREE_IDNAME,
     BoneDef,
     ConstraintDef,
+    editable,
     gather_input_bones,
     gather_input_constraints,
     select_bones,
-    copy_bone,
+    socket_links,
 )
 from .sockets import (
     RigSocket,
@@ -59,6 +61,8 @@ from .sockets import (
 )
 from .widgets import PRESET_ITEMS as _widget_preset_items
 from .widgets import widget_enum_items as _widget_enum_items
+
+log = logging.getLogger(__name__)
 
 _EPS = 1e-5
 
@@ -217,9 +221,10 @@ def _write_socket_value(node, name, value, linked_too=False):
 def _linked_marker(node, name):
     """(marker node, marker) wired into ``name``, or (None, None)."""
     sock = node.inputs.get(name)
-    if sock is None or not sock.is_linked or not sock.links:
+    links = socket_links(sock) if sock is not None and sock.is_linked else ()
+    if not links:
         return None, None
-    link = sock.links[0]
+    link = links[0]
     key = getattr(link.from_socket, "marker_key", "")
     source = link.from_node
     if not key or not hasattr(source, "marker_by_key"):
@@ -317,10 +322,16 @@ class _ModifierNodeBase(ArmatureNodeBase):
         self.width = 200
 
     def stream(self, ctx):
-        return [copy_bone(b) for b in gather_input_bones(self, self.stream_input, ctx)]
+        """The rig coming in, as a list of this node's own. The bones in it
+        are still upstream's: change one only through ``edit``."""
+        return list(gather_input_bones(self, self.stream_input, ctx))
 
     def selected(self, bones):
         return select_bones(bones, self.bone)
+
+    def edit(self, bones):
+        """The selected bones, copied into ``bones``, ready to change."""
+        return editable(bones, self.selected(bones))
 
 
 # ---------------------------------------------------------------------------
@@ -496,7 +507,7 @@ class SkeletonMarker(bpy.types.PropertyGroup):
     def set_rotation(self, value):
         self._set_quietly("rotation", value)
 
-    def set_scale(self, value):
+    def set_scale(self, value):  # called as "set_" + attr
         self._set_quietly("scale", value)
 
     def _set_quietly(self, attr, value):
@@ -776,7 +787,11 @@ class MarkerHolderMixin:
             prune_marker_empties,
             tag_viewports_redraw,
         )
+        from .sync import request_visibility_refresh
+        from .tree import graph_changed
 
+        graph_changed()  # shown or hidden: what the viewport displays changed
+        request_visibility_refresh()
         try:
             # Prune unconditionally. markers_shown() asks whether any handle
             # still matches a live marker, so deleting the LAST marker makes
@@ -786,7 +801,7 @@ class MarkerHolderMixin:
                 ensure_marker_empties(self)
             tag_viewports_redraw()
         except Exception as exc:  # noqa: BLE001
-            print(f"[Armature Nodes] Could not refresh marker handles: {exc}")
+            log.warning("Could not refresh marker handles: %s", exc)
 
     def push_markers_to_empties(self):
         from .primary_rig import find_marker_empties
@@ -846,7 +861,7 @@ class MarkerHolderMixin:
         try:
             remove_marker_empties(self)
         except Exception as exc:  # noqa: BLE001
-            print(f"[Armature Nodes] Could not clean up marker handles: {exc}")
+            log.warning("Could not clean up marker handles: %s", exc)
         self.schedule_rebuild()
 
 
@@ -959,7 +974,7 @@ class ArmatureOutputNode(ArmatureNodeBase, Node):
             "output in the 3D viewport"
         ),
         default=True,
-        update=lambda self, ctx: _redraw_viewports(),
+        update=lambda self, ctx: _display_changed(),
     )
 
     def init(self, context):
@@ -1009,7 +1024,7 @@ class ArmatureOutputNode(ArmatureNodeBase, Node):
             for obj in owned_objects(tree.name, self.name):
                 queue_object_removal(obj.name)
         except (ReferenceError, AttributeError) as exc:
-            print(f"[Armature Nodes] Could not release generated armature: {exc}")
+            log.warning("Could not release generated armature: %s", exc)
         self.schedule_rebuild()
 
     def eval_bones(self, ctx):
@@ -1037,7 +1052,7 @@ def _on_bone_selected(self, context):
     try:
         self.read_from_rig()
     except Exception as exc:  # noqa: BLE001
-        print(f"[Armature Nodes] Could not read bone: {exc}")
+        log.warning("Could not read bone: %s", exc)
     tree = self.id_data
     if tree is not None and hasattr(tree, "mark_dirty"):
         tree.mark_dirty()
@@ -1127,9 +1142,10 @@ class BoneNode(_LiveLinkMixin, _ModifierNodeBase, Node):
     def linked_marker(self):
         """(node, marker) driving the Position input, or (None, None)."""
         sock = self.inputs.get("Position")
-        if sock is None or not sock.is_linked or not sock.links:
+        links = socket_links(sock) if sock is not None and sock.is_linked else ()
+        if not links:
             return None, None
-        link = sock.links[0]
+        link = links[0]
         key = getattr(link.from_socket, "marker_key", "")
         node = link.from_node
         if not key or not hasattr(node, "marker_by_key"):
@@ -1235,10 +1251,6 @@ class BoneNode(_LiveLinkMixin, _ModifierNodeBase, Node):
             _syncing_bone_read = False
         return True
 
-    def follow_live_transform(self, obj=None):
-        """Kept for callers that predate the live link."""
-        return self.follow_live()
-
     def draw_buttons(self, context, layout):
         layout.context_pointer_set("node", self)
         obj = self.rig_for_ui()
@@ -1315,9 +1327,8 @@ class BoneNode(_LiveLinkMixin, _ModifierNodeBase, Node):
             return bones
         constraints = gather_input_constraints(self, "Constraints", ctx)
         position = self.position()
-        for b in bones:
-            if b.name != self.bone:
-                continue
+        mine = [b for b in bones if b.name == self.bone][:1]
+        for b in editable(bones, mine):
             if self.use_location and position is not None:
                 b.pose_location = tuple(position)
                 b.pose_offset = _ZERO
@@ -1332,7 +1343,6 @@ class BoneNode(_LiveLinkMixin, _ModifierNodeBase, Node):
             # armature when the Output is in Full Rig mode.
             if constraints:
                 b.constraints = list(b.constraints) + constraints
-            break
         return bones
 
 
@@ -1401,7 +1411,7 @@ class ChainNode(ArmatureNodeBase, Node):
             head = tail
         if bones and tip_constraints:
             bones[-1].constraints = tip_constraints
-        return [copy_bone(b) for b in parents] + bones
+        return list(parents) + bones  # the parents pass on unchanged
 
 
 # ---------------------------------------------------------------------------
@@ -1746,7 +1756,7 @@ class MarkerNode(MarkerHolderMixin, ArmatureNodeBase, Node):
         """
         out = []
         for sock in self.outputs:
-            for link in sock.links:
+            for link in socket_links(sock) if sock.is_linked else ():
                 consumer, target = link.to_node, link.to_socket
                 role_of = getattr(consumer, "marker_role", None)
                 role = role_of(target.name) if role_of is not None else None
@@ -2386,6 +2396,16 @@ def _redraw_viewports():
     tag_viewports_redraw()
 
 
+def _display_changed():
+    """An Output's Markers toggle: the handles follow what is displayed."""
+    from .sync import request_visibility_refresh
+    from .tree import graph_changed
+
+    graph_changed()
+    request_visibility_refresh()
+    _redraw_viewports()
+
+
 # ---------------------------------------------------------------------------
 # Transform (pose modifiers)
 # ---------------------------------------------------------------------------
@@ -2722,7 +2742,7 @@ class PositionNode(_TransformNodeBase, Node):
         has_offset = _nonzero(offset)
         if not absolute and not has_offset:
             return bones  # nothing asked: the node is a pass-through
-        chosen = self.selected(bones)
+        chosen = self.edit(bones)
         if absolute:
             for b in chosen:
                 b.pose_location = position
@@ -2856,7 +2876,7 @@ class RotationNode(_TransformNodeBase, Node):
         has_offset = _nonzero(offset)
         if not absolute and not has_offset:
             return bones
-        chosen = self.selected(bones)
+        chosen = self.edit(bones)
         if absolute:
             for b in chosen:
                 b.pose_rotation = rotation
@@ -3013,9 +3033,10 @@ class TransformNode(_TransformNodeBase, Node):
             # Several bones cannot share one set of values the way they could
             # share an offset: leave them unset rather than pile every bone
             # onto one point.
-            print(
-                f"[Armature Nodes] '{self.name}' moved several bones by an offset; "
-                "Transform now sets values, so those moves were dropped"
+            log.warning(
+                "'%s' moved several bones by an offset; "
+                "Transform now sets values, so those moves were dropped",
+                self.name,
             )
         self.layout_version = self._LAYOUT
 
@@ -3235,7 +3256,7 @@ class TransformNode(_TransformNodeBase, Node):
         """World values, set outright. As with Set Position, a set value
         replaces any offset an earlier node applied."""
         loc, rot, scale = parts
-        for b in self.selected(bones):
+        for b in self.edit(bones):
             if loc is not None:
                 b.pose_location = tuple(loc)
                 b.pose_offset = _ZERO
@@ -3254,7 +3275,7 @@ class TransformNode(_TransformNodeBase, Node):
         """The bones' own channels, set outright -- exactly as typing the same
         values into each bone's N-panel would."""
         loc, rot, scale = parts
-        for b in self.selected(bones):
+        for b in self.edit(bones):
             local_set = set(b.pose_local_set)
             if loc is not None:
                 b.pose_local_offset = tuple(loc)
@@ -3371,14 +3392,14 @@ class SnapNode(_ModifierNodeBase, Node):
         if obj is None or obj.type != "MESH":
             return bones
         offset = Vector(self.offset)
-        for b in self.selected(bones):
+        for b in self.edit(bones):
             # SURFACE needs a point to be closest TO; the bone's own head is
             # the only sensible reference at evaluation time.
             reference = Vector(b.pose_location) if b.pose_location else Vector(b.head)
             try:
                 anchor = _mesh_anchor(obj, self.mode, reference)
             except Exception as exc:  # noqa: BLE001
-                print(f"[Armature Nodes] Snap failed on '{b.name}': {exc}")
+                log.warning("Snap failed on '%s': %s", b.name, exc)
                 continue
             b.pose_location = tuple(Vector(anchor) + offset)
             b.pose_offset = _ZERO
@@ -3479,7 +3500,7 @@ class CustomShapeNode(_ModifierNodeBase, Node):
         offset = sock.get_value() if sock is not None else (0.0, 0.0, 0.0)
         widget = self._widget_name()
         preset = self.preset if self.source != "OBJECT" else "NONE"
-        for b in self.selected(bones):
+        for b in self.edit(bones):
             b.shape = ShapeDef(
                 widget=widget,
                 preset=preset,
@@ -3639,7 +3660,6 @@ _NO_REBUILD_PROPS = {
     "show_detail",
     "show_advanced",
     "show_handles",
-    "show_markers",
     "markers",  # CollectionProperty: does not accept update=
     "lock_depth",
     "symmetric",
@@ -3688,10 +3708,11 @@ def _check_reserved_names(cls):
     reserved = set(node_rna.properties.keys()) - {"bl_idname"}
     clashes = sorted(set(getattr(cls, "__annotations__", {})) & reserved)
     if clashes:
-        print(
-            f"[Armature Nodes] {cls.__name__} declares {', '.join(clashes)}, "
-            f"which shadow bpy.types.Node properties. Rename them "
-            f"(e.g. 'location' -> 'bone_location') or the node will misbehave."
+        log.warning(
+            "%s declares %s, which shadow bpy.types.Node properties. Rename them "
+            "(e.g. 'location' -> 'bone_location') or the node will misbehave.",
+            cls.__name__,
+            ", ".join(clashes),
         )
 
 

@@ -1,0 +1,26 @@
+schema_version = "1.0.0"
+
+id = "armature_nodes"
+version = "0.3.0"
+name = "Armature Nodes"
+tagline = "Rig with a node graph: modify an armature live, node by node"
+maintainer = "baryaelimelec"
+type = "add-on"
+
+tags = ["Rigging", "Node", "Animation"]
+
+blender_version_min = "4.2.0"
+
+# Blender's extension platform requires a GPL-compatible license for add-ons.
+license = [
+  "SPDX:GPL-3.0-or-later",
+]
+
+[build]
+paths_exclude_pattern = [
+  "__pycache__/",
+  "/.git/",
+  "/.gitignore",
+  "/tests/",
+  "*.zip",
+]

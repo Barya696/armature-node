@@ -7,12 +7,17 @@ modifier: one value in, one value out, changing only what it selects.
 
 ## Install
 
-1. Zip the `armature_nodes/` folder (the folder itself, so the zip contains
-   `armature_nodes/__init__.py`).
-2. In Blender: `Edit > Preferences > Add-ons > Install...`, pick the zip,
-   enable **Armature Nodes**.
+Requires Blender 4.2 or later; tested on 5.1 and 5.2.
 
-Requires Blender 3.6+ (tested API surface targets 3.6–4.x).
+It is a Blender **extension** (`blender_manifest.toml`):
+
+1. Build the package from this folder:
+   `blender --command extension build --source-dir . --output-dir dist`
+2. Drag `dist/armature_nodes-<version>.zip` into Blender, or use
+   `Edit > Preferences > Get Extensions > Install from Disk...`.
+
+The folder also still works as a legacy add-on: zip the `armature_nodes/`
+folder itself and use `Preferences > Add-ons > Install from Disk...`.
 
 ## Where it lives
 
@@ -450,11 +455,12 @@ is not live with them.
 
 ## Execution model
 
-0. **Baseline** — the Armature Input emits the rig's stored unmodified state,
-   capturing it from the object on first use.
-1. **Evaluate** — walk back from the Armature Output, memoized per node, into
-   a list of `BoneDef`. Duplicate names are resolved last-write-wins so a
-   downstream modifier beats an upstream one.
+0. **Baseline** — the Armature Input emits the rig's recorded, unmodified
+   state (captured by **Bind Rig**, never implicitly).
+1. **Evaluate** — walk back from the Armature Output, each node once
+   (memoized), into a list of `BoneDef`. The bones are shared down the stream
+   and a node copies only the ones it changes; several wires into the Output
+   are chained (see *One value on the wire*).
 2. **Edit-mode pass** (Full Rig only) — create and place bones, set parenting.
 3. **Pose-mode pass** — constraints and custom shapes.
 4. **Pose-transform pass** — apply what the Transform nodes wrote. Runs last
@@ -471,25 +477,60 @@ node, which marks the tree dirty, which re-poses the rig.
 
 | File | Responsibility |
 | --- | --- |
-| `core.py` | `BoneDef` / `ConstraintDef` / `ShapeDef`, eval context and memoization, bone selection |
-| `model/` | Pure data: types, JSON schema, v1→v2 migration, diff, rig transforms. Imports no `bpy`. |
+| `core.py` | `BoneDef` / `ConstraintDef` / `ShapeDef`, the evaluator (memoization, groups, chaining several wires), copy-on-write, link index |
+| `model/` | Pure data: types, JSON schema, v1→v2 migration, diff. Imports no `bpy`. |
 | `store/` | The `an_rig_*` properties, and the build lock. The only place they are touched. |
 | `capture/` | Live armature → `RigRecord`. Never writes. Called only from Bind and Capture. |
-| `apply/` | `RigRecord` → live armature. The only writer. |
-| `bridge.py` | Seam between the old node graph's `BoneDef` and `RigRecord`, until `graph/` lands |
-| `compat.py` | 3.6 / 4.x RNA shims (bone collections, colour, wire width) |
-| `sockets.py` | Rig (the whole armature, the stream), Constraint, Vector sockets |
-| `tree.py` | `ArmatureNodeTree` data-block, dirty tracking, live update |
+| `apply/` | `RigRecord` → live armature, and the Full Rig writers (`full_rig.py`). The only writer. |
+| `bridge.py` | The seam between the graph's `BoneDef` and the record's `RigRecord` |
+| `livelink.py` | Telling the graph's own pose writes from the user's, for the two-way live link |
+| `sockets.py` | Rig (the whole armature, the stream), Constraint, Vector / Rotation / Scale / Transform sockets |
+| `tree.py` | `ArmatureNodeTree` data-block, dirty tracking, debounced live update, graph version |
 | `nodes.py` | Every node type |
 | `primary_rig.py` | Marker handles and locks, viewport overlay, MediaPipe preset table, marker operators |
 | `handles.py` | The grabbable marker gizmo: hit-testing, move / turn / scale drags, rings and name label |
+| `marker_links.py` | Lines between Marker nodes: the joins, Fusion-style ports, their drawing and drag gizmo |
 | `groups.py` | Node groups: the group node, Make Group / Ungroup / Tab, group sockets kept in step, Shift+A > Group |
 | `widgets.py` | `WGTS_rig` widget library and Rigify-style preset generation |
-| `build.py` | Forward compile: evaluate → edit pass → pose pass → pose-transform pass |
+| `build.py` | A build: evaluate, then Modify (restore → apply → record) or Full Rig |
 | `decompile.py` | Reverse: the two-node stack that targets a rig |
-| `operators.py` | Build, decompile, convert |
+| `operators.py` | Build, Convert to Armature Nodes, Read From Rig |
+| `ops/` | Bind Rig, Capture, Restore Original, Forget |
 | `ui.py` | Shift+A categories, header buttons, N-panel sidebar |
-| `sync.py` | Editor follows the active armature; marker handles read back |
+| `sync.py` | Editor follows the active armature; the rig and marker handles read back when they move |
+
+## Performance
+
+What runs, and when — the numbers are from a 706-bone Rigify rig with 30 nodes:
+
+- **A node edit** rebuilds after an 80 ms debounce, in about 17 ms. The rig's
+  record is parsed once and cached against its stored text; nodes share the
+  rig's bones and copy only the ones they change; the diff skips every bone
+  that is the very same object as the record's.
+- **Posing a bone or dragging a marker** reads the rig back into the live
+  nodes, from `depsgraph_update_post` — only when the update moved a bound
+  rig or a marker handle. Anything else (a node dragged in the editor, a
+  material changed) costs one pass over the update list.
+- **Redrawing** the viewport or node editor reads cached results: which
+  markers are displayed, the node links, the record. They are rebuilt when a
+  graph changes (`tree.graph_version`), and dropped on undo and file load.
+- **Nothing polls** except what Blender cannot report — an editor switched to
+  Armature Nodes, an armature changing mode — twice a second, in well under a
+  millisecond.
+
+## Development
+
+Tests, from this folder:
+
+```
+blender -b --factory-startup -P tests/blender/run.py
+python tests/run_pure.py
+```
+
+The Blender suite takes one module by name: `... run.py -- test_groups`.
+Warnings go to the system console through the `armature_nodes` logger.
+Disabling the add-on drops all of its modules, so enabling it again (or
+Reload Scripts) runs the code as it is on disk.
 
 ## Programmatic use
 

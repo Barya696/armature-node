@@ -18,7 +18,7 @@ import traceback
 HERE = os.path.dirname(os.path.abspath(__file__))
 ADDON = os.path.dirname(os.path.dirname(HERE))
 PARENT = os.path.dirname(ADDON)
-for path in (HERE, PARENT):
+for path in (HERE, os.path.dirname(HERE), PARENT):
     if path not in sys.path:
         sys.path.insert(0, path)
 

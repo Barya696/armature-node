@@ -54,7 +54,7 @@ def value_source(sock):
 
     frames = list(core._frames)
     for _step in range(256):  # a wire loop through groups would never end
-        links = [l for l in sock.links if l.is_valid and not l.is_muted] if sock.is_linked else []
+        links = core._live_links(sock) if sock.is_linked else []
         if not links:
             return sock
         out = links[0].from_socket

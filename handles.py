@@ -36,7 +36,7 @@ already exists.
 import math
 
 import bpy
-from mathutils import Euler, Quaternion, Vector
+from mathutils import Quaternion, Vector
 
 try:
     import blf
@@ -125,11 +125,17 @@ def visible_handles():
     in Symmetric mode, which only mirrors its partner -- has nothing to grab
     and is left out; its glow is still drawn.
     """
-    from .primary_rig import displayed_marker_nodes, find_marker_empties, marker_color
+    from .primary_rig import (
+        displayed_marker_nodes,
+        find_marker_empties,
+        marker_color,
+        marker_empties_index,
+    )
 
     out = []
+    index = marker_empties_index()
     for node in displayed_marker_nodes():
-        empties = find_marker_empties(node)
+        empties = find_marker_empties(node, index)
         size = float(getattr(node, "handle_size", 1.0))
         height = node.effective_height()
         for marker in node.markers:
@@ -598,7 +604,7 @@ class ARMATURE_NODES_GGT_marker_handles(bpy.types.GizmoGroup):
     def poll(cls, context):
         from .primary_rig import displayed_marker_nodes
 
-        return next(iter(displayed_marker_nodes()), None) is not None
+        return bool(displayed_marker_nodes())
 
     def setup(self, context):
         gz = self.gizmos.new(ARMATURE_NODES_GT_marker_handles.bl_idname)

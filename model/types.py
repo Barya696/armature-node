@@ -7,8 +7,8 @@ live armature.
 
 Frozen buys immutability of the fields themselves. Nested ``dict`` values
 (constraint props, pose locks, bone colours) are still technically mutable, so
-the convention is that nothing mutates a record in place -- ``model.ops``
-returns rebuilt records instead. Sequence fields are tuples so equality is
+the convention is that nothing mutates a record in place: a change is a
+rebuilt record. Sequence fields are tuples so equality is
 value-based and deterministic, which is what ``model.diff`` relies on.
 
 Pose transforms are never *captured* -- posing is what the graph does, and a

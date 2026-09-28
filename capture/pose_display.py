@@ -9,17 +9,34 @@ limits describe how a control may be manipulated, so they are rig definition;
 where the control currently sits is animation, and the graph owns it.
 """
 
-from .. import compat
 from ..model.types import DisplayDef, PoseDef
 
 __all__ = ["capture_display", "capture_pose"]
 
 
+def bone_color(bone):
+    """Bone colour as a plain dict, or ``None`` for the default.
+
+    Only the palette and, for a custom palette, the three colours: the rest of
+    the ``color`` struct is derived and would produce spurious diffs.
+    """
+    color = bone.color
+    if color.palette == "DEFAULT":
+        return None
+    out = {"palette": color.palette}
+    if color.palette == "CUSTOM":
+        custom = color.custom
+        out["custom"] = {
+            "normal": list(custom.normal),
+            "select": list(custom.select),
+            "active": list(custom.active),
+        }
+    return out
+
+
 def capture_display(bone, pose_bone):
     if pose_bone is None:
-        return DisplayDef(
-            show_wire=bool(bone.show_wire), color=compat.bone_color(bone)
-        )
+        return DisplayDef(show_wire=bool(bone.show_wire), color=bone_color(bone))
     shape = pose_bone.custom_shape
     override = getattr(pose_bone, "custom_shape_transform", None)
     return DisplayDef(
@@ -28,12 +45,12 @@ def capture_display(bone, pose_bone):
         scale=tuple(pose_bone.custom_shape_scale_xyz),
         translation=tuple(pose_bone.custom_shape_translation),
         rotation=tuple(pose_bone.custom_shape_rotation_euler),
-        wire_width=compat.wire_width(pose_bone),
+        wire_width=float(pose_bone.custom_shape_wire_width),
         use_bone_size=bool(pose_bone.use_custom_shape_bone_size),
         # A pose-bone pointer, stored by bone name like every other reference.
         override=override.name if override is not None else "",
         show_wire=bool(bone.show_wire),
-        color=compat.bone_color(bone),
+        color=bone_color(bone),
     )
 
 

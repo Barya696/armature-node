@@ -21,9 +21,9 @@ from ..store import touched as touched_store
 from ..store import widgets_lib
 
 __all__ = [
-    "ARMATURE_OT_capture_record",
-    "ARMATURE_OT_restore_original",
-    "ARMATURE_OT_forget_record",
+    "ARMATURE_NODES_OT_capture_record",
+    "ARMATURE_NODES_OT_restore_original",
+    "ARMATURE_NODES_OT_forget_record",
     "classes",
 ]
 
@@ -35,7 +35,7 @@ def _bound_armature(context):
     return obj
 
 
-class ARMATURE_OT_capture_record(Operator):
+class ARMATURE_NODES_OT_capture_record(Operator):
     """Re-record this rig's current state as the original
 
     Use after editing the armature itself. It captures the rig as it is NOW,
@@ -72,7 +72,7 @@ class ARMATURE_OT_capture_record(Operator):
         return {"FINISHED"}
 
 
-class ARMATURE_OT_restore_original(Operator):
+class ARMATURE_NODES_OT_restore_original(Operator):
     """Put this rig back to its recorded state and forget what the graph wrote"""
 
     bl_idname = "armature_nodes.restore_original"
@@ -97,7 +97,7 @@ class ARMATURE_OT_restore_original(Operator):
         return {"FINISHED"}
 
 
-class ARMATURE_OT_forget_record(Operator):
+class ARMATURE_NODES_OT_forget_record(Operator):
     """Remove this rig's record. The rig itself is left exactly as it is"""
 
     bl_idname = "armature_nodes.forget_record"
@@ -122,9 +122,9 @@ class ARMATURE_OT_forget_record(Operator):
 
 
 classes = (
-    ARMATURE_OT_capture_record,
-    ARMATURE_OT_restore_original,
-    ARMATURE_OT_forget_record,
+    ARMATURE_NODES_OT_capture_record,
+    ARMATURE_NODES_OT_restore_original,
+    ARMATURE_NODES_OT_forget_record,
 )
 
 

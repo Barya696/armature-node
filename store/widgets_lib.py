@@ -54,6 +54,11 @@ def decode(text):
         return WidgetLib()
 
 
+# object -> (stored text, library decoded from it). Decoding a Rigify rig's
+# widgets is tens of milliseconds; the library only changes on a capture.
+_decoded = {}
+
+
 def read(obj):
     if obj is None:
         return WidgetLib()
@@ -61,7 +66,17 @@ def read(obj):
         value = obj.get(KEY)
     except (AttributeError, TypeError):
         return WidgetLib()
-    return decode(value if isinstance(value, str) else "")
+    text = value if isinstance(value, str) else ""
+    pointer = getattr(obj, "as_pointer", None)
+    key = pointer() if pointer is not None else id(obj)
+    cached = _decoded.get(key)
+    if cached is not None and cached[0] == text:
+        return cached[1]
+    lib = decode(text)
+    if len(_decoded) > 16:
+        _decoded.clear()
+    _decoded[key] = (text, lib)
+    return lib
 
 
 def write(obj, lib):

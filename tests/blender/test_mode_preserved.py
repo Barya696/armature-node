@@ -50,7 +50,7 @@ def test_repeated_builds_stay_in_pose_mode():
 def test_build_in_pose_mode_still_applies():
     """Skipping the mode switch must not skip the work."""
     from armature_nodes.apply import pipeline
-    from armature_nodes.model import ops
+    import record_ops as ops
     from armature_nodes.store import record as record_store
     from armature_nodes.store import touched as touched_store
 
@@ -96,7 +96,7 @@ def test_leaving_edit_mode_reschedules_the_build():
 # --- Full Rig mode ----------------------------------------------------------
 #
 # The Modify fix did not cover this path. Full Rig rebuilds edit bones through
-# apply/legacy_full.py, which enters EDIT and POSE unconditionally -- so every
+# apply/full_rig.py, which enters EDIT and POSE unconditionally -- so every
 # depsgraph tick ran a whole mode cycle, and each mode_set emitted another
 # depsgraph update that scheduled another build. That loop is what snapped
 # Pose mode straight back to Object.

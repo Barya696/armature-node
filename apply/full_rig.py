@@ -1,18 +1,18 @@
-"""Full Rig writers, moved here so apply/ is the only thing that writes.
+"""The Full Rig writers: an armature built from the graph, from scratch.
 
-These build an armature from scratch -- create the object, lay out edit bones,
-then attach constraints and custom shapes. They are the legacy Full Rig path,
-untouched in behaviour, relocated because the layering rule is "only apply/
-assigns to a bone" and a rule with an exception is not a rule.
+Create the object, lay out the edit bones, then attach constraints and custom
+shapes. They live in ``apply/`` because only ``apply/`` assigns to a bone.
 
-They do not yet go through the record, diff or touched set: Full Rig owns its
-armature outright, so there is nothing to restore to. Porting them onto the
-pipeline is step 3 work.
+Unlike Modify mode they do not go through the record, diff or touched set:
+Full Rig owns its armature outright, so there is nothing to restore to.
 """
+
+import logging
 
 import bpy
 
-from ..core import unique_names  # noqa: F401  (kept for the legacy call shape)
+log = logging.getLogger(__name__)
+
 
 def _ensure_object_mode():
     if bpy.context.mode != "OBJECT" and bpy.context.active_object:
@@ -111,7 +111,7 @@ def _apply_constraint(pose_bone, cdef, self_obj=None):
     try:
         con = pose_bone.constraints.new(cdef.type)
     except TypeError as exc:
-        print(f"[Armature Nodes] Cannot create constraint {cdef.type}: {exc}")
+        log.warning("Cannot create constraint %s: %s", cdef.type, exc)
         return
     if cdef.name:
         con.name = cdef.name
@@ -126,14 +126,14 @@ def _apply_constraint(pose_bone, cdef, self_obj=None):
                 try:
                     setattr(con, key, value)
                 except (AttributeError, TypeError) as exc:
-                    print(f"[Armature Nodes] Skipped constraint param {key}: {exc}")
+                    log.warning("Skipped constraint param %s: %s", key, exc)
     for key, value in params.items():
         if isinstance(value, list):
             value = tuple(value)
         try:
             setattr(con, key, value)
         except (AttributeError, TypeError, ValueError) as exc:
-            print(f"[Armature Nodes] Skipped constraint param {key}: {exc}")
+            log.warning("Skipped constraint param %s: %s", key, exc)
     if targets and hasattr(con, "targets"):
         for t in targets:
             tgt = con.targets.new()
@@ -144,9 +144,9 @@ def _apply_constraint(pose_bone, cdef, self_obj=None):
 
 def _apply_shape(pbone, bdef):
     """Assign (or clear) the custom shape widget on a pose bone."""
-    # The top-level widgets.py, not apply/widgets.py: this legacy path still
-    # resolves widgets by preset/name, while the record-driven pipeline
-    # rebuilds them from stored geometry.
+    # The top-level widgets.py, not apply/widgets.py: Full Rig resolves
+    # widgets by preset or name, while the record-driven pipeline rebuilds
+    # them from stored geometry.
     from ..widgets import resolve_widget_for_bone
 
     shape = bdef.shape
@@ -161,8 +161,7 @@ def _apply_shape(pbone, bdef):
     pbone.custom_shape_rotation_euler = shape.rotation
     pbone.use_custom_shape_bone_size = shape.scale_to_bone_length
     pbone.bone.show_wire = shape.show_wire
-    if hasattr(pbone, "custom_shape_wire_width"):  # Blender 4.x+
-        pbone.custom_shape_wire_width = shape.wire_width
+    pbone.custom_shape_wire_width = shape.wire_width
 
 
 def _pose_mode_pass(obj, bone_defs):
@@ -182,42 +181,3 @@ def _pose_mode_pass(obj, bone_defs):
             _apply_shape(pbone, bdef)
     finally:
         bpy.ops.object.mode_set(mode="OBJECT")
-
-
-def _geometry_differs(bone, bdef, eps=1e-6):
-    """True when a BoneDef's rest geometry/hierarchy no longer matches the
-    armature bone -- i.e. the user edited it on a Custom Shape node."""
-    if (Vector(bdef.head) - bone.head_local).length > eps:
-        return True
-    if (Vector(bdef.tail) - bone.tail_local).length > eps:
-        return True
-    parent = bone.parent.name if bone.parent else None
-    if (bdef.parent or None) != parent:
-        return True
-    return bone.use_connect != bdef.use_connect or bone.use_deform != bdef.use_deform
-
-
-def _edit_geometry_pass(obj, bone_defs):
-    """Move/re-parent ONLY the given existing bones (no create/remove)."""
-    _activate(obj)
-    bpy.ops.object.mode_set(mode="EDIT")
-    try:
-        edit_bones = obj.data.edit_bones
-        for b in bone_defs:
-            eb = edit_bones.get(b.name)
-            if eb is None:
-                continue
-            eb.head = b.head
-            eb.tail = b.tail
-            eb.roll = b.roll
-            eb.use_deform = b.use_deform
-            if b.parent and b.parent in edit_bones:
-                eb.parent = edit_bones[b.parent]
-                eb.use_connect = b.use_connect
-            else:
-                eb.parent = None
-                eb.use_connect = False
-    finally:
-        bpy.ops.object.mode_set(mode="OBJECT")
-
-

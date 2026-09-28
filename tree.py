@@ -12,12 +12,15 @@ property callbacks call ``mark_dirty``) schedules a deferred rebuild.
 """
 
 import contextlib
+import logging
 
 import bpy
 from bpy.types import NodeTree, PropertyGroup
 from bpy.props import BoolProperty, CollectionProperty, FloatProperty, StringProperty
 
 from .core import TREE_IDNAME
+
+log = logging.getLogger(__name__)
 
 # Guard so the rebuild does not re-trigger itself through tree.update().
 _updating = False
@@ -29,6 +32,19 @@ _pending = set()
 _pending_removal = set()
 # Delay used when something scheduled work without naming a tree.
 _DEFAULT_DELAY = 0.08
+# Bumped whenever an Armature node graph may have changed: nodes, links,
+# settings, a file load, an undo. What is derived from the graphs and asked
+# for on every redraw -- which markers are displayed -- is cached against it.
+_graph_version = 0
+
+
+def graph_changed():
+    global _graph_version
+    _graph_version += 1
+
+
+def graph_version():
+    return _graph_version
 
 
 def _schedule(delay=_DEFAULT_DELAY):
@@ -61,7 +77,7 @@ def _process_removals():
         try:
             bpy.data.objects.remove(obj, do_unlink=True)
         except (ReferenceError, RuntimeError) as exc:
-            print(f"[Armature Nodes] Could not remove '{name}': {exc}")
+            log.warning("Could not remove '%s': %s", name, exc)
             continue
         if data is not None and data.users == 0:
             try:
@@ -141,7 +157,7 @@ def _flush_pending():
         with bpy.context.temp_override(**ctx):
             _process_removals()
     except Exception as exc:  # noqa: BLE001
-        print(f"[Armature Nodes] Cleanup failed: {exc}")
+        log.warning("Cleanup failed: %s", exc)
     finally:
         _updating = False
 
@@ -157,16 +173,25 @@ def _flush_pending():
         try:
             from .build import build_armature_from_tree
 
+            if tree.last_error:
+                tree.last_error = ""  # the build reports its own warnings
             with bpy.context.temp_override(**ctx):
                 build_armature_from_tree(tree)
                 ctx["view_layer"].update()
             tree.is_dirty = False
-            tree.last_error = ""
         except Exception as exc:  # noqa: BLE001
             tree.last_error = str(exc)
-            print(f"[Armature Nodes] Live update failed for '{tree.name}': {exc}")
+            log.warning("Live update failed for '%s': %s", tree.name, exc)
         finally:
             _updating = False
+    # What the graphs display may have changed with them: marker handles.
+    try:
+        from .sync import refresh_marker_visibility
+
+        with bpy.context.temp_override(**ctx):
+            refresh_marker_visibility()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Marker handles failed: %s", exc)
     _redraw_all(ctx)
     return None
 
@@ -244,6 +269,7 @@ class ArmatureNodeTree(NodeTree):
         """
         if _updating:
             return
+        graph_changed()
         seen = set() if _seen is None else _seen
         if self.name in seen:
             return
@@ -268,6 +294,7 @@ class ArmatureNodeTree(NodeTree):
         for a node group, when its inputs or outputs change."""
         from .groups import sync_group_users
 
+        graph_changed()
         if not _updating:
             sync_group_users(self)
         self.mark_dirty()

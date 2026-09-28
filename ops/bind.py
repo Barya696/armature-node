@@ -17,7 +17,7 @@ from .. import capture
 from ..store import record as record_store
 from ..store import widgets_lib
 
-__all__ = ["ARMATURE_OT_bind_rig", "classes", "bind"]
+__all__ = ["ARMATURE_NODES_OT_bind_rig", "classes", "bind"]
 
 
 def bind(obj, force=False):
@@ -30,7 +30,7 @@ def bind(obj, force=False):
     return len(rec.bones), len(lib)
 
 
-class ARMATURE_OT_bind_rig(Operator):
+class ARMATURE_NODES_OT_bind_rig(Operator):
     """Record this armature as the original, so a graph can modify it safely"""
 
     bl_idname = "armature_nodes.bind_rig"
@@ -56,7 +56,7 @@ class ARMATURE_OT_bind_rig(Operator):
         return {"FINISHED"}
 
 
-classes = (ARMATURE_OT_bind_rig,)
+classes = (ARMATURE_NODES_OT_bind_rig,)
 
 
 def register():

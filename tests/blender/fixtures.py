@@ -73,11 +73,9 @@ def make_rig(name="rig", n_bones=4):
             con.influence = 0.5
             con.subtarget = "root"
 
-    # Bone collections (4.x+); on 3.6 this is simply skipped.
-    if hasattr(arm, "collections"):
-        controls = arm.collections.new("Controls")
-        for pbone in list(obj.pose.bones)[1:]:
-            controls.assign(pbone.bone)
+    controls = arm.collections.new("Controls")
+    for pbone in list(obj.pose.bones)[1:]:
+        controls.assign(pbone.bone)
 
     arm.display_type = "WIRE"
     obj.show_in_front = True

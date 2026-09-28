@@ -2,7 +2,7 @@
 
 from conftest import make_record
 
-from armature_nodes.model import ops
+import record_ops as ops
 from armature_nodes.model.diff import (
     ChangeSet,
     all_paths,

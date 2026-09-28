@@ -82,17 +82,36 @@ class BoneDef:
     # rather than added to. A zero offset normally means "no request" -- but
     # a channel set to zero means "at rest", and has to reach the rig.
     pose_local_set: tuple = ()
+    # Straight from the rig's record and untouched. Bones are shared down the
+    # stream until a node changes one (``editable``), and the build keeps the
+    # record's own bone for every bone still pristine at the end.
+    pristine: bool = field(default=False, compare=False, repr=False)
+
+
+def editable(bones, chosen):
+    """Copies of ``chosen``, put in their place in ``bones``, to change.
+
+    Copy on write. A node hands the rest of the stream on as it came instead
+    of copying the whole rig -- 700 bones per node on a Rigify rig, which was
+    most of every build -- and copies only the bones it is about to change.
+    """
+    wanted = {id(b) for b in chosen}
+    copies = {}
+    for index, bone in enumerate(bones):
+        key = id(bone)
+        if key in wanted:
+            if key not in copies:
+                copies[key] = copy_bone(bone)
+            bones[index] = copies[key]
+    return [copies[id(b)] for b in chosen if id(b) in copies]
 
 
 def unique_names(bones):
-    """Ensure every BoneDef in the list has a unique name.
-
-    Renames duplicates with .001-style suffixes and fixes up parent
-    references that pointed at the renamed bone *within the same list order*.
-    """
+    """Ensure every BoneDef in the list has a unique name, renaming later
+    duplicates with .001-style suffixes. Parent references are left as they
+    are: they name the first bone of that name."""
     seen = {}
-    rename_map = {}
-    for b in bones:
+    for index, b in enumerate(bones):
         base = b.name or "Bone"
         if base not in seen:
             seen[base] = 0
@@ -102,8 +121,9 @@ def unique_names(bones):
         while new_name in seen:
             seen[base] += 1
             new_name = f"{base}.{seen[base]:03d}"
-        rename_map[id(b)] = (b.name, new_name)
-        b.name = new_name
+        # A copy is renamed: the bone itself may be shared up the stream.
+        bones[index] = renamed = copy_bone(b)
+        renamed.name = new_name
         seen[new_name] = 0
     return bones
 
@@ -128,11 +148,6 @@ REROUTE = "NodeReroute"
 MAX_GROUP_DEPTH = 32
 
 _frames = []
-
-
-def current_group():
-    """The group node whose group is being evaluated, or None at top level."""
-    return _frames[-1] if _frames else None
 
 
 class entering:
@@ -192,8 +207,45 @@ def group_output_node(tree):
     return outputs[0] if outputs else None
 
 
+# tree pointer -> (graph version, {socket pointer: [link, ...]}).
+_link_index = {}
+
+
+def socket_links(sock):
+    """The links on ``sock``, as ``sock.links`` gives them.
+
+    ``NodeSocket.links`` walks every link of the tree on each call, and the
+    evaluator and the live link ask it for socket after socket. This indexes
+    a tree's links once, until the graph changes (``tree.graph_version``).
+    """
+    from .tree import graph_version
+
+    tree = sock.id_data
+    key, version = tree.as_pointer(), graph_version()
+    entry = _link_index.get(key)
+    if entry is None or entry[0] != version:
+        index, into = {}, {}
+        for link in tree.links:
+            index.setdefault(link.from_socket.as_pointer(), []).append(link)
+            into.setdefault(link.to_socket.as_pointer(), []).append(link)
+        for links in into.values():
+            # Several wires into one input: in their order on the socket,
+            # the order ``NodeSocket.links`` uses.
+            links.sort(key=lambda link: link.multi_input_sort_id, reverse=True)
+        index.update(into)
+        if len(_link_index) > 64:
+            _link_index.clear()
+        entry = _link_index[key] = (version, index)
+    return entry[1].get(sock.as_pointer(), ())
+
+
+def forget_link_index():
+    """A file load or an undo freed every link the index holds."""
+    _link_index.clear()
+
+
 def _live_links(sock):
-    return [l for l in sock.links if l.is_valid and not l.is_muted]
+    return [l for l in socket_links(sock) if l.is_valid and not l.is_muted]
 
 
 class EvalContext:
@@ -274,13 +326,6 @@ class EvalContext:
         )
         self._constraint_cache[key] = result
         return result
-
-    def bones_from_socket(self, sock):
-        """The rig coming out of one output socket."""
-        return self._from_socket(sock, "bones")
-
-    def constraints_from_socket(self, sock):
-        return self._from_socket(sock, "constraints")
 
     def _from_socket(self, sock, kind):
         node = sock.node

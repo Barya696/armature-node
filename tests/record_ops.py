@@ -1,17 +1,16 @@
-"""Pure rig transforms — the operations the nodes are built from.
+"""Pure record transforms, for building test scenarios.
 
 Every function here takes a :class:`RigRecord` and returns a new one. Nothing
-mutates, nothing touches ``bpy``, so a node is a one-line wrapper around a
-function that can be tested without Blender.
+mutates and nothing touches ``bpy``, so the diff and apply machinery can be
+tested with records made to order, with or without Blender.
 
-Selection is by name so that a node can say "hand.L" or "*_fk.?" without
-knowing anything about the rig it will be run against.
+Selection is by name, "hand.L" or "*_fk.?", the way a node's Bone field is.
 """
 
 import fnmatch
 from dataclasses import replace
 
-from .types import DisplayDef, RigRecord, TransformDef
+from armature_nodes.model.types import TransformDef
 
 __all__ = [
     "select",

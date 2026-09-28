@@ -1,19 +1,28 @@
-"""Forward evaluation: compile the node tree into a real armature.
+"""Forward evaluation: apply a node tree to its armature.
 
-Two-pass execution, because Blender requires it:
-  1. Edit-mode pass: create/update the armature object + edit bones
-     (head/tail/roll/parent/connect).
-  2. Pose-mode pass: apply constraints to pose bones, which can only be
-     added once the armature exists.
+* **Modify** (the default): the graph is folded onto the rig's record and
+  only what changed is written -- restore, apply, record what was touched
+  (``apply.pipeline``).
+* **Full Rig**: the graph owns the armature and rebuilds it, in two passes
+  because Blender requires it: edit bones first, then constraints and shapes
+  in Pose mode (``apply.full_rig``).
 
-Re-running the build on an already-built output updates in place (matched by
-armature object name and by bone name) instead of duplicating.
+Re-running the build updates in place, matched by object and bone name.
 """
 
-import bpy
-from mathutils import Vector
+import logging
 
+import bpy
+
+from .apply.full_rig import (
+    _edit_mode_pass,
+    _ensure_object_mode,
+    _get_or_create_armature_object,
+    _pose_mode_pass,
+)
 from .core import EvalContext, unique_names
+
+log = logging.getLogger(__name__)
 
 
 def find_output_node(tree):
@@ -97,15 +106,6 @@ def _drop_owned_objects(tree):
         queue_object_removal(obj.name)
 
 
-from .apply.legacy_full import (  # noqa: E402
-    _activate,
-    _edit_mode_pass,
-    _ensure_object_mode,
-    _get_or_create_armature_object,
-    _pose_mode_pass,
-)
-
-
 # tree name -> signature of the bone list its last Full Rig build produced.
 # Module level so it resets on reload, which is the safe direction: a stale
 # entry could skip a needed rebuild, a missing one only costs one rebuild.
@@ -177,7 +177,7 @@ def _apply_graph_pose(obj, bone_defs, tree_name=""):
     writer = Writer()
     pose_pass(obj, transforms, writer)
     for message in writer.errors[:3]:
-        print(f"[Armature Nodes] {message}")
+        log.warning("%s", message)
     return writer.writes
 
 
@@ -200,7 +200,7 @@ def _follow_live(tree):
                 try:
                     node.follow_live()
                 except Exception as exc:  # noqa: BLE001
-                    print(f"[Armature Nodes] Live link failed on '{node.name}': {exc}")
+                    log.warning("Live link failed on '%s': %s", node.name, exc)
 
 
 def _note_built(tree):
@@ -210,7 +210,7 @@ def _note_built(tree):
             try:
                 node.note_built()
             except Exception as exc:  # noqa: BLE001
-                print(f"[Armature Nodes] Live snapshot failed on '{node.name}': {exc}")
+                log.warning("Live snapshot failed on '%s': %s", node.name, exc)
 
 
 def _remember_mode():
@@ -235,7 +235,7 @@ def _restore_mode(built_obj, remembered):
         bpy.context.view_layer.objects.active = built_obj
         bpy.ops.object.mode_set(mode=mode)
     except RuntimeError as exc:
-        print(f"[Armature Nodes] Could not restore {mode} mode: {exc}")
+        log.warning("Could not restore %s mode: %s", mode, exc)
 
 
 def _modify_pass(tree, name, bone_defs):
@@ -267,17 +267,18 @@ def _modify_pass(tree, name, bone_defs):
             # rig as the original -- and migration cannot tell. Saying so is
             # the only honest option; silently blessing it is how a stripped
             # rig becomes permanent.
-            print(
-                f"[Armature Nodes] Upgraded '{obj.name}' record to v2. "
-                "This record came from an older version that could capture a "
-                "rig after it had been modified. If the rig looks wrong, "
-                "regenerate it and use Capture Rig State on the fresh one."
+            log.warning(
+                "Upgraded '%s' record to v2. This record came from an older "
+                "version that could capture a rig after it had been modified. "
+                "If the rig looks wrong, regenerate it and use Capture Rig "
+                "State on the fresh one.",
+                obj.name,
             )
             tree.last_error = (
                 "Record migrated from v1 - verify the rig, then Capture if wrong"
             )
         except Exception as exc:  # noqa: BLE001
-            print(f"[Armature Nodes] Could not upgrade record: {exc}")
+            log.warning("Could not upgrade record: %s", exc)
 
     base = record_store.read(obj)
     if base is None:

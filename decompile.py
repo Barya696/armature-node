@@ -12,20 +12,17 @@ of the stream through untouched, so the graph stays the size of your edits
 instead of the size of the rig.
 """
 
-import bpy
-
 NODE_X_SPACING = 260
 
 
-def decompile_armature_to_tree(obj, tree, shapes_only=False, full=False):
+def decompile_armature_to_tree(obj, tree, full=False):
     """Populate ``tree`` with the two-node stack that targets ``obj``.
 
-    ``shapes_only`` and ``full`` are kept for call-site compatibility and
-    only choose the Output node's mode:
+    ``full`` chooses the Output node's mode:
 
-    * default / ``shapes_only`` -> **Modify**: shapes and pose are written
-      onto the existing rig; its bones, constraints and drivers are left
-      alone. This is what you want on a generated rig.
+    * default -> **Modify**: shapes and pose are written onto the existing
+      rig; its bones, constraints and drivers are left alone. This is what
+      you want on a generated rig.
     * ``full`` -> **Full Rig**: the graph owns the armature and rebuilds its
       bones, so nodes can add and remove them.
     """

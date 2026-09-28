@@ -17,7 +17,6 @@ import datetime
 
 import bpy
 
-from .. import compat
 from ..model.types import ArmatureDef, BoneDef, RigRecord, SourceDef
 from ..store import lock
 from .collections import capture_membership
@@ -25,6 +24,7 @@ from .constraints import capture_constraints
 from .pose_display import capture_display, capture_pose
 from .rest import capture_rest
 from .widgets import capture_widgets
+
 
 class CaptureError(RuntimeError):
     """A rig could not be recorded."""
@@ -79,7 +79,7 @@ def _armature(obj):
         # property -- probed against 5.2, not assumed.
         show_in_front=bool(getattr(obj, "show_in_front", False)),
         pose_position=obj.data.pose_position,
-        collections=compat.armature_collection_names(obj.data),
+        collections=tuple(c.name for c in obj.data.collections_all),
     )
 
 

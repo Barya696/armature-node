@@ -22,6 +22,17 @@ KEY = "an_rig_record"
 __all__ = ["KEY", "exists", "read", "write", "forget", "raw", "stored_version",
            "needs_migration", "persist_migration"]
 
+# object -> (stored text, record parsed from it). A Rigify rig's record is
+# megabytes of JSON and parsing it took ~80 ms, on every build and on every
+# redraw of the Input node. A record is immutable, so the parsed one is
+# handed out again for as long as the stored text is the same.
+_parsed = {}
+
+
+def _ident(obj):
+    pointer = getattr(obj, "as_pointer", None)
+    return pointer() if pointer is not None else id(obj)
+
 
 def raw(obj):
     """The stored JSON text, or ``""``."""
@@ -66,12 +77,21 @@ def read(obj):
     """
     text = raw(obj)
     if text:
+        key = _ident(obj)
+        cached = _parsed.get(key)
+        if cached is not None and cached[0] == text:
+            return cached[1]
         try:
-            return from_json(text)
+            record = from_json(text)
         except RecordError:
             # Fall through to v1 rather than raising: a corrupt v2 record
             # should not hide a perfectly good legacy one underneath it.
             pass
+        else:
+            if len(_parsed) > 16:
+                _parsed.clear()
+            _parsed[key] = (text, record)
+            return record
     legacy = _v1_raw(obj)
     if legacy:
         import json

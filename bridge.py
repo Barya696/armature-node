@@ -1,10 +1,9 @@
-"""Translate between the old node graph and the new record.
+"""Translate between the node graph and the rig record.
 
-The node graph still speaks ``core.BoneDef`` -- a flat bone with a ``shape``
-and pose fields -- while the store and the apply pipeline speak
-``model.RigRecord``. Until ``graph/`` replaces the old nodes, this is the seam
-between them, and it is deliberately the *only* place the two vocabularies
-meet.
+The node graph speaks ``core.BoneDef`` -- a flat, mutable bone with a
+``shape`` and pose fields -- while the store and the apply pipeline speak
+``model.RigRecord``, frozen. This is the seam between them, and deliberately
+the *only* place the two vocabularies meet.
 
 The round trip must be an identity: ``overlay(base, to_bone_defs(base))``
 has to equal ``base``, or every build would diff against itself and rewrite
@@ -16,7 +15,7 @@ from dataclasses import replace
 from .core import BoneDef as GraphBone
 from .core import ConstraintDef as GraphConstraint
 from .core import ShapeDef as GraphShape
-from .model.types import ConstraintDef, DisplayDef, RestDef, TransformDef
+from .model.types import ConstraintDef, RestDef, TransformDef
 
 __all__ = ["to_bone_defs", "overlay"]
 
@@ -37,8 +36,25 @@ def _shape_from_display(display):
     )
 
 
+# id(record) -> (record, its bones). A record is immutable and the store hands
+# back the same one until the stored text changes, so each rig is converted
+# once, not on every build. The bones are shared down the stream: nodes copy
+# one before changing it (``core.editable``).
+_converted = {}
+
+
 def to_bone_defs(record):
-    """A record as the flat bone list the old graph expects."""
+    """A record as the flat bone list the old graph expects, every bone
+    marked pristine. The caller gets a list of its own; the bones are shared."""
+    entry = _converted.get(id(record))
+    if entry is None or entry[0] is not record:
+        if len(_converted) > 8:
+            _converted.clear()
+        entry = _converted[id(record)] = (record, _convert(record))
+    return list(entry[1])
+
+
+def _convert(record):
     out = []
     for name, bone in record.bones.items():
         rest = bone.rest
@@ -58,6 +74,7 @@ def to_bone_defs(record):
                     for c in bone.constraints
                 ],
                 shape=_shape_from_display(bone.display),
+                pristine=True,
             )
         )
     return out
@@ -140,6 +157,8 @@ def overlay(base, bone_defs):
 
     bones = dict(base.bones)
     for gb in bone_defs:
+        if gb.pristine:
+            continue  # untouched by the graph: the recorded bone, as it is
         recorded = base.bones.get(gb.name)
         if recorded is None:
             continue

@@ -204,23 +204,63 @@ def marker_collection(create=True):
     return coll
 
 
-def find_marker_empties(node):
-    """key -> empty object for every landmark handle owned by ``node``."""
+# Which handle belongs to which marker: (stamp, {(tree, node): {key: object
+# name}}). Asked for every marker node on every sync and redraw; scanning the
+# collection each time was most of that. Rebuilt when the collection changes
+# -- a handle made or removed here, or any object added or deleted -- and
+# holding names, not objects, so an undo can never leave it pointing at freed
+# memory.
+_empties_index = (None, {})
+_empties_version = 0
+
+
+def _empties_changed():
+    global _empties_version
+    _empties_version += 1
+
+
+def forget_caches():
+    """A file load or an undo replaced the data every cache here describes."""
+    global _displayed, _empties_index
+    _displayed = (None, ())
+    _empties_index = (None, {})
+    _rig_sizes.clear()
+
+
+def marker_empties_index():
+    """{(tree name, node name): {key: empty name}} for every handle."""
+    global _empties_index
     coll = bpy.data.collections.get(MARKER_COLLECTION)
     if coll is None:
         return {}
-    tree_name, node_name = node.id_data.name, node.name
+    stamp = (coll.as_pointer(), len(coll.objects), _empties_version)
+    if _empties_index[0] != stamp:
+        index = {}
+        for obj in coll.objects:
+            owner = (obj.get("an_tree"), obj.get("an_node"))
+            index.setdefault(owner, {})[obj.get("an_marker")] = obj.name
+        _empties_index = (stamp, index)
+    return _empties_index[1]
+
+
+def find_marker_empties(node, index=None):
+    """key -> empty object for every landmark handle owned by ``node``."""
+    owned = (index if index is not None else marker_empties_index()).get(
+        (node.id_data.name, node.name), {}
+    )
+    # Markers are user-defined now, so the node's own list is the only
+    # authority on which keys exist. A handle whose marker was deleted is
+    # not returned here; ensure_marker_empties() removes it.
     keys = set(node.marker_keys())
     found = {}
-    for obj in coll.objects:
-        if obj.get("an_tree") != tree_name or obj.get("an_node") != node_name:
+    for key, name in owned.items():
+        if key not in keys:
             continue
-        key = obj.get("an_marker")
-        # Markers are user-defined now, so the node's own list is the only
-        # authority on which keys exist. A handle whose marker was deleted is
-        # not returned here; ensure_marker_empties() removes it.
-        if key in keys:
-            found[key] = obj
+        obj = bpy.data.objects.get(name)
+        if obj is None:  # renamed behind the index's back: look again
+            _empties_changed()
+            return find_marker_empties(node) if index is None else found
+        found[key] = obj
     return found
 
 
@@ -236,6 +276,7 @@ def prune_marker_empties(node):
             continue
         if obj.get("an_marker") not in keys:
             bpy.data.objects.remove(obj, do_unlink=True)
+            _empties_changed()
 
 
 def ensure_marker_empties(node):
@@ -267,6 +308,7 @@ def ensure_marker_empties(node):
             obj["an_node"] = node.name
             obj["an_marker"] = key
             coll.objects.link(obj)
+            _empties_changed()
             existing[key] = obj
         obj.empty_display_size = (0.008 if key in GROUP_ANCHOR else 0.016) * h
         obj.location = tuple(marker.position)
@@ -329,6 +371,7 @@ def set_handle_locks(obj, lock_loc, lock_rot, lock_scale, arrows, hide_select=Fa
 def remove_marker_empties(node):
     for obj in find_marker_empties(node).values():
         bpy.data.objects.remove(obj, do_unlink=True)
+    _empties_changed()
     coll = bpy.data.collections.get(MARKER_COLLECTION)
     if coll is not None and not coll.objects and not coll.children:
         bpy.data.collections.remove(coll)
@@ -341,7 +384,20 @@ def remove_marker_empties(node):
 _draw_handle = None
 
 
-def _reaches_output(node, seen=None):
+def _downstream(tree, cache):
+    """{node name: [nodes its outputs feed]} for ``tree``, from one pass over
+    its links. ``NodeSocket.links`` scans every link of the tree on each call,
+    and walking a graph through it was quadratic."""
+    out = cache.get(tree.name)
+    if out is None:
+        out = cache[tree.name] = {}
+        for link in tree.links:
+            if link.is_valid:
+                out.setdefault(link.from_node.name, []).append(link.to_node)
+    return out
+
+
+def _reaches_output(node, seen=None, cache=None):
     """True when following this node's output links arrives at an Armature
     Output whose marker display is on.
 
@@ -349,33 +405,29 @@ def _reaches_output(node, seen=None):
     of every group node running the group, so the walk carries on from there
     -- which is what shows a marker that sits inside a group.
     """
-    if seen is None:
-        seen = set()
+    seen = set() if seen is None else seen
+    cache = {} if cache is None else cache
     key = (node.id_data.name, node.name)
     if key in seen:
         return False  # graphs can rejoin; never walk a node twice
     seen.add(key)
-    for sock in node.outputs:
-        for link in sock.links:
-            if not link.is_valid:
-                continue
-            nxt = link.to_node
-            if nxt.bl_idname == "ArmatureNodesOutputNode":
-                if getattr(nxt, "show_markers", True):
-                    return True
-                continue  # this output hides markers; another may not
-            if nxt.bl_idname == "NodeGroupOutput":
-                from .groups import group_nodes_using
-
-                if any(_reaches_output(g, seen) for g in group_nodes_using(nxt.id_data)):
-                    return True
-                continue
-            if _reaches_output(nxt, seen):
+    for nxt in _downstream(node.id_data, cache).get(node.name, ()):
+        if nxt.bl_idname == "ArmatureNodesOutputNode":
+            if getattr(nxt, "show_markers", True):
                 return True
+            continue  # this output hides markers; another may not
+        if nxt.bl_idname == "NodeGroupOutput":
+            from .groups import group_nodes_using
+
+            if any(_reaches_output(g, seen, cache) for g in group_nodes_using(nxt.id_data)):
+                return True
+            continue
+        if _reaches_output(nxt, seen, cache):
+            return True
     return False
 
 
-def marker_node_visible(node):
+def marker_node_visible(node, _cache=None):
     """Whether a marker node's handles belong in the viewport.
 
     A marker is displayed *through* the Armature Output it feeds, the way a
@@ -386,30 +438,52 @@ def marker_node_visible(node):
     """
     if not getattr(node, "show_handles", True):
         return False
-    return _reaches_output(node)
+    return _reaches_output(node, cache=_cache)
+
+
+# (graph version, ((tree name, node name), ...)): the displayed marker nodes.
+# Asked on every redraw and every mouse move over the viewport; the answer
+# only changes when a graph does.
+_displayed = (None, ())
 
 
 def displayed_marker_nodes():
-    """Every marker-holding node currently displayed.
+    """Every marker-holding node currently displayed, as a list.
 
     Both the Skeleton node and the single Marker node draw here -- a Marker
     node that drew nothing was invisible in the viewport, which defeats the
     point of a marker. The grabbable handles (``handles``) use the same list.
     """
-    return _overlay_nodes()
+    global _displayed
+    from .tree import graph_version
+
+    version = graph_version()
+    if _displayed[0] != version:
+        found = _find_displayed()
+        _displayed = (version, tuple((n.id_data.name, n.name) for n in found))
+        return found
+    out = []
+    for tree_name, node_name in _displayed[1]:
+        tree = bpy.data.node_groups.get(tree_name)
+        node = tree.nodes.get(node_name) if tree is not None else None
+        if node is None:  # renamed or removed without the graph saying so
+            _displayed = (None, ())
+            return displayed_marker_nodes()
+        out.append(node)
+    return out
 
 
-def _overlay_nodes():
+def _find_displayed():
     from .core import TREE_IDNAME
 
+    cache, out = {}, []
     for tree in bpy.data.node_groups:
         if tree.bl_idname != TREE_IDNAME:
             continue
         for node in tree.nodes:
-            if node.bl_idname not in MARKER_NODE_IDNAMES:
-                continue
-            if marker_node_visible(node):
-                yield node
+            if node.bl_idname in MARKER_NODE_IDNAMES and marker_node_visible(node, cache):
+                out.append(node)
+    return out
 
 
 # The glow: a disc facing the camera, fading from the marker's colour at the
@@ -567,7 +641,7 @@ def join_segments(nodes):
 def _draw_skeleton_overlay():
     if gpu is None or batch_for_shader is None:
         return
-    nodes = list(_overlay_nodes())
+    nodes = displayed_marker_nodes()
     if not nodes:
         return
     gpu.state.blend_set("ALPHA")
@@ -662,7 +736,7 @@ def _node(context, needs=None):
     return node
 
 
-class ARMATURE_OT_skeleton_toggle_markers(Operator):
+class ARMATURE_NODES_OT_skeleton_toggle_markers(Operator):
     """Show the landmarks as draggable handles in the viewport (or hide them)"""
 
     bl_idname = "armature_nodes.skeleton_toggle_markers"
@@ -697,7 +771,7 @@ class ARMATURE_OT_skeleton_toggle_markers(Operator):
         return {"FINISHED"}
 
 
-class ARMATURE_OT_skeleton_mirror(Operator):
+class ARMATURE_NODES_OT_skeleton_mirror(Operator):
     """Copy the left-side landmarks to the right (or the other way round)"""
 
     bl_idname = "armature_nodes.skeleton_mirror"
@@ -726,7 +800,7 @@ class ARMATURE_OT_skeleton_mirror(Operator):
         return {"FINISHED"}
 
 
-class ARMATURE_OT_skeleton_front_view(Operator):
+class ARMATURE_NODES_OT_skeleton_front_view(Operator):
     """Switch a 3D viewport to the front orthographic view for 2D landmark
     adjustment"""
 
@@ -749,7 +823,7 @@ class ARMATURE_OT_skeleton_front_view(Operator):
         return {"CANCELLED"}
 
 
-class ARMATURE_OT_skeleton_toggle_rotation(Operator):
+class ARMATURE_NODES_OT_skeleton_toggle_rotation(Operator):
     """Enable or disable rotation adjustment on this landmark"""
 
     bl_idname = "armature_nodes.skeleton_toggle_rotation"
@@ -772,7 +846,7 @@ class ARMATURE_OT_skeleton_toggle_rotation(Operator):
         return {"FINISHED"}
 
 
-class ARMATURE_OT_skeleton_add_marker(Operator):
+class ARMATURE_NODES_OT_skeleton_add_marker(Operator):
     """Add one marker to this Skeleton node, at the 3D cursor"""
 
     bl_idname = "armature_nodes.skeleton_add_marker"
@@ -804,7 +878,7 @@ class ARMATURE_OT_skeleton_add_marker(Operator):
         return {"FINISHED"}
 
 
-class ARMATURE_OT_skeleton_remove_marker(Operator):
+class ARMATURE_NODES_OT_skeleton_remove_marker(Operator):
     """Remove this marker, its output socket and its viewport handle"""
 
     bl_idname = "armature_nodes.skeleton_remove_marker"
@@ -827,7 +901,7 @@ class ARMATURE_OT_skeleton_remove_marker(Operator):
         return {"FINISHED"}
 
 
-class ARMATURE_OT_skeleton_load_preset(Operator):
+class ARMATURE_NODES_OT_skeleton_load_preset(Operator):
     """Fill this Skeleton node with MediaPipe's 33 pose landmarks.
 
     A 1.8 m T-pose body, ready to drag onto the character. Adds only what is
@@ -857,7 +931,7 @@ class ARMATURE_OT_skeleton_load_preset(Operator):
         return {"FINISHED"}
 
 
-class ARMATURE_OT_skeleton_clear_markers(Operator):
+class ARMATURE_NODES_OT_skeleton_clear_markers(Operator):
     """Delete every marker on this Skeleton node"""
 
     bl_idname = "armature_nodes.skeleton_clear_markers"
@@ -883,14 +957,14 @@ class ARMATURE_OT_skeleton_clear_markers(Operator):
 
 
 classes = (
-    ARMATURE_OT_skeleton_toggle_markers,
-    ARMATURE_OT_skeleton_mirror,
-    ARMATURE_OT_skeleton_front_view,
-    ARMATURE_OT_skeleton_toggle_rotation,
-    ARMATURE_OT_skeleton_add_marker,
-    ARMATURE_OT_skeleton_remove_marker,
-    ARMATURE_OT_skeleton_load_preset,
-    ARMATURE_OT_skeleton_clear_markers,
+    ARMATURE_NODES_OT_skeleton_toggle_markers,
+    ARMATURE_NODES_OT_skeleton_mirror,
+    ARMATURE_NODES_OT_skeleton_front_view,
+    ARMATURE_NODES_OT_skeleton_toggle_rotation,
+    ARMATURE_NODES_OT_skeleton_add_marker,
+    ARMATURE_NODES_OT_skeleton_remove_marker,
+    ARMATURE_NODES_OT_skeleton_load_preset,
+    ARMATURE_NODES_OT_skeleton_clear_markers,
 )
 
 

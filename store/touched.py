@@ -57,7 +57,11 @@ def write(obj, touched):
     if not paths:
         clear(obj)
         return 0
-    obj[KEY] = json.dumps(paths, separators=(",", ":"), sort_keys=True)
+    text = json.dumps(paths, separators=(",", ":"), sort_keys=True)
+    # Only when it changed: writing a property tags the rig for another
+    # depsgraph update, and most builds touch what the last one did.
+    if obj.get(KEY) != text:
+        obj[KEY] = text
     return sum(len(v) for v in paths.values())
 
 
