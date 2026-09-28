@@ -74,6 +74,7 @@ def _convert(record):
                     for c in bone.constraints
                 ],
                 shape=_shape_from_display(bone.display),
+                props=bone.pose.props,
                 pristine=True,
             )
         )
@@ -181,6 +182,11 @@ def overlay(base, bone_defs):
                 tail_radius=recorded.rest.tail_radius,
             ),
             display=_display_from_shape(recorded.display, gb.shape),
+            pose=(
+                recorded.pose
+                if gb.props is None or gb.props == recorded.pose.props
+                else replace(recorded.pose, props=dict(gb.props))
+            ),
             transform=_transform_from_graph(gb),
             constraints=tuple(
                 ConstraintDef(type=c.type, name=c.name, props=dict(c.params))

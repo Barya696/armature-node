@@ -89,7 +89,7 @@ custom properties:
 
 | Property | Holds |
 | --- | --- |
-| `an_rig_record` | the complete rig as JSON: bones, hierarchy, deform flags, collections, colours, display, pose settings, full constraint properties |
+| `an_rig_record` | the complete rig as JSON: bones, hierarchy, deform flags, collections, colours, display, pose settings, switches (number and on/off custom properties), full constraint properties |
 | `an_rig_widgets` | the widget **meshes**, zlib+base64 — so a rig can be rebuilt when its `WGT-*` objects are gone |
 | `an_rig_touched` | which fields the last build wrote |
 
@@ -416,6 +416,25 @@ How the relative moves behave:
 - **IK Constraint** and **Constraint** (copy/limit/track/stretch) — wired into
   the Constraints input of a Bone, Chain or Marker node.
 
+### Rigify
+
+- **Rigify Switch** — sets the rig's own switches from the graph: Rigify's
+  IK / FK, Pole, IK Parent, Pole Parent, IK Stretch and FK Limb Follow (kept
+  on a limb's `*_parent` bone: `upper_arm_parent.L`, `thigh_parent.L`), Neck
+  Follow, Head Follow and Torso Parent (on `torso`) — and any other number or
+  on/off custom property a bone has.
+  - Pick the bone with the ▾ menu, which lists only bones that have
+    switches, or leave **Bone** empty to set a switch on **every** bone that
+    has it: one node turns the poles on for all four limbs.
+  - Tick a switch to set it; unticked, it shows what the rig has. Ticking
+    starts from the rig's value, so nothing jumps. A parent switch is a
+    dropdown of Rigify's own names (None, Root, Torso, Hips…).
+  - Like every node it works over the record: **deleting it puts back** the
+    values the rig was bound with. A switch changed in Rigify's own panel is
+    taken into the node, so the next build keeps it.
+  - A rig bound before switches were recorded shows **Record Switches**,
+    which adds them to its record and changes nothing else.
+
 ### Node groups
 
 The same principle as Blender's own node groups. A group is a node tree of its
@@ -486,7 +505,7 @@ node, which marks the tree dirty, which re-poses the rig.
 | `livelink.py` | Telling the graph's own pose writes from the user's, for the two-way live link |
 | `sockets.py` | Rig (the whole armature, the stream), Constraint, Vector / Rotation / Scale / Transform sockets |
 | `tree.py` | `ArmatureNodeTree` data-block, dirty tracking, debounced live update, graph version |
-| `nodes/` | The node types, one module per Shift+A category (`armature_io`, `bone`, `marker`, `transform`, `shape`, `constraint`); `base.py` and `marker_base.py` hold what they share, `__init__.py` registers them |
+| `nodes/` | The node types, one module per Shift+A category (`armature_io`, `bone`, `marker`, `transform`, `shape`, `constraint`, `rigify`); `base.py` and `marker_base.py` hold what they share, `__init__.py` registers them |
 | `primary_rig.py` | Marker handles and locks, viewport overlay, MediaPipe preset table, marker operators |
 | `handles.py` | The grabbable marker gizmo: hit-testing, move / turn / scale drags, rings and name label |
 | `marker_links.py` | Lines between Marker nodes: the joins, Fusion-style ports, their drawing and drag gizmo |
@@ -495,7 +514,7 @@ node, which marks the tree dirty, which re-poses the rig.
 | `build.py` | A build: evaluate, then Modify (restore → apply → record) or Full Rig |
 | `decompile.py` | Reverse: the two-node stack that targets a rig |
 | `operators.py` | Build, Convert to Armature Nodes, Read From Rig |
-| `ops/` | Bind Rig, Capture, Restore Original, Forget |
+| `ops/` | Bind Rig, Capture, Record Switches, Restore Original, Forget |
 | `ui.py` | Shift+A categories, header buttons, N-panel sidebar |
 | `sync.py` | Editor follows the active armature; the rig and marker handles read back when they move |
 

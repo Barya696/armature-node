@@ -86,11 +86,18 @@ class DisplayDef:
 
 @dataclass(frozen=True)
 class PoseDef:
-    """Pose-bone settings that are rig definition, not animation."""
+    """Pose-bone settings that are rig definition, not animation.
+
+    ``props`` is the bone's custom properties that are switches -- numbers
+    and booleans, such as Rigify's IK/FK, pole and parent settings -- by
+    name. ``None`` means the record was made before they were recorded, which
+    is not the same as a bone that has none.
+    """
 
     rotation_mode: str = "QUATERNION"
     locks: dict = field(default_factory=dict)
     ik: dict = field(default_factory=dict)
+    props: Optional[dict] = None
 
 
 @dataclass(frozen=True)

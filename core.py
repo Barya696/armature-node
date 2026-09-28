@@ -82,6 +82,9 @@ class BoneDef:
     # rather than added to. A zero offset normally means "no request" -- but
     # a channel set to zero means "at rest", and has to reach the rig.
     pose_local_set: tuple = ()
+    # The bone's switches (custom properties) by name, as recorded; None when
+    # the record predates them. A node replaces the dict, never edits it.
+    props: Optional[dict] = None
     # Straight from the rig's record and untouched. Bones are shared down the
     # stream until a node changes one (``editable``), and the build keeps the
     # record's own bone for every bone still pristine at the end.
@@ -501,6 +504,7 @@ def copy_bone(b):
         pose_local_offset=tuple(b.pose_local_offset),
         pose_local_rotation=tuple(b.pose_local_rotation),
         pose_local_set=tuple(b.pose_local_set),
+        props=b.props,
         constraints=[
             ConstraintDef(type=c.type, name=c.name, params=dict(c.params))
             for c in b.constraints

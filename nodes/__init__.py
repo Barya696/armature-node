@@ -16,6 +16,8 @@ is the input, not something the graph has to describe.
   are layered onto.
 * ``shape`` -- CustomShapeNode: assigns a control widget.
 * ``constraint`` -- IKConstraintNode, GenericConstraintNode.
+* ``rigify`` -- RigifySwitchNode: sets the rig's switches (IK/FK, pole,
+  parents, follow).
 
 The group node is not here: it lives in ``groups.py``, with the rest of node
 groups.
@@ -38,6 +40,7 @@ from .bone import BoneNode, ChainNode
 from .constraint import GenericConstraintNode, IKConstraintNode
 from .marker import MarkerNode, SkeletonNode
 from .marker_base import SkeletonMarker, deferred_marker_writes  # noqa: F401
+from .rigify import ARMATURE_NODES_OT_rigify_switch_bone, RigifySwitch, RigifySwitchNode
 from .shape import CustomShapeNode
 from .transform import PositionNode, RotationNode, SnapNode, TransformNode
 
@@ -59,6 +62,9 @@ classes = (
     CustomShapeNode,
     IKConstraintNode,
     GenericConstraintNode,
+    RigifySwitch,
+    RigifySwitchNode,
+    ARMATURE_NODES_OT_rigify_switch_bone,
 )
 
 

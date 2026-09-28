@@ -56,24 +56,7 @@ class ArmatureNodeBase:
         builds a rig that does not exist yet, in which case the bone field
         falls back to plain text entry.
         """
-        tree = self.id_data
-        if tree is None:
-            return None
-        for node in tree.nodes:
-            if node.bl_idname == "ArmatureNodesInputNode":
-                src = getattr(node, "source", None)
-                if src is not None and getattr(src, "type", "") == "ARMATURE":
-                    return src
-        # Inside a node group: the rig the group is used on, when exactly one
-        # uses it. That is still the binding -- found through the group node
-        # -- and it is what makes a node inside a group live with its bone.
-        from ..groups import unique_rig
-
-        # No fallback to the Output's armature_name. The target follows the
-        # BINDING, never the selection or a typed name: a tree that quietly
-        # retargeted itself to whichever armature was active is how a rig
-        # ended up modified by a graph that was never pointed at it.
-        return unique_rig(tree)
+        return bound_rig(self.id_data)
 
     def rig_for_ui(self):
         """The rig to list bone names from, for a dropdown.
@@ -114,6 +97,28 @@ class ArmatureNodeBase:
             row.prop(self, "bone", text="", icon="BONE_DATA")
         if not self.bone:
             layout.label(text="All bones", icon="INFO")
+
+
+def bound_rig(tree):
+    """The rig ``tree`` works on: its Armature Input's source, or -- in a node
+    group -- the rig the group is used on, when exactly one uses it."""
+    if tree is None:
+        return None
+    for node in tree.nodes:
+        if node.bl_idname == "ArmatureNodesInputNode":
+            src = getattr(node, "source", None)
+            if src is not None and getattr(src, "type", "") == "ARMATURE":
+                return src
+    # Inside a node group, that is still the binding -- found through the
+    # group node -- and it is what makes a node inside a group live with its
+    # bone.
+    from ..groups import unique_rig
+
+    # No fallback to the Output's armature_name. The target follows the
+    # BINDING, never the selection or a typed name: a tree that quietly
+    # retargeted itself to whichever armature was active is how a rig ended
+    # up modified by a graph that was never pointed at it.
+    return unique_rig(tree)
 
 
 def bone_select_prop(update=None):

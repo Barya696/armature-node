@@ -74,8 +74,15 @@ def _set_bone_color(bone, data):
 
 
 def apply_pose(pbone, leaf, value, writer):
-    """Write one ``pose.*`` leaf: rotation mode, locks, IK settings."""
+    """Write one ``pose.*`` leaf: rotation mode, locks, IK settings, switches."""
     if pbone is None:
+        return
+    if leaf == "props":
+        written = [writer.set_prop(pbone, key, sub) for key, sub in (value or {}).items()]
+        if any(written):
+            # A custom property set from Python does not tag the rig, and
+            # Rigify's drivers read these: without it they keep the old value.
+            pbone.id_data.update_tag()
         return
     if leaf == "rotation_mode":
         writer.set(pbone, "rotation_mode", value)

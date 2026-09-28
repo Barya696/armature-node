@@ -127,6 +127,15 @@ def test_transform_is_diffable():
     assert diff(target, cleared).bones["root"] == {"transform.location": None}
 
 
+def test_switches_diff_as_one_path():
+    base = make_record(2)
+    bone = base.bones["root"]
+    switched = {**bone.pose.props, "pole_vector": True}
+    changed = with_value(bone, "pose.props", switched)
+    target = base.with_bones({**base.bones, "root": changed})
+    assert diff(base, target).bones["root"] == {"pose.props": switched}
+
+
 def test_constraints_diff_as_a_whole():
     base = make_record(3)
     stripped = with_value(base.bones["bone.001"], "constraints", ())

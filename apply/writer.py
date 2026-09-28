@@ -70,3 +70,16 @@ class Writer:
             return False
         self.writes += 1
         return True
+
+    def set_prop(self, owner, key, value):
+        """Assign the custom property ``owner[key] = value`` when it differs."""
+        current = owner.get(key)
+        if current is not None and type(current) is type(value) and _same(current, value):
+            return False
+        try:
+            owner[key] = value
+        except (TypeError, ValueError) as exc:
+            self.note(f"[{key!r}]: {exc}")
+            return False
+        self.writes += 1
+        return True

@@ -75,6 +75,13 @@ NODE_CATEGORIES = [
             NodeItem("ArmatureNodesGenericConstraintNode"),
         ],
     ),
+    ArmatureNodeCategory(
+        "ARMATURE_NODES_RIGIFY",
+        "Rigify",
+        items=[
+            NodeItem("ArmatureNodesRigifySwitchNode"),
+        ],
+    ),
     # Filled when the menu opens: the groups that exist change as you work.
     ArmatureNodeCategory("ARMATURE_NODES_GROUP", "Group", items=_group_items),
 ]

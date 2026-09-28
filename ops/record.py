@@ -1,4 +1,4 @@
-"""Record operators: Capture, Restore Original, Forget.
+"""Record operators: Capture, Record Switches, Restore Original, Forget.
 
 Thin wrappers. The logic lives in ``capture`` and ``apply.pipeline``; these
 exist so that every capture and every write happens inside one operator
@@ -11,17 +11,22 @@ from that -- it is the exact data loss this architecture was rebuilt to
 prevent, so it is never a silent or automatic action.
 """
 
+from dataclasses import replace
+
 import bpy
 from bpy.types import Operator
+from bpy.props import StringProperty
 
 from .. import capture
 from ..apply import pipeline
+from ..capture.pose_display import capture_props
 from ..store import record as record_store
 from ..store import touched as touched_store
 from ..store import widgets_lib
 
 __all__ = [
     "ARMATURE_NODES_OT_capture_record",
+    "ARMATURE_NODES_OT_record_switches",
     "ARMATURE_NODES_OT_restore_original",
     "ARMATURE_NODES_OT_forget_record",
     "classes",
@@ -33,6 +38,14 @@ def _bound_armature(context):
     if obj is None or obj.type != "ARMATURE":
         return None
     return obj
+
+
+def _sync_switch_nodes():
+    """The record changed: Rigify Switch nodes list what it has now."""
+    for tree in bpy.data.node_groups:
+        for node in getattr(tree, "nodes", ()):
+            if hasattr(node, "sync_switches"):
+                node.sync_switches()
 
 
 class ARMATURE_NODES_OT_capture_record(Operator):
@@ -66,9 +79,41 @@ class ARMATURE_NODES_OT_capture_record(Operator):
         # would make the next build "restore" paths to values that no longer
         # mean anything.
         touched_store.clear(obj)
+        _sync_switch_nodes()
         self.report(
             {"INFO"}, f"Recorded '{obj.name}': {len(rec.bones)} bones, {len(lib)} widgets"
         )
+        return {"FINISHED"}
+
+
+class ARMATURE_NODES_OT_record_switches(Operator):
+    """Add the rig's switches (Rigify's IK/FK, pole, parents...) to a record
+    made before switches were recorded. Nothing else in the record changes"""
+
+    bl_idname = "armature_nodes.record_switches"
+    bl_label = "Record Switches"
+    bl_options = {"REGISTER", "UNDO"}
+
+    rig: StringProperty(name="Rig", default="", options={"HIDDEN", "SKIP_SAVE"})
+
+    def execute(self, context):
+        obj = bpy.data.objects.get(self.rig) if self.rig else _bound_armature(context)
+        record = record_store.read(obj) if obj is not None else None
+        if record is None:
+            self.report({"ERROR"}, "Bind the rig first")
+            return {"CANCELLED"}
+        # Unlike a full capture this cannot record the graph's own work: no
+        # build writes a switch the record lacks, so what the rig has is its own.
+        bones = {
+            name: bone
+            if bone.pose.props is not None
+            else replace(bone, pose=replace(bone.pose, props=capture_props(obj.pose.bones.get(name))))
+            for name, bone in record.bones.items()
+        }
+        record_store.write(obj, record.with_bones(bones))
+        _sync_switch_nodes()
+        count = sum(1 for bone in bones.values() if bone.pose.props)
+        self.report({"INFO"}, f"Recorded the switches of {count} bones on '{obj.name}'")
         return {"FINISHED"}
 
 
@@ -123,6 +168,7 @@ class ARMATURE_NODES_OT_forget_record(Operator):
 
 classes = (
     ARMATURE_NODES_OT_capture_record,
+    ARMATURE_NODES_OT_record_switches,
     ARMATURE_NODES_OT_restore_original,
     ARMATURE_NODES_OT_forget_record,
 )

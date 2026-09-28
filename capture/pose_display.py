@@ -6,12 +6,18 @@ have been deleted can still be rebuilt exactly.
 
 The pose *transform* is deliberately not captured. Locks, rotation mode and IK
 limits describe how a control may be manipulated, so they are rig definition;
-where the control currently sits is animation, and the graph owns it.
+where the control currently sits is animation, and the graph owns it. So are
+the bone's switches -- Rigify's IK/FK, pole and parent settings -- which the
+Rigify Switch node sets and a build restores.
 """
 
 from ..model.types import DisplayDef, PoseDef
 
-__all__ = ["capture_display", "capture_pose"]
+__all__ = ["capture_display", "capture_pose", "capture_props"]
+
+#: The custom-property types that are switches. Arrays, strings and groups are
+#: data a rig keeps for itself, not settings a node would set.
+_SWITCH_TYPES = (bool, int, float)
 
 
 def bone_color(bone):
@@ -71,4 +77,18 @@ def capture_pose(pose_bone):
         ik[f"use_ik_limit_{axis}"] = bool(getattr(pose_bone, f"use_ik_limit_{axis}"))
         ik[f"ik_min_{axis}"] = float(getattr(pose_bone, f"ik_min_{axis}"))
         ik[f"ik_max_{axis}"] = float(getattr(pose_bone, f"ik_max_{axis}"))
-    return PoseDef(rotation_mode=pose_bone.rotation_mode, locks=locks, ik=ik)
+    return PoseDef(
+        rotation_mode=pose_bone.rotation_mode, locks=locks, ik=ik, props=capture_props(pose_bone)
+    )
+
+
+def capture_props(pose_bone):
+    """The bone's switches: its custom properties that are numbers or booleans."""
+    if pose_bone is None:
+        return {}
+    out = {}
+    for key in pose_bone.keys():
+        value = pose_bone[key]
+        if not key.startswith("_") and isinstance(value, _SWITCH_TYPES):
+            out[key] = value
+    return out

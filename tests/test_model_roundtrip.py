@@ -52,6 +52,26 @@ def test_transform_survives_roundtrip():
     assert back.bones["root"].transform.rotation is None
 
 
+def test_switches_survive_roundtrip_with_their_types():
+    props = from_json(to_json(make_record(2))).bones["root"].pose.props
+    assert props == {"IK_FK": 0.25, "pole_vector": False, "IK_parent": 1}
+    assert type(props["IK_FK"]) is float
+    assert type(props["pole_vector"]) is bool
+    assert type(props["IK_parent"]) is int
+
+
+def test_a_record_from_before_switches_reads_as_not_recorded():
+    """Not as "no switches": the node must not write what it cannot restore."""
+    import json
+
+    data = json.loads(to_json(make_record(2)))
+    for bone in data["bones"].values():
+        del bone["pose"]["props"]
+    back = from_json(json.dumps(data))
+    assert all(bone.pose.props is None for bone in back.bones.values())
+    assert from_json(to_json(back)) == back
+
+
 def test_empty_record_roundtrips():
     r = RigRecord()
     assert from_json(to_json(r)) == r

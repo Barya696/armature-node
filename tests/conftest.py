@@ -75,6 +75,7 @@ def make_bone(name, parent=None, shape="", deform=True, collections=(), constrai
             rotation_mode="XYZ",
             locks={"location": [True, False, True]},
             ik={"lock_ik_x": True, "ik_stiffness_x": 0.5},
+            props={"IK_FK": 0.25, "pole_vector": False, "IK_parent": 1},
         ),
         constraints=tuple(constraints),
     )

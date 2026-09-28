@@ -96,6 +96,7 @@ def _bone_to_dict(b):
             "rotation_mode": b.pose.rotation_mode,
             "locks": dict(b.pose.locks),
             "ik": dict(b.pose.ik),
+            "props": dict(b.pose.props) if b.pose.props is not None else None,
         },
         "transform": {
             key: (list(getattr(b.transform, key)) if getattr(b.transform, key) else None)
@@ -191,6 +192,9 @@ def _bone_from_dict(name, d):
             rotation_mode=p.get("rotation_mode", "QUATERNION"),
             locks=dict(p.get("locks") or {}),
             ik=dict(p.get("ik") or {}),
+            # Absent in a record made before switches were recorded: None,
+            # "not recorded", so nothing can write a value it cannot restore.
+            props=dict(p["props"]) if p.get("props") is not None else None,
         ),
         transform=_transform_from_dict(d.get("transform")),
         constraints=tuple(
