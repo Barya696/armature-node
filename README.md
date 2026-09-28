@@ -510,7 +510,9 @@ What runs, and when — the numbers are from a 706-bone Rigify rig with 30 nodes
 - **Posing a bone or dragging a marker** reads the rig back into the live
   nodes, from `depsgraph_update_post` — only when the update moved a bound
   rig or a marker handle. Anything else (a node dragged in the editor, a
-  material changed) costs one pass over the update list.
+  material changed) costs one pass over the update list. A dragged handle
+  rebuilds on the next frame, not after the debounce, so the rig keeps up
+  with the mouse: about 20 ms a frame for a control, 45 ms for the root.
 - **Redrawing** the viewport or node editor reads cached results: which
   markers are displayed, the node links, the record. They are rebuilt when a
   graph changes (`tree.graph_version`), and dropped on undo and file load.

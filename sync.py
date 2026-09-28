@@ -311,8 +311,9 @@ def request_visibility_refresh():
 
 
 def read_marker_drags(handle_trees=None):
-    """Read dragged marker handles back into their nodes."""
-    from .tree import is_updating
+    """Read dragged marker handles back into their nodes, and have the rig
+    follow on the next tick."""
+    from .tree import apply_soon, is_updating
 
     if is_updating():
         return  # a rebuild is mid-flight; matrices are not trustworthy
@@ -327,6 +328,7 @@ def read_marker_drags(handle_trees=None):
             log.warning("Marker sync failed on '%s': %s", node.name, exc)
     if changed:
         _redraw_editors()
+        apply_soon()
 
 
 def sync_marker_handles():

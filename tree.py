@@ -54,6 +54,16 @@ def _schedule(delay=_DEFAULT_DELAY):
     bpy.app.timers.register(_flush_pending, first_interval=delay)
 
 
+def apply_soon():
+    """Apply the dirty trees on the next tick, without the debounce.
+
+    For a marker handle being dragged: the debounce restarts on every mouse
+    move, so the rig would wait for the mouse to stop instead of following.
+    """
+    if _pending:
+        _schedule(0.0)
+
+
 def queue_object_removal(name):
     """Remove an armature object once the current operation has finished.
 

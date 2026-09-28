@@ -119,6 +119,24 @@ def test_dragging_a_handle_in_pose_mode_moves_the_bone():
     live._assert_close(live._head(obj), before + Vector((1.0, 0.0, 0.0)), "bone")
 
 
+def test_a_drag_rebuilds_on_the_next_tick():
+    """Not after the edit debounce: it restarts on every mouse move, so the
+    rig would stay behind the handle until the mouse stopped."""
+    from armature_nodes import tree as tree_module
+    from armature_nodes.handles import MOVE
+
+    _obj, _tree, _node, _mn, _marker, handle = _marker_on("ArmatureNodesPositionNode")
+    delays, schedule = [], tree_module._schedule
+    tree_module._schedule = delays.append
+    try:
+        start = VIEW.to_screen(handle.location)
+        _drag(handle, MOVE, start, start + Vector((100.0, 0.0)))
+        live._full_tick()
+    finally:
+        tree_module._schedule = schedule
+    assert delays and delays[-1] == 0.0, f"scheduled with {delays}"
+
+
 def test_x_locks_the_move_and_shift_is_fine():
     from armature_nodes.handles import Drag, MOVE
 
