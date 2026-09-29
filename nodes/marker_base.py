@@ -9,7 +9,7 @@ import contextlib
 import logging
 
 import bpy
-from bpy.props import BoolProperty, FloatProperty, FloatVectorProperty, StringProperty
+from bpy.props import BoolProperty, EnumProperty, FloatProperty, FloatVectorProperty, StringProperty
 from mathutils import Vector
 
 from ..sockets import VectorSocket
@@ -169,6 +169,26 @@ class SkeletonMarker(bpy.types.PropertyGroup):
         default=(0.95, 0.45, 0.75),
         subtype="COLOR",
         update=lambda self, context: redraw_viewports(),
+    )
+    # What a Wrap Markers node does with this marker (nodes/wrap.py).
+    wrap_role: EnumProperty(
+        name="Wrap",
+        description="What a Wrap Markers node does with this marker",
+        items=(
+            ("INSIDE", "Inside", "A joint: drawn into the middle of the limb it sits in"),
+            ("SURFACE", "Surface", "A landmark: drawn onto the skin"),
+            ("FREE", "Free", "Carried along by the skeleton, never drawn to the mesh"),
+            ("FIXED", "Fixed", "Never moved by a wrap"),
+        ),
+        default="INSIDE",
+    )
+    wrap_pair: BoolProperty(name="Paired", default=False, options={"HIDDEN"})
+    wrap_target: FloatVectorProperty(
+        name="Pair",
+        description="Where the pair puts this marker, on or in the mesh",
+        size=3,
+        subtype="TRANSLATION",
+        options={"HIDDEN"},
     )
 
     def set_position(self, value):

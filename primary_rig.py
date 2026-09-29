@@ -11,10 +11,10 @@ shoulders, elbows, wrists, pinky / index / thumb, hips, knees, ankles, heels,
 foot index) is a **preset**, loaded into a new Skeleton node so it starts with
 a usable body. Nothing here depends on it being complete.
 
-Scope: **markers only**. There is no mesh analysis, no auto placement and no
-snapping -- markers are placed by hand (dragged in the viewport or typed on
-the node). Turning a marker into rig is the Custom Shape node's job: wire a
-marker into one and it poses that control.
+Scope: **markers only**. Markers are placed by hand here (dragged in the
+viewport or typed on the node); fitting them onto a mesh is the Wrap Markers
+node's job (``nodes/wrap.py``). Turning a marker into rig is the job of the
+node it is wired into.
 """
 
 import bpy
@@ -665,6 +665,9 @@ def _draw_skeleton_overlay():
                 coords += [p0, p1]
                 colors += [c0, c1]
             draw_smooth_lines(bpy.context.region, coords, colors, 3.0 * _ui_scale())
+        from .nodes.wrap import draw_pairs
+
+        draw_pairs(nodes, nodes[0].effective_height())
 
         for node in nodes:
             pos = {m.key: tuple(node.marker_value(m, "position")) for m in node.markers if m.key}
@@ -940,7 +943,7 @@ class ARMATURE_NODES_OT_skeleton_clear_markers(Operator):
 
     @classmethod
     def poll(cls, context):
-        node = _node(context, getattr(self, "_needs", None))
+        node = _node(context, getattr(cls, "_needs", None))
         return node is not None and len(node.markers) > 0
 
     def invoke(self, context, event):

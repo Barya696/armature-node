@@ -20,9 +20,21 @@ class ArmatureNodeCategory(NodeCategory):
 
 
 def _group_items(context):
+    from nodeitems_utils import NodeItemCustom
+
     from .groups import add_menu_items
 
-    return add_menu_items(context) if context is not None else []
+    if context is None:
+        return []
+    items = add_menu_items(context)
+    edit_tree = getattr(context.space_data, "edit_tree", None)
+    if edit_tree is None or not edit_tree.get("an_preset"):  # never inside itself
+        items.insert(0, NodeItemCustom(draw=_draw_human_skeleton_item))
+    return items
+
+
+def _draw_human_skeleton_item(_item, layout, _context):
+    layout.operator("armature_nodes.add_human_skeleton", icon="OUTLINER_OB_ARMATURE")
 
 
 NODE_CATEGORIES = [
@@ -40,6 +52,7 @@ NODE_CATEGORIES = [
         items=[
             NodeItem("ArmatureNodesMarkerNode"),
             NodeItem("ArmatureNodesSkeletonNode"),
+            NodeItem("ArmatureNodesWrapNode"),
         ],
     ),
     ArmatureNodeCategory(
@@ -187,7 +200,43 @@ class ARMATURE_NODES_PT_view3d_tool(Panel):
                 box.label(text=tree.last_error, icon="ERROR")
 
 
-classes = (ARMATURE_NODES_PT_sidebar, ARMATURE_NODES_PT_view3d_tool)
+class ARMATURE_NODES_PT_wrap(Panel):
+    """Fit a marker skeleton onto a character, where the character is: the
+    Wrap Markers node's controls in the 3D Viewport sidebar, with a way to
+    get a skeleton to fit when the rig has none."""
+
+    bl_label = "Wrap Markers"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "Wrap"
+
+    @classmethod
+    def poll(cls, context):
+        from .nodes.wrap import wrap_node_for
+
+        return _active_armature(context) is not None or wrap_node_for(context) is not None
+
+    def draw(self, context):
+        from .nodes.wrap import wrap_node_for
+
+        layout = self.layout
+        wrap = wrap_node_for(context)
+        if wrap is not None:
+            layout.label(text=f"Markers of {wrap.id_data.name}", icon="OUTLINER_OB_ARMATURE")
+            wrap.draw_buttons_ext(context, layout)
+            return
+        tree = getattr(_active_armature(context), "armature_nodes_tree", None)
+        if tree is None:
+            layout.label(text="Turn the rig into Armature Nodes first", icon="INFO")
+            _draw_convert_button(layout, context)
+        elif any(hasattr(n, "markers") for n in tree.nodes):
+            layout.operator("armature_nodes.wrap_add", icon="MOD_SHRINKWRAP")
+        else:
+            layout.label(text="No markers to fit yet", icon="INFO")
+            layout.operator("armature_nodes.add_human_skeleton", text="Add Human Skeleton", icon="OUTLINER_OB_ARMATURE")
+
+
+classes = (ARMATURE_NODES_PT_sidebar, ARMATURE_NODES_PT_view3d_tool, ARMATURE_NODES_PT_wrap)
 
 
 def register():

@@ -11,6 +11,9 @@ is the input, not something the graph has to describe.
 * ``bone`` -- BoneNode poses one bone of the rig; ChainNode generates new ones.
 * ``marker`` -- MarkerNode (one draggable handle, live with the bone its wire
   reaches), SkeletonNode (a bundle of markers, one output each).
+* ``wrap`` -- WrapMarkersNode: fits the tree's markers onto a mesh, as the
+  wrap add-on fits a template (pairs, Snap, Attract, Stick). Also Marker in
+  Shift+A.
 * ``transform`` -- PositionNode, RotationNode, TransformNode, SnapNode: pose
   modifiers. They never touch rest geometry, so they cannot deform a rig they
   are layered onto.
@@ -43,6 +46,7 @@ from .marker_base import SkeletonMarker, deferred_marker_writes  # noqa: F401
 from .rigify import ARMATURE_NODES_OT_rigify_switch_bone, RigifySwitch, RigifySwitchNode
 from .shape import CustomShapeNode
 from .transform import PositionNode, RotationNode, SnapNode, TransformNode
+from .wrap import classes as wrap_classes
 
 log = logging.getLogger(__name__)
 
@@ -65,6 +69,7 @@ classes = (
     RigifySwitch,
     RigifySwitchNode,
     ARMATURE_NODES_OT_rigify_switch_bone,
+    *wrap_classes,
 )
 
 
@@ -90,6 +95,8 @@ _NO_REBUILD_PROPS = {
     "parent_seen",
     "uid",  # what a marker's lines to other markers attach to
     "layout_version",  # the Transform node's one-time migration
+    "wrap_stage",  # the Wrap Markers node's bookkeeping
+    "wrap_original",
 }
 
 

@@ -27,6 +27,7 @@ _MODULES = (
     "tree",
     "nodes",
     "groups",
+    "human_skeleton",
     "operators",
     "primary_rig",
     "handles",

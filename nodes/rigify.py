@@ -168,6 +168,18 @@ def _on_bone_changed(self, context):
 _recorded = {}
 
 
+def _build_due(tree, _seen=None):
+    """A build of ``tree`` is waiting -- or, for a group, of a tree using it:
+    a group is never dirty itself, the trees running it are."""
+    from ..groups import group_users
+
+    seen = set() if _seen is None else _seen
+    if tree is None or tree.name in seen:
+        return False
+    seen.add(tree.name)
+    return bool(getattr(tree, "is_dirty", False)) or any(_build_due(u, seen) for u in group_users(tree))
+
+
 class RigifySwitchNode(ModifierNodeBase, Node):
     """Rigify's switches -- IK/FK, pole, parents, follow -- set from the graph.
 
@@ -282,9 +294,8 @@ class RigifySwitchNode(ModifierNodeBase, Node):
         from ..tree import suspend_live_update
 
         self.sync_switches()
-        tree = self.id_data
-        if tree is None or tree.is_dirty:
-            return False  # a build is due: the rig has not caught up with the node
+        if _build_due(self.id_data):
+            return False  # the rig has not caught up with the node yet
         changed = False
         for item in self.switches:
             if not item.use:

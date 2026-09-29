@@ -298,6 +298,75 @@ own **Handles** toggle still wins, for hiding one marker without unwiring it.
   wire it in: the landmarks are a layout to drag onto a character, and the
   bones go to them. A landmark does follow when you grab the bone it drives.
 
+- **Wrap Markers** — fits the tree's markers onto a mesh, the way the wrap
+  add-on fits a template onto a scan: point pairs, then **Snap**,
+  **Attract** and **Stick**. The markers are the skeleton — its bones are
+  the lines the viewport draws between them (a marker and its parent,
+  joined markers, MediaPipe's bones) — and the mesh is the target. The node
+  has no sockets: it works on every marker in its tree.
+  1. Choose the **mesh**, or select it: a node without one takes the
+     selected mesh.
+  2. **Auto** pairs, with no clicks, the markers it knows by name — the
+     Human Skeleton's (below): Pelvis, Chest, Head, Clavicles, Hands, Feet
+     — at their places on a character standing up and facing -Y, found from
+     human proportions and, for the hands, the tips of the arms.
+     **Pick Pairs**: click a marker's glow, then where it goes on the mesh,
+     then the next. A joint goes *into* the mesh, halfway through it under
+     the cursor; a landmark onto the skin. Right-click drops the picked
+     marker and **X** forgets its pair; **Esc**, or right-click with none
+     picked, ends. With **Symmetric** on, the
+     partner (Hand.R for Hand.L) is paired with the mirror image across the
+     mesh's own middle, its local X = 0, wherever the mesh stands.
+  3. **Symmetrize** makes the skeleton symmetric (each marker averaged with
+     its partner's mirror image, one without a side put on the middle
+     line) and gives every pair its partner.
+  4. **Snap** pulls the paired markers onto their places and the skeleton
+     follows the way a skeleton does: every bone keeps its length, a
+     marker where three or more bones meet (a chest, a pelvis) turns as one
+     solid piece, and the joints between bend. Hands paired into an A-pose
+     swing the arms down at the shoulders instead of dragging the chest;
+     a smaller character shares its difference out along the bones; one
+     pair carries its whole skeleton. A marker no pair reaches (no bone to
+     it) moves by the pairs' average. Snap always starts from the markers
+     as they were before the first step, so it depends on the pairs alone.
+  5. **Attract** draws each marker toward its place on the mesh, over
+     passes whose reach shrinks to the distance beside the button, while
+     the bones keep the skeleton in one piece. **Stick** does the same,
+     harder, and lands every marker within its distance exactly on its
+     place. Distances are a share of the skeleton's height.
+
+  **Fit to Mesh** is all of it in one click: Auto when nothing is paired
+  yet, then Snap, Attract and Stick. The same controls are in the 3D
+  Viewport sidebar's **Wrap** tab, for the selected rig: there, a rig with
+  no markers yet gets **Add Human Skeleton**, and one with markers but no
+  Wrap Markers node gets **Wrap These Markers** (which also makes markers
+  named Elbow or Knee Free, as the Human Skeleton has them).
+
+  Each marker's **Wrap** role, in the sidebar (N › Node), says where its
+  place is: **Inside**, the default, for a joint — the middle of the limb
+  it sits in; **Surface** for a landmark — the skin; **Free** — carried by
+  the skeleton, never drawn to the mesh (a pole target); **Fixed** — never
+  moved. A pair holds through every step, and is drawn as a line from the
+  marker to its place (the eye toggle hides them).
+
+  A step runs in the background: its passes stream into the markers, so
+  the skeleton glides onto the mesh and the rig follows live. **Esc** stops
+  it and puts the markers back. Each step is one undo step, and
+  **Original** puts the markers back where they were before the first. A
+  marker moves the way a drag moves it — a child against its parent, a face
+  or finger landmark with its anchor; one that is only a readout of its
+  bone, or an offset from rest, stays where it is.
+- **Human Skeleton** (Shift+A › Group) — a ready-made group: thirteen
+  markers — Pelvis, Chest, Head, Clavicles, Elbows, Hands, Knees, Feet —
+  each driving the Rigify control that does that job through a Transform
+  node (torso, chest, head, shoulder, the IK hands and feet, the elbow and
+  knee pole targets), parented like the bones, the thighs drawn as lines. A
+  Rigify Switch turns the poles on and a Wrap Markers node comes with it.
+  The group is made the first time it is added. Wired into a Rigify rig's
+  tree, every marker takes its control's place, so nothing moves until you
+  fit it to a character: select the rig and the character, **Wrap** tab,
+  **Fit to Mesh**.
+
 ### Bone
 
 - **Bone** — **one** bone from the rig, posed. Pick any bone (DEF, MCH, ORG or
@@ -451,8 +520,9 @@ through a **group node**:
   Output** takes its outputs. Drag a wire into their empty socket to add one;
   rename, reorder or remove them in the sidebar's **Group** tab (*Group
   Sockets*), as in any Blender node group.
-- **Shift+A > Group** adds Group Input / Output (inside a group) and any
-  existing group — except one that would end up inside itself.
+- **Shift+A > Group** adds Group Input / Output (inside a group), the
+  ready-made **Human Skeleton** (see *Marker*), and any existing group —
+  except one that would end up inside itself.
 - One group can be used by any number of group nodes, on any rig. **Edit it
   once and every one of them changes**, and every rig using it rebuilds.
 - Values cross the edge the way wires do: a marker outside wired into a group
@@ -505,8 +575,10 @@ node, which marks the tree dirty, which re-poses the rig.
 | `livelink.py` | Telling the graph's own pose writes from the user's, for the two-way live link |
 | `sockets.py` | Rig (the whole armature, the stream), Constraint, Vector / Rotation / Scale / Transform sockets |
 | `tree.py` | `ArmatureNodeTree` data-block, dirty tracking, debounced live update, graph version |
-| `nodes/` | The node types, one module per Shift+A category (`armature_io`, `bone`, `marker`, `transform`, `shape`, `constraint`, `rigify`); `base.py` and `marker_base.py` hold what they share, `__init__.py` registers them |
+| `nodes/` | The node types, one module per Shift+A category (`armature_io`, `bone`, `marker`, `transform`, `shape`, `constraint`, `rigify`, and `wrap`, the Wrap Markers node, listed under Marker); `base.py` and `marker_base.py` hold what they share, `__init__.py` registers them |
 | `primary_rig.py` | Marker handles and locks, viewport overlay, MediaPipe preset table, marker operators |
+| `wrap_solver.py` | The Wrap Markers node's maths: Snap, Attract and Stick over a marker skeleton. numpy, no `bpy` |
+| `human_skeleton.py` | The Human Skeleton group, made on first use, and where its markers go on a character (Auto) |
 | `handles.py` | The grabbable marker gizmo: hit-testing, move / turn / scale drags, rings and name label |
 | `marker_links.py` | Lines between Marker nodes: the joins, Fusion-style ports, their drawing and drag gizmo |
 | `groups.py` | Node groups: the group node, Make Group / Ungroup / Tab, group sockets kept in step, Shift+A > Group |
@@ -549,6 +621,7 @@ python tests/run_pure.py
 ```
 
 The Blender suite takes one module by name: `... run.py -- test_groups`.
+The pure suite needs numpy for the wrap solver's tests; Blender ships it.
 A new node goes in the `nodes/` module of its Shift+A category, and into
 `classes` in `nodes/__init__.py`.
 Warnings go to the system console through the `armature_nodes` logger.

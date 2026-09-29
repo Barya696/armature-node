@@ -706,6 +706,8 @@ def add_menu_items(context):
     for group in sorted(group_trees(), key=lambda t: t.name.lower()):
         if edit_tree is not None and uses_tree(group, edit_tree):
             continue
+        if group.get("an_preset"):
+            continue  # listed as the preset that makes it (``ui``)
         items.append(
             NodeItem(
                 GROUP_NODE,
