@@ -1,4 +1,4 @@
-"""The Wrap Markers node: pairs, Snap, Attract, Stick, symmetry and Original,
+"""The Wrap Markers node: pairs, Snap, Attract, Stick, symmetry and Preview,
 on meshes whose middle is known -- upright cylinders, a limb or two."""
 
 import math
@@ -190,6 +190,8 @@ def test_symmetric_pairs_mirror_across_the_middle_of_the_mesh():
 
     unpair(wrap, (left.name, left.markers[0].key))
     assert not left.markers[0].wrap_pair and not right.markers[0].wrap_pair, "forget one, forget both"
+    wrap.symmetric = False  # the mirror toggle off: the marker alone
+    assert _pair(wrap, left, 1.0, x=2.3) == 1 and not right.markers[0].wrap_pair
 
 
 def test_a_middle_marker_stays_on_the_middle_of_a_mesh_imported_at_a_hundredth():
@@ -269,17 +271,80 @@ def test_symmetrize_mirrors_the_skeleton_and_its_pairs():
     live._assert_close(right.markers[0].wrap_target, (-0.4, 0.0, 1.4), "the mirrored pair")
 
 
-def test_original_puts_the_markers_back():
+def test_original_and_wrapped_show_the_skeleton_before_and_after_the_fit():
+    """The switch at the bottom of the node. Each pose keeps what was done
+    to it while it showed."""
+    tree = _tree()
+    wrap = _wrap(tree, _limbs())
+    hip, knee, ankle = _chain(tree)
+    chain = (hip, knee, ankle)
+    wrap.preview = "WRAPPED"
+    assert wrap.preview == "ORIGINAL", "nothing fitted yet, nothing to show"
+    _pair(wrap, hip, 1.9)
+    _run(wrap, "SNAP")
+    _run(wrap, "STICK")
+    assert wrap.preview == "WRAPPED"
+    del wrap["wrap_preview"]  # a node saved before the switch: its kept original means a fit shows
+    assert wrap.preview == "WRAPPED"
+    knee.markers[0].set_position(knee.markers[0].position + Vector((0.0, 0.0, 0.1)))  # touched up
+    fitted = [_at(n) for n in chain]
+    wrap.preview = "ORIGINAL"
+    for node, want in zip(chain, ((0.5, 0.2, 1.8), (0.5, 0.2, 1.0), (0.5, 0.2, 0.2))):
+        live._assert_close(_at(node), want, f"{node.name}, original")
+    wrap.preview = "ORIGINAL"  # again: nothing to keep from the other
+    wrap.preview = "WRAPPED"
+    for node, want in zip(chain, fitted):
+        live._assert_close(_at(node), want, f"{node.name}, wrapped as touched up")
+
+
+def test_a_fit_from_the_original_fits_the_skeleton_as_it_is_now():
     tree = _tree()
     wrap = _wrap(tree, _limbs())
     hip, knee, ankle = _chain(tree)
     _pair(wrap, hip, 1.9)
     _run(wrap, "SNAP")
-    _run(wrap, "STICK")
-    assert bpy.ops.armature_nodes.wrap_original(tree=tree.name, node=wrap.name) == {"FINISHED"}
-    for node, want in ((hip, (0.5, 0.2, 1.8)), (knee, (0.5, 0.2, 1.0)), (ankle, (0.5, 0.2, 0.2))):
-        live._assert_close(_at(node), want, node.name)
-    assert wrap.wrap_stage == 0 and not wrap.wrap_original
+    wrap.preview = "ORIGINAL"
+    ankle.markers[0].set_position(ankle.markers[0].position + Vector((0.0, 0.0, -0.1)))  # a longer shin
+    shin = (_at(knee) - _at(ankle)).length
+    assert abs(shin - 0.9) < 1e-4, shin
+    _run(wrap, "SNAP")
+    assert abs((_at(knee) - _at(ankle)).length - shin) < 1e-3, "the fit kept the shin it was shown"
+
+
+def test_undo_in_pick_pairs_takes_back_the_last_pair():
+    """Ctrl Z while picking, or the button beside Pick Pairs: a pair made
+    or forgotten goes back to what it was, its marker picked again to put
+    it right."""
+    from armature_nodes.nodes import wrap as module
+
+    tree = _tree()
+    wrap = _wrap(tree, _limbs())
+    hip, knee, _ankle = _chain(tree)
+    mesh = module.MeshTarget(wrap.target, bpy.context.evaluated_depsgraph_get())
+    ident = (hip.name, hip.markers[0].key)
+    front = Vector((0.0, 1.0, 0.0))
+    module._picking = {"tree": tree.name, "chosen": None, "spots": [], "undo": [], "cursor": None}
+    try:
+        for z in (1.9, 1.7):  # paired, then again elsewhere
+            module._picking["chosen"] = ident
+            assert module.set_pair(wrap, mesh, (Vector((0.0, -5.0, z)), front))
+        knee.markers[0].wrap_pair = True  # paired since, not by a pick: a Fit's own pairs
+        module._picking["chosen"] = ident
+        assert not module.set_pair(wrap, mesh, (Vector((3.0, -5.0, 1.0)), front)), "a miss"
+        assert len(module._picking["undo"]) == 2 and module._picking["chosen"] == ident
+        module.set_pair(wrap)  # X: forgotten
+        assert not hip.markers[0].wrap_pair and module._picking["chosen"] is None
+        assert module.undo_pick(wrap)
+        assert hip.markers[0].wrap_pair and module._picking["chosen"] == ident, "back, and picked again"
+        live._assert_close(hip.markers[0].wrap_target, (0.0, 0.0, 1.7), "the last pair")
+        module.undo_pick(wrap)
+        live._assert_close(hip.markers[0].wrap_target, (0.0, 0.0, 1.9), "the first pair")
+        module.undo_pick(wrap)
+        assert not hip.markers[0].wrap_pair and not hip.markers[0].wrap_picked
+        assert not module.undo_pick(wrap), "nothing left to undo"
+        assert knee.markers[0].wrap_pair, "a pair no pick made is left alone"
+    finally:
+        module._picking = None
 
 
 def test_snap_starts_from_the_original_every_time():

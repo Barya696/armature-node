@@ -228,8 +228,9 @@ class ARMATURE_NODES_OT_add_human_skeleton(Operator):
         return self.execute(context)
 
     def execute(self, context):
-        obj = context.active_object
-        tree = getattr(obj, "armature_nodes_tree", None) if obj is not None and obj.type == "ARMATURE" else None
+        from .nodes.wrap import selected_rig_tree
+
+        tree = selected_rig_tree(context)
         if tree is None:
             self.report({"WARNING"}, "Select a rig with an Armature Nodes tree first")
             return {"CANCELLED"}

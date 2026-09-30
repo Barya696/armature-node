@@ -97,6 +97,8 @@ _NO_REBUILD_PROPS = {
     "layout_version",  # the Transform node's one-time migration
     "wrap_stage",  # the Wrap Markers node's bookkeeping
     "wrap_original",
+    "wrap_wrapped",
+    "preview",  # moves the markers itself
 }
 
 

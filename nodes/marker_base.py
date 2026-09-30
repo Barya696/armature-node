@@ -183,6 +183,8 @@ class SkeletonMarker(bpy.types.PropertyGroup):
         default="INSIDE",
     )
     wrap_pair: BoolProperty(name="Paired", default=False, options={"HIDDEN"})
+    # Picked by hand: kept by Fit, which redoes the pairs it made itself.
+    wrap_picked: BoolProperty(name="Picked", default=False, options={"HIDDEN"})
     wrap_target: FloatVectorProperty(
         name="Pair",
         description="Where the pair puts this marker, on or in the mesh",

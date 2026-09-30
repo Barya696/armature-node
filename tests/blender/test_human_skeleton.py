@@ -190,6 +190,54 @@ def test_fit_to_mesh_pairs_and_wraps_in_one_go():
     assert elbow.x > joints["shoulder.L"].x and elbow.z < joints["shoulder.L"].z, "the pole target was not carried down the arm"
 
 
+def test_fit_keeps_your_picks_and_redoes_its_own_pairs():
+    """With two buttons there is nothing to clear: Fit keeps what you picked
+    and finds the rest afresh every time -- a character moved since follows."""
+    from armature_nodes.human_skeleton import human_skeleton_group
+    from armature_nodes.nodes.wrap import MeshTarget, pair
+
+    fixtures.ensure_registered()
+    body, joints = _mannequin()
+    group = human_skeleton_group()
+    markers, wrap = _group_parts(group)
+    wrap.target = body
+    elbow = joints["elbow.L"]
+    mesh = MeshTarget(body, bpy.context.evaluated_depsgraph_get())
+    assert pair(wrap, (markers["Hand.L"].name, "marker"), mesh, Vector((elbow.x, -5.0, elbow.z)), Vector((0, 1, 0)))
+    picked = Vector(markers["Hand.L"].markers[0].wrap_target)
+    assert bpy.ops.armature_nodes.wrap_run(step="FIT", tree=group.name, node=wrap.name) == {"FINISHED"}
+    live._assert_close(_at(markers["Hand.L"]), picked, "the picked hand")
+    live._assert_close(_at(markers["Hand.R"]), picked * Vector((-1.0, 1.0, 1.0)), "its mirror, picked with it")
+    pelvis = _at(markers["Pelvis"])
+    body.location.x += 0.5
+    bpy.context.view_layer.update()
+    assert bpy.ops.armature_nodes.wrap_run(step="FIT", tree=group.name, node=wrap.name) == {"FINISHED"}
+    live._assert_close(_at(markers["Pelvis"]), pelvis + Vector((0.5, 0.0, 0.0)), "the pelvis, after the character moved")
+    live._assert_close(Vector(markers["Hand.L"].markers[0].wrap_target), picked, "your pick stays yours")
+
+
+def test_selecting_another_character_fits_to_it_and_forgets_the_last_ones_picks():
+    from armature_nodes.human_skeleton import human_skeleton_group
+    from armature_nodes.nodes.wrap import MeshTarget, pair
+
+    fixtures.ensure_registered()
+    first, joints = _mannequin()
+    second, _joints = _mannequin()
+    second.location.x = 2.0
+    bpy.context.view_layer.update()
+    group = human_skeleton_group()
+    markers, wrap = _group_parts(group)
+    wrap.target = first
+    wrist = joints["wrist.L"]
+    mesh = MeshTarget(first, bpy.context.evaluated_depsgraph_get())
+    assert pair(wrap, (markers["Hand.L"].name, "marker"), mesh, Vector((wrist.x, -5.0, wrist.z)), Vector((0, 1, 0)))
+    with bpy.context.temp_override(active_object=second, selected_objects=[second]):
+        assert bpy.ops.armature_nodes.wrap_run(step="FIT", tree=group.name, node=wrap.name) == {"FINISHED"}
+    assert wrap.target == second
+    assert not markers["Hand.L"].markers[0].wrap_picked, "a pick on the other character was kept"
+    assert (_at(markers["Hand.L"]) - (wrist + Vector((2.0, 0.0, 0.0)))).length < 0.04 * H
+
+
 def test_the_viewport_panel_finds_the_wrap_node_inside_the_group():
     from armature_nodes.human_skeleton import add_to_tree
     from armature_nodes.nodes.wrap import wrap_node_for

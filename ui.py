@@ -202,8 +202,8 @@ class ARMATURE_NODES_PT_view3d_tool(Panel):
 
 class ARMATURE_NODES_PT_wrap(Panel):
     """Fit a marker skeleton onto a character, where the character is: the
-    Wrap Markers node's controls in the 3D Viewport sidebar, with a way to
-    get a skeleton to fit when the rig has none."""
+    Wrap Markers node's buttons in the 3D Viewport sidebar -- or the one
+    button that gets a skeleton to fit, when the rig has none."""
 
     bl_label = "Wrap Markers"
     bl_space_type = "VIEW_3D"
@@ -212,28 +212,34 @@ class ARMATURE_NODES_PT_wrap(Panel):
 
     @classmethod
     def poll(cls, context):
-        from .nodes.wrap import wrap_node_for
+        from .nodes.wrap import selected_objects, wrap_node_for
 
-        return _active_armature(context) is not None or wrap_node_for(context) is not None
+        return wrap_node_for(context) is not None or any(o.type == "ARMATURE" for o in selected_objects(context))
 
     def draw(self, context):
-        from .nodes.wrap import wrap_node_for
+        from .nodes.wrap import selected_rig_tree, wrap_node_for
 
         layout = self.layout
         wrap = wrap_node_for(context)
         if wrap is not None:
-            layout.label(text=f"Markers of {wrap.id_data.name}", icon="OUTLINER_OB_ARMATURE")
-            wrap.draw_buttons_ext(context, layout)
+            wrap.draw_buttons(context, layout)
             return
-        tree = getattr(_active_armature(context), "armature_nodes_tree", None)
+        tree = selected_rig_tree(context)
+        col = layout.column()
+        hint = col.row()
+        hint.alignment = "CENTER"
+        hint.enabled = False
+        button = col.row()
+        button.scale_y = 1.8
         if tree is None:
-            layout.label(text="Turn the rig into Armature Nodes first", icon="INFO")
-            _draw_convert_button(layout, context)
+            hint.label(text="Turn the rig into nodes first", icon="INFO")
+            button.operator("armature_nodes.convert_rig", text="Convert to Nodes", icon="NODETREE")
         elif any(hasattr(n, "markers") for n in tree.nodes):
-            layout.operator("armature_nodes.wrap_add", icon="MOD_SHRINKWRAP")
+            hint.label(text="Fit this rig's markers to a character", icon="INFO")
+            button.operator("armature_nodes.wrap_add", icon="MOD_SHRINKWRAP")
         else:
-            layout.label(text="No markers to fit yet", icon="INFO")
-            layout.operator("armature_nodes.add_human_skeleton", text="Add Human Skeleton", icon="OUTLINER_OB_ARMATURE")
+            hint.label(text="A skeleton for Rigify, ready to fit", icon="INFO")
+            button.operator("armature_nodes.add_human_skeleton", text="Add Human Skeleton", icon="OUTLINER_OB_ARMATURE")
 
 
 classes = (ARMATURE_NODES_PT_sidebar, ARMATURE_NODES_PT_view3d_tool, ARMATURE_NODES_PT_wrap)

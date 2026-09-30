@@ -298,64 +298,55 @@ own **Handles** toggle still wins, for hiding one marker without unwiring it.
   wire it in: the landmarks are a layout to drag onto a character, and the
   bones go to them. A landmark does follow when you grab the bone it drives.
 
-- **Wrap Markers** — fits the tree's markers onto a mesh, the way the wrap
-  add-on fits a template onto a scan: point pairs, then **Snap**,
-  **Attract** and **Stick**. The markers are the skeleton — its bones are
-  the lines the viewport draws between them (a marker and its parent,
-  joined markers, MediaPipe's bones) — and the mesh is the target. The node
-  has no sockets: it works on every marker in its tree.
-  1. Choose the **mesh**, or select it: a node without one takes the
-     selected mesh.
-  2. **Auto** pairs, with no clicks, the markers it knows by name — the
-     Human Skeleton's (below): Pelvis, Chest, Head, Clavicles, Hands, Feet
-     — at their places on a character standing up and facing -Y, found from
-     human proportions and, for the hands, the tips of the arms.
-     **Pick Pairs**: click a marker's glow, then where it goes on the mesh,
-     then the next. A joint goes *into* the mesh, halfway through it under
-     the cursor; a landmark onto the skin. Right-click drops the picked
-     marker and **X** forgets its pair; **Esc**, or right-click with none
-     picked, ends. With **Symmetric** on, the
-     partner (Hand.R for Hand.L) is paired with the mirror image across the
-     mesh's own middle, its local X = 0, wherever the mesh stands.
-  3. **Symmetrize** makes the skeleton symmetric (each marker averaged with
-     its partner's mirror image, one without a side put on the middle
-     line) and gives every pair its partner.
-  4. **Snap** pulls the paired markers onto their places and the skeleton
-     follows the way a skeleton does: every bone keeps its length, a
-     marker where three or more bones meet (a chest, a pelvis) turns as one
-     solid piece, and the joints between bend. Hands paired into an A-pose
-     swing the arms down at the shoulders instead of dragging the chest;
-     a smaller character shares its difference out along the bones; one
-     pair carries its whole skeleton. A marker no pair reaches (no bone to
-     it) moves by the pairs' average. Snap always starts from the markers
-     as they were before the first step, so it depends on the pairs alone.
-  5. **Attract** draws each marker toward its place on the mesh, over
-     passes whose reach shrinks to the distance beside the button, while
-     the bones keep the skeleton in one piece. **Stick** does the same,
-     harder, and lands every marker within its distance exactly on its
-     place. Distances are a share of the skeleton's height.
+- **Wrap Markers** — fits the tree's markers onto a character mesh, the
+  way the wrap add-on fits a template onto a scan. Two buttons and a switch,
+  on the node and in the 3D Viewport sidebar's **Wrap** tab:
+  - **Fit to Mesh** — select the rig and the character, in either order,
+    and press it. The markers it knows by name (the Human Skeleton's, below:
+    Pelvis, Chest, Head, Clavicles, Hands, Feet) are paired with their
+    places automatically, found from human proportions and, for the hands,
+    the tips of the arms; then the skeleton is snapped onto the pairs, drawn
+    into the middle of the limbs and stuck there. The line above the buttons
+    says which character it fits to, and when it has.
+  - **Pick Pairs** — for a marker the automatic pairs miss or place wrong.
+    Press it and it stays pressed in, the picker on: over the viewport the
+    cursor turns into an eyedropper. Click a marker's glow — the cursor turns
+    into a crosshair — then where it goes on the character, then the next. A
+    joint goes *into* the mesh, halfway through it under the cursor. With
+    the mirror toggle to its left on (it is by default), its partner (Hand.R
+    for Hand.L) gets the mirror image across the character's middle — both
+    places show under the cursor before you click. Turn it off for a
+    character that isn't symmetric: Fit then leaves each side to itself too.
+    While it runs, **✕** beside it (or right-click) unselects the picked
+    marker and **⟲** (or **Ctrl Z**) takes back the last pair, its marker
+    picked again to put it right; **X** forgets a marker's pair. Press the button again, or **Esc**, to stop; the whole
+    session is one undo step. Fit keeps what you picked and redoes the rest
+    every time, so it follows a character moved since; selecting another
+    character forgets the last one's picks.
+  - **Original | Wrapped** — at the bottom: the skeleton as it was before
+    the fit, or fitted, to compare the two. Each keeps what you change while
+    it shows — a marker touched up after the fit is still touched up when
+    you come back to Wrapped — and Fit fits the skeleton as Original shows
+    it.
 
-  **Fit to Mesh** is all of it in one click: Auto when nothing is paired
-  yet, then Snap, Attract and Stick. The same controls are in the 3D
-  Viewport sidebar's **Wrap** tab, for the selected rig: there, a rig with
-  no markers yet gets **Add Human Skeleton**, and one with markers but no
-  Wrap Markers node gets **Wrap These Markers** (which also makes markers
-  named Elbow or Knee Free, as the Human Skeleton has them).
+  How the skeleton moves: its bones are the lines the viewport draws between
+  the markers (a marker and its parent, joined markers, MediaPipe's bones).
+  Every bone keeps its length, a marker where three or more bones meet (a
+  chest, a pelvis) turns as one solid piece, and the joints between bend:
+  hands paired into an A-pose swing the arms down at the shoulders instead
+  of dragging the chest. Pole targets (the Human Skeleton's Elbows and
+  Knees) are carried, never drawn into the mesh. A marker moves the way a
+  drag moves it — a child against its parent, a face or finger landmark with
+  its anchor.
 
-  Each marker's **Wrap** role, in the sidebar (N › Node), says where its
-  place is: **Inside**, the default, for a joint — the middle of the limb
-  it sits in; **Surface** for a landmark — the skin; **Free** — carried by
-  the skeleton, never drawn to the mesh (a pole target); **Fixed** — never
-  moved. A pair holds through every step, and is drawn as a line from the
-  marker to its place (the eye toggle hides them).
-
-  A step runs in the background: its passes stream into the markers, so
-  the skeleton glides onto the mesh and the rig follows live. **Esc** stops
-  it and puts the markers back. Each step is one undo step, and
-  **Original** puts the markers back where they were before the first. A
-  marker moves the way a drag moves it — a child against its parent, a face
-  or finger landmark with its anchor; one that is only a readout of its
-  bone, or an offset from rest, stays where it is.
+  The fit streams into the markers, so the skeleton glides onto the
+  character and the rig follows live; **Esc** stops it and puts them back,
+  and each fit is one undo step. In the sidebar, a rig with no markers yet
+  gets **Add Human Skeleton**, and one with markers but no Wrap Markers node
+  gets **Wrap These Markers**. The single steps (Snap, Attract, Stick),
+  Symmetrize and each marker's role (Inside, Surface, Free, Fixed) are still
+  there for scripts: `armature_nodes.wrap_run`, `wrap_symmetrize`,
+  `SkeletonMarker.wrap_role`; the switch is the node's `preview`.
 - **Human Skeleton** (Shift+A › Group) — a ready-made group: thirteen
   markers — Pelvis, Chest, Head, Clavicles, Elbows, Hands, Knees, Feet —
   each driving the Rigify control that does that job through a Transform

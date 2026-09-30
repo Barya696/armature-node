@@ -15,8 +15,8 @@ the target (``wrap_solver`` has the maths):
 A step runs in the background: the runner feeds the solver's passes to the
 markers one at a time, so the skeleton glides onto the mesh and the rig
 follows it live. Esc stops it and puts the markers back. Each step is one
-undo step, and **Original** puts the markers back where they were before the
-first one.
+undo step, and **Original** / **Wrapped** shows the skeleton as it was before
+the first one, or as the last one left it.
 
 The node has no sockets. It works on the markers of its own tree -- the
 skeleton the viewport draws -- and moves them the way a drag does: a child
@@ -32,7 +32,7 @@ from bpy.types import Node, Operator
 from mathutils import Matrix, Vector
 
 from ..wrap_solver import Skeleton
-from .base import ArmatureNodeBase, redraw_viewports
+from .base import ArmatureNodeBase
 
 WRAP_NODE = "ArmatureNodesWrapNode"
 _SKELETON_NODE = "ArmatureNodesSkeletonNode"
@@ -46,7 +46,8 @@ _STEPS = (
 _FIT = (
     "FIT",
     "Fit to Mesh",
-    "Snap, Attract and Stick in one go -- pairing the markers Auto Pairs knows first, if none are",
+    "Fit the skeleton onto the selected character: the pairs you picked, the rest found from "
+    "its proportions, then Snap, Attract and Stick in one go",
     "PLAY",
 )
 _PAIR_COLOR = (1.0, 0.82, 0.25, 0.9)
@@ -270,6 +271,19 @@ def world_positions(entries):
     return np.array(points, dtype=float).reshape(-1, 3)
 
 
+def _dump(entries, points):
+    """A pose to keep on the node: ``points`` for the markers of ``entries``."""
+    return json.dumps({f"{n.name}\t{m.key}": [float(v) for v in p] for (n, m), p in zip(entries, points)})
+
+
+def _load(pose, entries):
+    """(n, 3) the kept ``pose`` for ``entries`` -- where a marker is now, for
+    one added since."""
+    saved = json.loads(pose or "{}")
+    points = [saved.get(f"{n.name}\t{m.key}") or n.marker_value(m, "position") for n, m in entries]
+    return np.array(points, dtype=float).reshape(-1, 3)
+
+
 def place_markers(entries, points):
     """Move each marker to its world position in ``points`` -- parents first,
     each child against its parent's new place, as a drag does -- with a
@@ -311,54 +325,143 @@ def _redraw():
 # Pairs
 # ---------------------------------------------------------------------------
 
-# While Pick Pairs runs: {"tree", "chosen": (node name, key) or None, "spot"}.
+# While Pick Pairs runs: {"tree", "chosen": (node name, key) or None,
+# "spots": [(a marker, its place)] a click would pair, "undo": [(chosen, the
+# pairs a change changed, as they were)], "cursor"}.
 _picking = None
 
 
-def pair(wrap, ident, mesh, origin, direction):
-    """Pair marker ``ident`` -- (node name, key) -- with the place the ray
-    finds on ``mesh`` and, with Symmetric on, its partner with the mirror
-    image. Returns how many markers were paired: 0 when the ray misses."""
+def _marker_of(tree, ident):
+    """The marker ``ident`` -- (node name, key) -- names in ``tree``, or None."""
+    node = tree.nodes.get(ident[0]) if ident is not None else None
+    return node.marker_by_key(ident[1]) if hasattr(node, "marker_by_key") else None
+
+
+def pairs_of(tree):
+    """Every marker's pair in ``tree``, as Undo puts it back."""
+    return {(n.name, m.key): (m.wrap_pair, m.wrap_picked, tuple(m.wrap_target)) for n, m in tree_markers(tree)}
+
+
+def set_pair(wrap, mesh=None, ray=None):
+    """Pair the marker Pick Pairs has picked with the place ``ray`` (origin,
+    direction) finds on ``mesh`` -- or, with no mesh, forget its pair -- as
+    a change Undo takes back, and put the marker down. False when the ray
+    misses."""
+    chosen, before = _picking["chosen"], pairs_of(wrap.id_data)
+    if mesh is None:
+        unpair(wrap, chosen)
+    elif not pair(wrap, chosen, mesh, *ray):
+        return False
+    after = pairs_of(wrap.id_data)  # Undo puts back only what this changed: a Fit since redid the rest
+    _picking["undo"].append((chosen, {k: v for k, v in before.items() if after.get(k) != v}))
+    _picking.update(chosen=None, spots=[])
+    return True
+
+
+def undo_pick(wrap):
+    """Take back the last pair Pick Pairs made or forgot, with its marker
+    picked again to put it right. False when there is none."""
+    if _picking is None or not _picking["undo"]:
+        return False
+    _picking["chosen"], before = _picking["undo"].pop()
+    _picking["spots"] = []
+    for node, marker in tree_markers(wrap.id_data):
+        if (node.name, marker.key) in before:
+            marker.wrap_pair, marker.wrap_picked, marker.wrap_target = before[node.name, marker.key]
+    _redraw()
+    return True
+
+
+def stop_picking(context):
+    """End Pick Pairs, the cursor and the status bar back as they were. Its
+    modal operator lets go at the next event."""
+    global _picking
+    if _picking is not None and _picking["cursor"] is not None and context.window is not None:
+        context.window.cursor_modal_restore()
+    _picking = None
+    if context.workspace is not None:
+        context.workspace.status_text_set(None)
+    _redraw()
+
+
+def _show_cursor(context, at):
+    """While Pick Pairs runs, the eyedropper over the viewport -- a crosshair
+    once a marker is picked, to aim at its place -- and the usual cursor
+    over the buttons."""
+    want = None if at is None else ("CROSSHAIR" if _picking["chosen"] is not None else "EYEDROPPER")
+    if want != _picking["cursor"]:
+        if want is None:
+            context.window.cursor_modal_restore()
+        else:
+            context.window.cursor_modal_set(want)
+        _picking["cursor"] = want
+
+
+def _say(context, wrap):
+    """What Pick Pairs wants next, in the status bar."""
+    marker = _marker_of(wrap.id_data, _picking["chosen"])
+    if marker is None:
+        text = "Pick Pairs: click a marker   Ctrl Z: undo   Esc: done"
+    else:
+        text = (
+            f"Pick Pairs: click where {marker.name} goes on {wrap.target.name}"
+            "   Right-click: unselect   X: forget its pair   Ctrl Z: undo"
+        )
+    if context.workspace is not None:
+        context.workspace.status_text_set(text)
+
+
+def places(wrap, ident, mesh, origin, direction):
+    """[(node, marker, place)] a click along the ray pairs: marker ``ident``
+    -- (node name, key) -- with where the ray finds on ``mesh`` and, with
+    Symmetric on, its partner with the mirror image. Empty on a miss."""
     entries = tree_markers(wrap.id_data)
     keys = [(n.name, m.key) for n, m in entries]
     if tuple(ident) not in keys:
-        return 0
+        return []
     i = keys.index(tuple(ident))
     rays = [(i, Vector(origin), Vector(direction))]
     j = partners(entries)[i] if wrap.symmetric else -1
     if j not in (-1, i):
         near = _mirrored(mesh.frame, origin)
         rays.append((j, near, _mirrored(mesh.frame, Vector(origin) + Vector(direction)) - near))
-    done = 0
+    found = []
     for k, o, d in rays:
-        marker = entries[k][1]
+        node, marker = entries[k]
         spot = mesh.pick(o, d, marker.wrap_role) if marker.wrap_role != "FIXED" else None
-        if spot is None:
-            if k == i:
-                return 0
-            continue
+        if spot is None and k == i:
+            return []
+        if spot is not None:
+            found.append((node, marker, spot))
+    return found
+
+
+def pair(wrap, ident, mesh, origin, direction):
+    """Pair what ``places`` finds. Returns how many markers were paired: 0
+    when the ray misses."""
+    found = places(wrap, ident, mesh, origin, direction)
+    for _node, marker, spot in found:
         marker.wrap_target = spot
-        marker.wrap_pair = True
-        done += 1
+        marker.wrap_pair = marker.wrap_picked = True
     _redraw()
-    return done
+    return len(found)
 
 
 def auto_pairs(wrap, mesh):
-    """Pair every unpaired marker the Human Skeleton knows by name (Pelvis,
-    Hand.L...) with its place on ``mesh``, found from a character's
-    proportions (``human_skeleton.landmarks``) -- in the middle of the body
-    there for a joint, on the skin for a Surface marker. A marker found by
-    its height keeps that height: the middle of a round head is its centre,
-    well above the neck. With Symmetric on, the right side is the left one's
-    mirror image. Returns how many."""
+    """Pair every marker the Human Skeleton knows by name (Pelvis, Hand.L...)
+    -- all but those picked by hand -- with its place on ``mesh``, found
+    from a character's proportions (``human_skeleton.landmarks``): in the
+    middle of the body there for a joint, on the skin for a Surface marker.
+    A marker found by its height keeps that height: the middle of a round
+    head is its centre, well above the neck. With Symmetric on, the right
+    side is the left one's mirror image. Returns how many."""
     from ..human_skeleton import landmarks, spec
 
     found = landmarks(mesh)
     level = {name for name, _c, _p, _w, how, _s in spec() if how == "height"}
     todo = [
         m for _n, m in tree_markers(wrap.id_data)
-        if m.name in found and not m.wrap_pair and m.wrap_role in ("INSIDE", "SURFACE")
+        if m.name in found and not m.wrap_picked and m.wrap_role in ("INSIDE", "SURFACE")
     ]
     if not todo:
         return 0
@@ -373,7 +476,7 @@ def auto_pairs(wrap, mesh):
         if m.name in level and m.wrap_role == "INSIDE":
             spot.z = found[m.name].z
         m.wrap_target = spot
-        m.wrap_pair = True
+        m.wrap_pair, m.wrap_picked = True, False
     _redraw()
     return len(todo)
 
@@ -392,14 +495,15 @@ def unpair(wrap, ident=None):
     else:
         chosen = ()
     for k in chosen:
-        entries[k][1].wrap_pair = False
+        entries[k][1].wrap_pair = entries[k][1].wrap_picked = False
     _redraw()
 
 
 def draw_pairs(nodes, height):
     """For the viewport overlay: each pair as a line from its marker to its
     place, the place lit -- in trees whose Wrap Markers node shows pairs --
-    and, while Pick Pairs runs, the marker picked and where it would go."""
+    and, while Pick Pairs runs, the marker picked and where a click would
+    put it -- and, with Symmetric on, its partner."""
     from ..handles import draw_lines, line_shader, ui_scale
     from ..primary_rig import _draw_glow_points
 
@@ -421,9 +525,9 @@ def draw_pairs(nodes, height):
         marker = node.marker_by_key(_picking["chosen"][1]) if node is not None else None
         if marker is not None:
             lit = tuple(node.marker_value(marker, "position"))
-            if _picking["spot"] is not None:
-                coords += [lit, tuple(_picking["spot"])]
-                spots.append(tuple(_picking["spot"]))
+            for start, spot in _picking["spots"]:
+                coords += [start, spot]
+                spots.append(spot)
     if coords:
         draw_lines(line_shader(bpy.context.region), coords, _PAIR_COLOR, 2.0 * ui_scale())
     _draw_glow_points(spots, _PAIR_COLOR, 0.45, height)
@@ -456,13 +560,14 @@ class WrapRun:
         if not self.entries:
             raise Refused("There are no markers in this tree to wrap")
         mesh = MeshTarget(wrap.target, depsgraph)
-        if step == "FIT" and not any(m.wrap_pair for _n, m in self.entries):
-            auto_pairs(wrap, mesh)
+        if step == "FIT":
+            auto_pairs(wrap, mesh)  # yours kept, its own made afresh: the mesh may have moved
         pairs = {i: tuple(m.wrap_target) for i, (_n, m) in enumerate(self.entries) if m.wrap_pair}
         if step in ("SNAP", "FIT") and not pairs:
             raise Refused("Pick at least one pair first")
         self.start = world_positions(self.entries)
-        wrap.remember(self.entries)
+        # The skeleton to fit is the original: as it shows, if it does.
+        wrap.remember(self.entries, replace=wrap.preview == "ORIGINAL")
         rest = wrap.originals(self.entries)
         size = _height(rest)
         mirror = partners(self.entries, self.start, mesh.frame, size) if wrap.symmetric else None
@@ -523,18 +628,29 @@ class _WrapOperator:
         return node if getattr(node, "bl_idname", "") == WRAP_NODE else None
 
     def with_mesh(self, context):
-        """The node, with a mesh to wrap onto -- the selected one if it has
-        none yet -- or None, reported."""
+        """The node, aimed at the selected character -- or, with no mesh
+        selected, at the one it had -- or None, reported. Aimed at another
+        character, it forgets the pairs picked on the last one."""
         wrap = self.wrap_node(context)
-        if wrap is not None and wrap.target is None:
-            for obj in (getattr(context, "active_object", None), *getattr(context, "selected_objects", ())):
-                if obj is not None and obj.type == "MESH":
-                    wrap.target = obj
-                    break
-        if wrap is None or wrap.target is None:
-            self.report({"WARNING"}, "Choose the mesh to wrap onto first")
+        mesh = selected_mesh(context) or (wrap.target if wrap is not None else None)
+        if wrap is None or mesh is None:
+            self.report({"WARNING"}, "Select the character to fit the skeleton to")
             return None
+        if wrap.target != mesh:
+            if wrap.target is not None:
+                unpair(wrap)
+            wrap.target = mesh
         return wrap
+
+
+def selected_mesh(context):
+    """The character the selection names: the active object if it is a mesh,
+    else the one mesh selected. None when that is not clear."""
+    obj = getattr(context, "active_object", None)
+    if obj is not None and obj.type == "MESH":
+        return obj
+    meshes = [o for o in getattr(context, "selected_objects", ()) if o.type == "MESH"]
+    return meshes[0] if len(meshes) == 1 else None
 
 
 class ARMATURE_NODES_OT_wrap_run(_WrapOperator, Operator):
@@ -603,22 +719,61 @@ class ARMATURE_NODES_OT_wrap_run(_WrapOperator, Operator):
         wrap = run.node()
         if wrap is not None:
             wrap.wrap_stage = len(_STEPS) if self.step == "FIT" else [s[0] for s in _STEPS].index(self.step) + 1
+            wrap["wrap_preview"] = 1  # what shows now: Wrapped
         _redraw()
         self.report({"INFO"}, f"{self.step.title()}: {len(run.entries)} markers")
         return {"FINISHED"}
 
 
+# (identifier, label, tooltip): the Pick Pairs button, and the two beside it
+# while it runs.
+_PICK = (
+    (
+        "TOGGLE",
+        "Pick Pairs",
+        "Pair markers with their places on the character: click a marker, then where it goes, "
+        "then the next. Press again to stop",
+    ),
+    ("DROP", "Unselect", "Unselect the picked marker, to pick another (right-click)"),
+    ("UNDO", "Undo", "Take back the last pair, its marker picked again to put it right (Ctrl Z)"),
+)
+
+
 class ARMATURE_NODES_OT_wrap_pick(_WrapOperator, Operator):
     """Pair markers with their places on the mesh: click a marker, then where
-    it goes -- then the next. Right-click drops the picked marker, X forgets
-    its pair; Esc or right-click with none picked ends"""
+    it goes -- then the next. Right-click unselects the picked marker, X
+    forgets its pair, Ctrl Z takes back the last; Esc or the button again
+    ends"""
 
     bl_idname = "armature_nodes.wrap_pick"
     bl_label = "Pick Pairs"
     bl_options = {"UNDO"}  # the whole picking session is one undo step
 
+    action: EnumProperty(name="Action", items=_PICK, options={"HIDDEN", "SKIP_SAVE"})
+
+    @classmethod
+    def description(cls, context, properties):
+        return next(tip for action, _label, tip in _PICK if action == properties.action)
+
     def invoke(self, context, event):
         global _picking
+        wrap = self.wrap_node(context)
+        if _picking is not None and wrap is not None and _picking["tree"] == wrap.id_data.name:
+            # A button pressed while it runs. The session, when it ends, is the undo step.
+            if self.action == "TOGGLE":
+                stop_picking(context)
+                return {"CANCELLED"}
+            if self.action == "UNDO":
+                undo_pick(wrap)
+            else:
+                _picking.update(chosen=None, spots=[])
+            _say(context, wrap)
+            _redraw()
+            return {"CANCELLED"}
+        if self.action != "TOGGLE":
+            return {"CANCELLED"}
+        if _picking is not None:
+            stop_picking(context)  # running on another tree: that one ends
         wrap = self.with_mesh(context)
         if wrap is None:
             return {"CANCELLED"}
@@ -628,84 +783,73 @@ class ARMATURE_NODES_OT_wrap_pick(_WrapOperator, Operator):
             self.report({"WARNING"}, str(exc))
             return {"CANCELLED"}
         self.tree, self.node = wrap.id_data.name, wrap.name
-        _picking = {"tree": self.tree, "chosen": None, "spot": None}
+        _picking = self._session = {"tree": self.tree, "chosen": None, "spots": [], "undo": [], "cursor": None}
         context.window_manager.modal_handler_add(self)
-        self._say(context, wrap)
+        _show_cursor(context, _view_under(context, event))
+        _say(context, wrap)
+        _redraw()
         return {"RUNNING_MODAL"}
 
     def modal(self, context, event):
+        if _picking is not self._session:
+            return {"FINISHED"}  # its button pressed again, or picking went on elsewhere
         wrap = self.wrap_node(context)
-        if wrap is None:
-            return self._end(context)
-        if event.type in {"ESC", "RIGHTMOUSE"} and event.value == "PRESS":
-            if _picking["chosen"] is None:
-                return self._end(context)
-            _picking["chosen"] = _picking["spot"] = None  # drop it, keep picking
-            self._say(context, wrap)
-            _redraw()
-            return {"RUNNING_MODAL"}
+        press = event.value == "PRESS"
+        if wrap is None or (press and event.type in {"ESC", "RIGHTMOUSE"} and _picking["chosen"] is None):
+            stop_picking(context)
+            return {"FINISHED"}
         at = _view_under(context, event)
         if event.type == "MOUSEMOVE":
-            _picking["spot"] = self._spot(wrap, at)
+            _picking["spots"] = self._spots(wrap, at)
+            _show_cursor(context, at)
             _redraw()
             return {"PASS_THROUGH"}  # so the handle under the mouse lights up
-        if event.value != "PRESS" or at is None:
+        if not press:
             return {"PASS_THROUGH"}
-        if event.type == "LEFTMOUSE":
+        if event.type in {"ESC", "RIGHTMOUSE"}:
+            _picking.update(chosen=None, spots=[])  # unselect it, keep picking
+        elif event.type == "Z" and (event.ctrl or event.oskey):
+            if not event.shift:  # taken either way: no Blender undo or redo mid-session
+                undo_pick(wrap)
+        elif at is None:
+            return {"PASS_THROUGH"}
+        elif event.type == "LEFTMOUSE":
             self._click(wrap, at)
         elif event.type in {"X", "DEL"} and _picking["chosen"] is not None:
-            unpair(wrap, _picking["chosen"])
-            _picking["chosen"] = _picking["spot"] = None
+            set_pair(wrap)  # forgotten
         else:
             return {"PASS_THROUGH"}
-        self._say(context, wrap)
+        _show_cursor(context, at)
+        _say(context, wrap)
+        _redraw()
         return {"RUNNING_MODAL"}
 
-    def _chosen_marker(self, wrap, ident):
-        node = wrap.id_data.nodes.get(ident[0]) if ident is not None else None
-        return node.marker_by_key(ident[1]) if hasattr(node, "marker_by_key") else None
+    def cancel(self, context):
+        if _picking is self._session:  # another file opened under it, say
+            stop_picking(context)
 
-    def _spot(self, wrap, at):
-        marker = self._chosen_marker(wrap, _picking["chosen"])
-        if marker is None or at is None:
-            return None
+    def _spots(self, wrap, at):
+        if _picking["chosen"] is None or at is None:
+            return []
         view, xy = at
-        return self._mesh.pick(*view.ray(xy), marker.wrap_role)
+        found = places(wrap, _picking["chosen"], self._mesh, *view.ray(xy))
+        return [(tuple(n.marker_value(m, "position")), tuple(spot)) for n, m, spot in found]
 
     def _click(self, wrap, at):
         """With a marker picked, the mesh under the cursor pairs it -- even
         through a glow, since its place is often right behind one. Off the
         mesh, a marker's glow picks that marker."""
         view, xy = at
-        if _picking["chosen"] is not None and pair(wrap, _picking["chosen"], self._mesh, *view.ray(xy)):
-            _picking["chosen"] = _picking["spot"] = None
+        if _picking["chosen"] is not None and set_pair(wrap, self._mesh, view.ray(xy)):
             return
         under = _marker_under(view, xy, self.tree)
-        marker = self._chosen_marker(wrap, under)
+        marker = _marker_of(wrap.id_data, under)
         if marker is None:
             return
         if marker.wrap_role == "FIXED":
             self.report({"WARNING"}, f"'{marker.name}' is Fixed: it takes no pair")
         else:
             _picking["chosen"] = under
-
-    def _say(self, context, wrap):
-        marker = self._chosen_marker(wrap, _picking["chosen"])
-        if marker is None:
-            text = "Pick Pairs: click a marker   Esc / right-click: done"
-        else:
-            text = (
-                f"Pick Pairs: click where {marker.name} goes on {wrap.target.name}"
-                "   Right-click: another marker   X: forget its pair"
-            )
-        context.workspace.status_text_set(text)
-
-    def _end(self, context):
-        global _picking
-        _picking = None
-        context.workspace.status_text_set(None)
-        _redraw()
-        return {"FINISHED"}
 
 
 def _view_under(context, event):
@@ -781,29 +925,10 @@ class ARMATURE_NODES_OT_wrap_symmetrize(_WrapOperator, Operator):
             a, b = entries[i][1], entries[j][1]
             if a.wrap_pair and not b.wrap_pair and b.wrap_role != "FIXED":
                 b.wrap_target = _mirrored(across, a.wrap_target)
-                b.wrap_pair = True
+                b.wrap_pair, b.wrap_picked = True, a.wrap_picked
                 added += 1
         _redraw()
         self.report({"INFO"}, f"Symmetric: {len(sides) // 2} left and right, {added} pair(s) mirrored")
-        return {"FINISHED"}
-
-
-class ARMATURE_NODES_OT_wrap_original(_WrapOperator, Operator):
-    """Put the markers back where they were before the first wrap step"""
-
-    bl_idname = "armature_nodes.wrap_original"
-    bl_label = "Original"
-    bl_options = {"REGISTER", "UNDO"}
-
-    def execute(self, context):
-        wrap = self.wrap_node(context)
-        if wrap is None or not wrap.wrap_original:
-            self.report({"INFO"}, "The markers are where they started")
-            return {"CANCELLED"}
-        entries = tree_markers(wrap.id_data)
-        place_markers(entries, wrap.originals(entries))
-        wrap.wrap_original, wrap.wrap_stage = "", 0
-        _redraw()
         return {"FINISHED"}
 
 
@@ -865,8 +990,7 @@ class ARMATURE_NODES_OT_wrap_add(Operator):
     def execute(self, context):
         from ..human_skeleton import spec
 
-        obj = context.active_object
-        tree = getattr(obj, "armature_nodes_tree", None) if obj is not None and obj.type == "ARMATURE" else None
+        tree = selected_rig_tree(context)
         if tree is None:
             self.report({"WARNING"}, "Select a rig with an Armature Nodes tree first")
             return {"CANCELLED"}
@@ -881,24 +1005,42 @@ class ARMATURE_NODES_OT_wrap_add(Operator):
         return {"FINISHED"}
 
 
+def selected_objects(context):
+    """The active object first, then the rest of the selection."""
+    active = getattr(context, "active_object", None)
+    rest = [o for o in getattr(context, "selected_objects", ()) if o != active]
+    return [o for o in (active, *rest) if o is not None]
+
+
+def selected_rig_tree(context):
+    """The Armature Nodes tree of the selected rig, or None."""
+    for obj in selected_objects(context):
+        tree = getattr(obj, "armature_nodes_tree", None) if obj.type == "ARMATURE" else None
+        if tree is not None:
+            return tree
+    return None
+
+
 def wrap_node_for(context):
-    """The Wrap Markers node the viewport panel works with: one in the
-    selected rig's tree or a group it runs, else one wrapping onto the
-    selected mesh. None when there is none."""
+    """The Wrap Markers node the viewport panel works with: one in a
+    selected rig's tree or a group it runs -- the rig and the character can
+    be selected in either order -- else one wrapping onto a selected mesh.
+    None when there is none."""
     from ..groups import armature_trees, trees_in_use
 
-    obj = context.active_object
-    tree = getattr(obj, "armature_nodes_tree", None) if obj is not None and obj.type == "ARMATURE" else None
-    trees = trees_in_use(tree) if tree is not None else []
-    for tree in trees:
-        for node in tree.nodes:
-            if node.bl_idname == WRAP_NODE:
-                return node
-    if obj is not None and obj.type == "MESH":
-        for tree in armature_trees():
+    objects = selected_objects(context)
+    for obj in objects:
+        tree = getattr(obj, "armature_nodes_tree", None) if obj.type == "ARMATURE" else None
+        for tree in trees_in_use(tree) if tree is not None else ():
             for node in tree.nodes:
-                if node.bl_idname == WRAP_NODE and node.target == obj:
+                if node.bl_idname == WRAP_NODE:
                     return node
+    for obj in objects:
+        if obj.type == "MESH":
+            for tree in armature_trees():
+                for node in tree.nodes:
+                    if node.bl_idname == WRAP_NODE and node.target == obj:
+                        return node
     return None
 
 
@@ -908,16 +1050,42 @@ def wrap_node_for(context):
 
 
 def _redraw_only(self, context):
-    redraw_viewports()
+    _redraw()
+
+
+def _preview_get(node):
+    # Unrecorded -- a node saved before there was a choice -- a kept
+    # original means a fit shows.
+    return node.get("wrap_preview", int(bool(node.wrap_original)))
+
+
+def _preview_set(node, value):
+    """Show the other pose -- once there is a fit -- keeping the one shown
+    until now as it is: a marker dragged there is where it was dragged, the
+    next time that pose shows."""
+    if value == _preview_get(node) or not node.wrap_original:
+        return
+    entries, _bones = gather(node.id_data)
+    leaving = _dump(entries, world_positions(entries))
+    if value:
+        node.wrap_original = leaving
+    else:
+        node.wrap_wrapped = leaving
+    place_markers(entries, _load(node.wrap_wrapped if value else node.wrap_original, entries))
+    node["wrap_preview"] = value
+    _redraw()
 
 
 class WrapMarkersNode(ArmatureNodeBase, Node):
     """Wrap the tree's markers onto a mesh, the way the wrap add-on wraps a
     template onto a scan: pairs, then Snap, Attract, Stick.
 
-    No sockets: it works on the markers of its tree, the skeleton the
-    viewport draws, and each marker's own Wrap role says what happens to it
-    (Inside, Surface, Free, Fixed -- in the sidebar).
+    Two buttons: Pick Pairs, and Fit to Mesh, which fits onto the selected
+    character; under them, Original and Wrapped, to see the skeleton before
+    the fit and after it. No sockets: it works on the markers of its tree,
+    the skeleton the viewport draws. Each marker's Wrap role (Inside, Surface, Free,
+    Fixed) says what happens to it; the Human Skeleton sets them, and Wrap
+    These Markers frees the pole targets.
     """
 
     bl_idname = WRAP_NODE
@@ -938,6 +1106,7 @@ class WrapMarkersNode(ArmatureNodeBase, Node):
             "across the mesh's middle, and keep the skeleton symmetric as it wraps"
         ),
         default=True,
+        update=_redraw_only,
     )
     attract_distance: FloatProperty(
         name="Attract Distance",
@@ -969,68 +1138,76 @@ class WrapMarkersNode(ArmatureNodeBase, Node):
         update=_redraw_only,
     )
     wrap_stage: IntProperty(name="Steps Run", default=0, options={"HIDDEN"})
+    # The two poses Preview shows, as _dump keeps them.
     wrap_original: StringProperty(name="Original", default="", options={"HIDDEN"})
+    wrap_wrapped: StringProperty(name="Wrapped", default="", options={"HIDDEN"})
+    preview: EnumProperty(
+        name="Preview",
+        description="Show the skeleton as it was before the fit, or fitted",
+        items=(
+            ("ORIGINAL", "Original", "The skeleton as it was before the fit"),
+            ("WRAPPED", "Wrapped", "The skeleton fitted to the character"),
+        ),
+        get=_preview_get,
+        set=_preview_set,
+    )
 
     def init(self, context):
         self.width = 220
 
     def remember(self, entries, points=None, replace=False):
-        """Keep where the markers are -- what Original goes back to, and the
+        """Keep where the markers are -- the pose Original shows, and the
         shape Snap starts from -- unless that is already kept."""
-        if self.wrap_original and not replace:
-            return
-        points = world_positions(entries) if points is None else points
-        saved = {f"{n.name}\t{m.key}": [float(v) for v in p] for (n, m), p in zip(entries, points)}
-        self.wrap_original = json.dumps(saved)
+        if replace or not self.wrap_original:
+            self.wrap_original = _dump(entries, world_positions(entries) if points is None else points)
 
     def originals(self, entries):
-        """(n, 3) where the markers were before the first step -- where they
-        are now, for one added since."""
-        saved = json.loads(self.wrap_original or "{}")
-        points = [saved.get(f"{n.name}\t{m.key}") or n.marker_value(m, "position") for n, m in entries]
-        return np.array(points, dtype=float).reshape(-1, 3)
+        """(n, 3) where the markers were before the fit."""
+        return _load(self.wrap_original, entries)
 
     def draw_buttons(self, context, layout):
+        """Quietly on top, the character it fits to -- or, while Pick Pairs
+        runs, what to click. Symmetric, and Pick Pairs, pressed in while it
+        runs, Unselect and Undo beside it then; Fit to Mesh; and at the
+        bottom, the skeleton before the fit or after it. Everything else is
+        Fit's business."""
         layout.context_pointer_set("node", self)
-        layout.prop(self, "target", text="", icon="MESH_DATA")
-        count = sum(m.wrap_pair for _n, m in tree_markers(self.id_data))
-        row = layout.row(align=True)
-        row.operator("armature_nodes.wrap_auto_pairs", text="Auto", icon="AUTO")
-        row.operator("armature_nodes.wrap_pick", text=f"Pick Pairs ({count})", icon="EYEDROPPER")
-        row.operator("armature_nodes.wrap_unpair", text="", icon="X")
-        row.prop(self, "show_pairs", text="", icon="HIDE_OFF" if self.show_pairs else "HIDE_ON")
-        row = layout.row(align=True)
-        row.prop(self, "symmetric", toggle=True, icon="MOD_MIRROR")
-        row.operator("armature_nodes.wrap_symmetrize")
-        row = layout.row()
-        row.scale_y = 1.5
+        picking = _picking if _picking is not None and _picking["tree"] == self.id_data.name else None
+        chosen = _marker_of(self.id_data, picking["chosen"]) if picking is not None else None
+        mesh = selected_mesh(context) or self.target
+        col = layout.column()
+        status = col.row()
+        status.alignment = "CENTER"
+        status.enabled = False  # a quiet, greyed line
+        if picking is not None:
+            status.label(text=f"Click where {chosen.name} goes" if chosen else "Click a marker", icon="MOUSE_LMB")
+        elif mesh is None:
+            status.label(text="Select the character", icon="INFO")
+        elif mesh == self.target and self.wrap_stage == len(_STEPS):
+            status.label(text=f"Fitted to {mesh.name}", icon="CHECKMARK")
+        else:
+            status.label(text=mesh.name, icon="MESH_DATA")
+        col.separator(factor=0.4)
+        picked = sum(m.wrap_picked for _n, m in tree_markers(self.id_data))
+        row = col.row()
+        row.scale_y = 1.3
+        row.prop(self, "symmetric", text="", icon="MOD_MIRROR", toggle=True)
+        row = row.row(align=True)
+        text = f"Pick Pairs  ·  {picked}" if picked else "Pick Pairs"
+        row.operator("armature_nodes.wrap_pick", text=text, icon="EYEDROPPER", depress=picking is not None)
+        if picking is not None:
+            if chosen is not None:
+                row.operator("armature_nodes.wrap_pick", text="", icon="X").action = "DROP"
+            undo = row.row(align=True)
+            undo.enabled = bool(picking["undo"])
+            undo.operator("armature_nodes.wrap_pick", text="", icon="LOOP_BACK").action = "UNDO"
+        row = col.row()
+        row.scale_y = 1.8
         row.operator("armature_nodes.wrap_run", text=_FIT[1], icon=_FIT[3]).step = _FIT[0]
-        col = layout.column(align=True)
-        col.scale_y = 1.2
-        for number, (step, label, _tip, icon) in enumerate(_STEPS, 1):
-            row = col.row(align=True)
-            op = row.operator("armature_nodes.wrap_run", text=label, icon=icon, depress=self.wrap_stage >= number)
-            op.step = step
-            if step != "SNAP":
-                row.prop(self, "attract_distance" if step == "ATTRACT" else "stick_distance", text="")
-        row = layout.row()
-        row.enabled = bool(self.wrap_original)
-        row.operator("armature_nodes.wrap_original", icon="LOOP_BACK")
-
-    def draw_buttons_ext(self, context, layout):
-        """The sidebar: the node, then each marker's role and pair."""
-        self.draw_buttons(context, layout)
-        box = layout.box()
-        box.label(text="Markers", icon="EMPTY_AXIS")
-        for node, marker in tree_markers(self.id_data):
-            row = box.row(align=True)
-            row.label(text=marker.name or marker.key)
-            row.prop(marker, "wrap_role", text="")
-            if marker.wrap_pair:
-                op = row.operator("armature_nodes.wrap_unpair", text="", icon="X")
-                op.marker = f"{node.name}\t{marker.key}"
-            else:
-                row.label(text="", icon="BLANK1")
+        col.separator(factor=0.6)
+        row = col.row(align=True)
+        row.enabled = bool(self.wrap_original)  # nothing to show before a fit
+        row.prop(self, "preview", expand=True)
 
 
 classes = (
@@ -1039,7 +1216,6 @@ classes = (
     ARMATURE_NODES_OT_wrap_pick,
     ARMATURE_NODES_OT_wrap_auto_pairs,
     ARMATURE_NODES_OT_wrap_symmetrize,
-    ARMATURE_NODES_OT_wrap_original,
     ARMATURE_NODES_OT_wrap_unpair,
     ARMATURE_NODES_OT_wrap_add,
 )
