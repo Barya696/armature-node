@@ -1,9 +1,6 @@
-"""Marker handles you grab in any mode: the gizmo layer (``handles.py``).
-
-A gizmo cannot be clicked without a window, so the parts are tested apart:
-``pick`` decides what is under the mouse, ``Drag`` turns mouse motion into a
-move, turn or scale of the handle, and from there the path is the ordinary
-one -- the handle's empty moved, the marker synced, the bone rebuilt. The
+"""Marker handles (``handles.py``): a marker is its empty, moved with G / R /
+S like any object; the gizmo only outlines the glows and lights the one under
+the mouse. ``pick`` decides what is under it -- Pick Pairs uses it too. The
 view is a stand-in: a front orthographic view at 100 pixels per metre.
 """
 
@@ -39,14 +36,6 @@ class FrontView:
 
 
 VIEW = FrontView()
-
-
-def _drag(obj, mode, start, end, **options):
-    from armature_nodes.handles import Drag
-
-    drag = Drag(obj, mode, VIEW, start)
-    drag.update(end, **options)
-    return drag
 
 
 def _marker_on(node_type, socket="Position"):
@@ -102,137 +91,49 @@ def test_bigger_handles_are_easier_to_hit():
 # --- dragging --------------------------------------------------------------------
 
 
-def test_dragging_a_handle_in_pose_mode_moves_the_bone():
-    """The point of the gizmos: an empty cannot be clicked in Pose mode."""
-    from armature_nodes.handles import MOVE
+def test_g_moves_a_marker_as_it_moves_any_object():
+    """A marker is its empty: moved as G moves an object, the marker takes
+    the move on the next tick, and the bone follows."""
+    obj, tree, _node, _mn, _marker, handle = _marker_on("ArmatureNodesPositionNode")
+    handle.location = Vector(handle.location) + Vector((0.3, 0.0, 0.2))
+    goal = Vector(handle.location)
+    live._tick()
+    live._build(tree)
+    live._tick()
+    assert (live._head(obj) - goal).length < 1e-3, (live._head(obj), goal)
+
+
+def test_dragging_a_glow_moves_the_marker_freely():
+    """Press on a glow and drag: the marker follows the mouse in the view's
+    plane -- X locks it to that axis -- and the bone follows the marker."""
+    from armature_nodes.handles import Drag
 
     obj, tree, _node, _mn, _marker, handle = _marker_on("ArmatureNodesPositionNode")
-    before = live._head(obj)
-    bpy.context.view_layer.objects.active = obj
-    bpy.ops.object.mode_set(mode="POSE")
-
-    start = VIEW.to_screen(handle.location)
-    _drag(handle, MOVE, start, start + Vector((100.0, 0.0)))
-    live._full_tick()
-    live._build(tree)
-    assert obj.mode == "POSE", "the drag must not leave Pose mode"
-    live._assert_close(live._head(obj), before + Vector((1.0, 0.0, 0.0)), "bone")
-
-
-def test_a_drag_rebuilds_on_the_next_tick():
-    """Not after the edit debounce: it restarts on every mouse move, so the
-    rig would stay behind the handle until the mouse stopped."""
-    from armature_nodes import tree as tree_module
-    from armature_nodes.handles import MOVE
-
-    _obj, _tree, _node, _mn, _marker, handle = _marker_on("ArmatureNodesPositionNode")
-    delays, schedule = [], tree_module._schedule
-    tree_module._schedule = delays.append
-    try:
-        start = VIEW.to_screen(handle.location)
-        _drag(handle, MOVE, start, start + Vector((100.0, 0.0)))
-        live._full_tick()
-    finally:
-        tree_module._schedule = schedule
-    assert delays and delays[-1] == 0.0, f"scheduled with {delays}"
-
-
-def test_x_locks_the_move_and_shift_is_fine():
-    from armature_nodes.handles import Drag, MOVE
-
-    _obj, _tree, _node, _mn, _marker, handle = _marker_on("ArmatureNodesPositionNode")
-    before = handle.location.copy()
-    start = VIEW.to_screen(before)
-    drag = Drag(handle, MOVE, VIEW, start)
+    was = Vector(handle.location)
+    start = VIEW.to_screen(was)
+    drag = Drag(handle, VIEW, start)
     drag.set_axis("X")
-    drag.update(start + Vector((100.0, 100.0)))
-    live._assert_close(handle.location, before + Vector((1.0, 0.0, 0.0)), "locked to X")
-    drag.set_axis("X")  # pressed again: free
-    drag.update(start + Vector((100.0, 100.0)), precise=True)
-    live._assert_close(handle.location, before + Vector((0.1, 0.0, 0.1)), "fine move")
-
-
-def test_escape_puts_it_back():
-    from armature_nodes.handles import MOVE
-
-    _obj, _tree, _node, _mn, _marker, handle = _marker_on("ArmatureNodesPositionNode")
-    before = handle.location.copy()
-    start = VIEW.to_screen(before)
-    drag = _drag(handle, MOVE, start, start + Vector((150.0, -40.0)))
-    drag.cancel()
-    live._assert_close(handle.location, before, "handle after cancel")
-
-
-def test_ctrl_drops_the_marker_on_the_surface():
-    from armature_nodes.handles import MOVE
-
-    obj, tree, _node, _mn, _marker, handle = _marker_on("ArmatureNodesPositionNode")
-    # A wall facing the viewer, one metre deep.
-    bpy.ops.mesh.primitive_plane_add(size=10.0, location=(0.0, 1.0, 1.0), rotation=(math.radians(90.0), 0.0, 0.0))
-    bpy.context.view_layer.objects.active = obj
-    bpy.context.view_layer.update()
-    start = VIEW.to_screen(handle.location)
-    _drag(handle, MOVE, start, start + Vector((50.0, 0.0)), snap=True, context=bpy.context)
-    want = Vector((VIEW.on_plane(start, handle.location).x + 0.5, 1.0, VIEW.on_plane(start, handle.location).z))
-    live._assert_close(handle.location, want, "on the wall")
-    live._full_tick()
+    drag.update(start + Vector((40.0, 20.0)))
+    assert (Vector(handle.location) - was - Vector((0.4, 0.0, 0.0))).length < 1e-6, "X only"
+    drag.set_axis("X")  # free again
+    drag.update(start + Vector((40.0, 20.0)))
+    goal = Vector(handle.location)
+    assert (goal - was - Vector((0.4, 0.0, 0.2))).length < 1e-6
+    live._tick()
     live._build(tree)
-    live._assert_close(live._head(obj), want, "bone on the wall")
+    live._tick()
+    assert (live._head(obj) - goal).length < 1e-3, (live._head(obj), goal)
 
 
-def test_turning_the_ring_turns_the_bone():
-    from armature_nodes.handles import ROTATE
+def test_a_click_selects_the_marker_for_g_r_s():
+    from armature_nodes.handles import select_marker
 
-    obj, tree, _node, _mn, _marker, handle = _marker_on("ArmatureNodesTransformNode", "Transform")
-    before = live._world_rot(obj)
-    c = VIEW.to_screen(handle.location)
-    # A quarter turn, counter-clockwise on screen.
-    _drag(handle, ROTATE, c + Vector((50.0, 0.0)), c + Vector((0.0, 50.0)))
-    live._full_tick()
-    live._build(tree)
-    turn = Quaternion(VIEW.facing(), math.radians(90.0))
-    live._assert_turn(live._world_rot(obj), turn @ before, "bone")
-
-
-def test_ctrl_turns_in_five_degree_steps():
-    from armature_nodes.handles import ROTATE
-
-    _obj, _tree, _node, _mn, _marker, handle = _marker_on("ArmatureNodesTransformNode", "Transform")
-    before = handle.rotation_euler.to_quaternion()
-    c = VIEW.to_screen(handle.location)
-    tilt = Vector((math.cos(math.radians(12.0)), math.sin(math.radians(12.0)))) * 50.0
-    _drag(handle, ROTATE, c + Vector((50.0, 0.0)), c + tilt, snap=True)
-    turned = handle.rotation_euler.to_quaternion() @ before.inverted()
-    assert abs(math.degrees(2.0 * math.acos(min(1.0, abs(turned.w)))) - 10.0) < 1e-3
-
-
-def test_dragging_the_square_scales_the_bone():
-    from armature_nodes.handles import SCALE
-
-    obj, tree, _node, _mn, _marker, handle = _marker_on("ArmatureNodesTransformNode", "Transform")
-    c = VIEW.to_screen(handle.location)
-    _drag(handle, SCALE, c + Vector((40.0, 0.0)), c + Vector((80.0, 0.0)))
-    live._assert_close(handle.scale, (2.0, 2.0, 2.0), "handle")
-    live._full_tick()
-    live._build(tree)
-    live._assert_close(obj.pose.bones["bone.002"].matrix.to_scale(), (2.0, 2.0, 2.0), "bone")
-
-
-# --- what is offered -------------------------------------------------------------
-
-
-def test_a_marker_that_only_turns_turns_from_its_glow():
-    """Wired into Rotation, the position is a readout: the glow turns it."""
-    from armature_nodes.handles import MOVE, ROTATE, visible_handles
-
-    _obj, _tree, _node, _mn, marker, handle = _marker_on("ArmatureNodesRotationNode", "Rotation")
-    [h] = [h for h in visible_handles() if h.key == marker.key]
-    assert not h.move and h.turn, (h.move, h.turn)
-    assert h.core_mode() == ROTATE
-    before = handle.location.copy()
-    start = VIEW.to_screen(before)
-    _drag(handle, MOVE, start, start + Vector((80.0, 40.0)))
-    live._assert_close(handle.location, before, "a readout position moved")
+    obj, _tree, _node, _mn, _marker, handle = _marker_on("ArmatureNodesPositionNode")
+    obj.select_set(True)
+    select_marker(bpy.context, handle)
+    assert handle.select_get() and bpy.context.view_layer.objects.active == handle and not obj.select_get()
+    select_marker(bpy.context, handle, extend=True)  # Shift on the active one takes it off
+    assert not handle.select_get()
 
 
 def test_a_mirrored_landmark_is_not_grabbable():
@@ -340,11 +241,12 @@ def test_zoomed_far_out_a_handle_can_still_be_grabbed():
     assert abs(tiny - SMALLEST * ui_scale()) < 1e-6, tiny
 
 
-def test_what_you_can_grab_follows_the_zoom():
-    """The same press, 30 pixels from the handle: on it zoomed in, off it
-    zoomed out -- the gizmo's hit test uses the size it is drawn at. And
-    that size is the figure's: this rig is 3.8 m tall, so 20 pixels out is
-    still on it where a 1.8 m figure's handle would have ended."""
+def test_what_lights_up_follows_the_zoom():
+    """The mouse 30 pixels from the handle: on it zoomed in, off it zoomed
+    out -- the hover test uses the size the glow is drawn at. And that size
+    is the figure's: this rig is 3.8 m tall, so 20 pixels out is still on it
+    where a 1.8 m figure's handle would have ended. What lights up is what
+    a press grabs."""
     import types
 
     from armature_nodes import handles
@@ -359,10 +261,11 @@ def test_what_you_can_grab_follows_the_zoom():
             handles.View = lambda region, rv3d, ppm=ppm: ZoomView(ppm)
             press = ZoomView(ppm).to_screen(handle.location) + Vector((gap, 0.0))
             found[ppm, gap] = gizmo.test_select(types.SimpleNamespace(hit=None), context, press)
+            assert (found[ppm, gap] == handles.MOVE) == (handles.hovered_ident() is not None)
     finally:
         handles.View = real
         handles._set_hovered(None)
-    assert found[4000.0, 30.0] == handles.MOVE, "zoomed in, the handle is under the press"
+    assert found[4000.0, 30.0] == handles.MOVE, "zoomed in, the handle is under the mouse"
     assert found[400.0, 30.0] == -1, "zoomed out, the handle is smaller than 30 pixels"
     assert found[400.0, 20.0] == handles.MOVE, "sized to its 3.8 m rig, it reaches 20 pixels"
 

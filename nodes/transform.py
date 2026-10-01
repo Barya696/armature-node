@@ -11,9 +11,11 @@ from bpy.types import Node
 from bpy.props import (
     BoolProperty,
     EnumProperty,
+    FloatProperty,
     FloatVectorProperty,
     IntProperty,
     PointerProperty,
+    StringProperty,
 )
 from mathutils import Vector
 
@@ -243,6 +245,11 @@ class PositionNode(_TransformNodeBase, Node):
     Setting a position replaces any offset an earlier node applied -- the
     later node wins, as in Geometry Nodes. Pose only; rest geometry is never
     touched.
+
+    A marker wired into Position takes the bone's place -- or, given a seed
+    bone, a point along that one, the Offset taking up the difference so
+    nothing moves: the Human Skeleton's elbow sits on the elbow and moves
+    the pole target standing well behind it.
     """
 
     bl_idname = "ArmatureNodesPositionNode"
@@ -259,6 +266,10 @@ class PositionNode(_TransformNodeBase, Node):
         default=False,
         update=_on_use_absolute_changed,
     )
+    # Where a wired marker is seeded instead: this far from the head of
+    # this bone to its tail.
+    seed_bone: StringProperty(name="Seed Bone", options={"HIDDEN"})
+    seed_at: FloatProperty(name="Seed At", min=0.0, max=1.0, options={"HIDDEN"})
 
     _INPUTS = (("Position", VectorSocket, None), ("Offset", VectorSocket, None))
 
@@ -290,10 +301,17 @@ class PositionNode(_TransformNodeBase, Node):
     def marker_seed(self, socket_name, attr, value):
         """The Position that keeps the bone at ``value``: this node adds its
         own Offset on top, so taking the bone's place as it is would move it
-        by the Offset."""
-        if socket_name == "Position" and attr == "position":
+        by the Offset -- or, with a seed bone, the point on it, the Offset
+        becoming the way from there to the bone."""
+        if socket_name != "Position" or attr != "position":
+            return value
+        obj, _pbone = self.single_bone()
+        seed = obj.pose.bones.get(self.seed_bone) if obj is not None and self.seed_bone else None
+        if seed is None:
             return tuple(Vector(value) - Vector(self.socket_value("Offset")))
-        return value
+        at = obj.matrix_world @ seed.head.lerp(seed.tail, self.seed_at)
+        self.write_socket("Offset", tuple(Vector(value) - at))
+        return tuple(at)
 
     def on_socket_edited(self, sock):
         # Typing a position is asking for it: take the bone over, rather than

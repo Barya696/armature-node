@@ -28,6 +28,7 @@ _MODULES = (
     "nodes",
     "groups",
     "human_skeleton",
+    "pose_fit",
     "operators",
     "primary_rig",
     "handles",

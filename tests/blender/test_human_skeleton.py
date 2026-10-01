@@ -14,21 +14,31 @@ H = 1.6  # the mannequin, and the rig, are this tall
 
 
 def _rig():
-    """An armature with Rigify's control names at a 1.6 m human's places --
-    not the group's 1.8 m defaults, so a marker that takes its bone moves --
-    and the limbs' ``*_parent`` bones holding Rigify's pole switch, off."""
-    from armature_nodes.human_skeleton import spec
+    """An armature with Rigify's bone names at a 1.6 m human's places -- not
+    the group's own, so a marker that takes its place moves: the controls,
+    the joints the shoulders, elbows and knees sit on (ORG-forearm...), the
+    pole targets well behind and in front of those, and the limbs'
+    ``*_parent`` bones holding Rigify's pole switch, off."""
     from armature_nodes.ops.bind import bind
 
     fixtures.ensure_registered()
+    places = {"torso": (0.0, 0.018, 0.544), "chest": (0.0, 0.0, 0.65), "neck": (0.0, 0.006, 0.837), "head": (0.0, -0.013, 0.899)}
+    for side, suffix in ((1.0, "L"), (-1.0, "R")):
+        for name, (x, y, z) in {
+            "shoulder": (0.009, -0.035, 0.809), "ORG-upper_arm": (0.099, 0.014, 0.799),
+            "ORG-forearm": (0.222, 0.045, 0.727), "upper_arm_ik_target": (0.24, 0.3, 0.75),
+            "hand_ik": (0.331, 0.025, 0.655), "ORG-shin": (0.049, -0.015, 0.271),
+            "thigh_ik_target": (0.049, -0.5, 0.27), "foot_ik": (0.05, 0.008, 0.035),
+        }.items():
+            places[f"{name}.{suffix}"] = (side * x, y, z)
     arm = bpy.data.armatures.new("rig")
     obj = bpy.data.objects.new("rig", arm)
     bpy.context.scene.collection.objects.link(obj)
     bpy.context.view_layer.objects.active = obj
     bpy.ops.object.mode_set(mode="EDIT")
-    for _name, control, _parent, where, _how, side in spec():
-        bone = arm.edit_bones.new(control)
-        bone.head = (side * where[0] * H, where[1] * H, where[2] * H)
+    for name, where in places.items():
+        bone = arm.edit_bones.new(name)
+        bone.head = Vector(where) * H
         bone.tail = bone.head + Vector((0.0, 0.0, 0.1))
     for name in ("upper_arm_parent.L", "upper_arm_parent.R", "thigh_parent.L", "thigh_parent.R"):
         bone = arm.edit_bones.new(name)
@@ -51,6 +61,9 @@ def _mannequin(arms_down=45.0):
         "pelvis": Vector((0.0, 0.0, 0.544 * H)), "chest": Vector((0.0, 0.0, 0.65 * H)),
         "neck": Vector((0.0, 0.0, 0.83 * H)), "head": Vector((0.0, 0.0, 0.899 * H)),
         "crown": Vector((0.0, 0.0, 0.94 * H)),  # a head 0.06 H round: its top at H
+        # Halfway from the top of the neck to the top of the head, as
+        # Rigify's head bone runs: where the Head marker goes.
+        "mid-head": Vector((0.0, 0.0, (0.899 + 1.0) / 2.0 * H)),
     }
     limbs = [("pelvis", "chest", 0.075), ("chest", "neck", 0.07), ("neck", "head", 0.03), ("head", "crown", 0.06)]
     for side, x in (("L", 1.0), ("R", -1.0)):
@@ -101,26 +114,40 @@ def _at(node):
 
 
 def test_the_group_holds_the_skeleton_and_is_made_once():
+    """Sixteen joints of a stick figure, one colour, drawn with seventeen
+    lines: the spine, the collarbones and the chest between them, arms,
+    hips and legs."""
     from armature_nodes.human_skeleton import human_skeleton_group
+    from armature_nodes.nodes.wrap import gather
 
     fixtures.ensure_registered()
     group = human_skeleton_group()
     assert human_skeleton_group() == group
     markers, _wrap = _group_parts(group)
-    moves = {n.bone for n in group.nodes if n.bl_idname == "ArmatureNodesTransformNode"}
-    assert len(markers) == 13 and len(moves) == 13
-    assert {"torso", "chest", "head", "hand_ik.L", "foot_ik.R", "upper_arm_ik_target.L"} <= moves
+    moves = {n.bone: n for n in group.nodes if n.bl_idname in ("ArmatureNodesTransformNode", "ArmatureNodesPositionNode")}
+    assert len(markers) == 16 and len(moves) == 14, "every marker but the hips moves a control"
+    assert {"torso", "chest", "neck", "head", "hand_ik.L", "foot_ik.R", "upper_arm_ik_target.L", "shoulder.R"} <= set(moves)
+    assert moves["thigh_ik_target.L"].seed_bone == "ORG-shin.L", "a knee sits on the knee, not on its pole target"
     assert markers["Hand.L"]._parent_source().node == markers["Elbow.L"]
-    assert markers["Knee.R"]._parent_source().node == markers["Foot.R"]
-    assert len(group.marker_links) == 2, "the thighs: pelvis to each knee"
-    assert markers["Elbow.L"].markers[0].wrap_role == "FREE", "a pole target is carried, not wrapped"
+    assert markers["Knee.R"]._parent_source().node == markers["Hip.R"]
+    assert markers["Shoulder.L"]._parent_source().node == markers["Chest"]
+    entries, bones = gather(group)
+    assert len(entries) == 16 and len(bones) == 17, len(bones)
+    assert {tuple(round(c, 3) for c in n.markers[0].color) for n in markers.values()} == {(0.947, 0.212, 0.006)}
+    roles = {name: n.markers[0].wrap_role for name, n in markers.items()}
+    assert {roles.pop("Hip.L"), roles.pop("Hip.R")} == {"FREE"}, "a hip is carried: there the body is all pelvis"
+    assert set(roles.values()) == {"INSIDE"}, "every other marker is a joint, drawn into the body"
     switch = next(n for n in group.nodes if n.bl_idname == "ArmatureNodesRigifySwitchNode")
     pole = switch.switches["pole_vector"]
     assert pole.use and pole.flag
 
 
-def test_on_a_rig_every_marker_takes_its_controls_place_and_nothing_moves():
+def test_on_a_rig_every_marker_takes_its_joints_place_and_nothing_moves():
+    """A hand on its IK control -- and an elbow on the elbow, not on the pole
+    target it moves, which stands well behind it; the head in the middle of
+    the head. Every marker drawn: a hip moves nothing but shows."""
     from armature_nodes.human_skeleton import add_to_tree, spec
+    from armature_nodes.primary_rig import marker_node_visible
 
     rig, tree = _rig()
     heads = {pb.name: (rig.matrix_world @ pb.matrix).to_translation() for pb in rig.pose.bones}
@@ -128,8 +155,12 @@ def test_on_a_rig_every_marker_takes_its_controls_place_and_nothing_moves():
     live._build(tree)
     live._tick()
     markers, _wrap = _group_parts(node.node_tree)
-    for name, control, _parent, _where, _how, _side in spec():
-        live._assert_close(_at(markers[name]), heads[control], f"{name} on {control}")
+    for name, control, seed, _parent, _where, _side in spec():
+        if control is not None:
+            bone, along = seed or (control, 0.0)
+            pb = rig.pose.bones[bone]
+            live._assert_close(_at(markers[name]), rig.matrix_world @ pb.head.lerp(pb.tail, along), f"{name} on {bone}")
+    assert all(marker_node_visible(n) for n in markers.values())
     live._build(tree, live.BUILDS)
     for name, head in heads.items():
         live._assert_close((rig.matrix_world @ rig.pose.bones[name].matrix).to_translation(), head, name)
@@ -158,19 +189,18 @@ def test_auto_pairs_finds_the_joints_of_a_standing_character():
     body, joints = _mannequin()
     markers, wrap = _group_parts(human_skeleton_group())
     wrap.target = body
-    assert auto_pairs(wrap, MeshTarget(body, bpy.context.evaluated_depsgraph_get())) == 9
+    assert auto_pairs(wrap, MeshTarget(body, bpy.context.evaluated_depsgraph_get())) == 14, "all but the hips"
     misses = []
     for name, joint, tolerance in (
-        ("Pelvis", "pelvis", 0.02), ("Chest", "chest", 0.02), ("Head", "head", 0.02),
-        ("Foot.L", "ankle.L", 0.03), ("Foot.R", "ankle.R", 0.03),
-        ("Hand.L", "wrist.L", 0.04), ("Hand.R", "wrist.R", 0.04),
+        ("Pelvis", "pelvis", 0.02), ("Chest", "chest", 0.02), ("Neck", "neck", 0.02), ("Head", "mid-head", 0.02),
+        ("Shoulder.L", "shoulder.L", 0.03), ("Elbow.L", "elbow.L", 0.03), ("Elbow.R", "elbow.R", 0.03),
+        ("Hand.L", "wrist.L", 0.04), ("Hand.R", "wrist.R", 0.04), ("Knee.L", "knee.L", 0.03), ("Knee.R", "knee.R", 0.03), ("Foot.L", "ankle.L", 0.03), ("Foot.R", "ankle.R", 0.03),
     ):
         got = Vector(markers[name].markers[0].wrap_target)
         off = (got - joints[joint]).length
         if off >= tolerance * H:
             misses.append(f"{name} {off * 100:.1f} cm from the {joint}, at {tuple(round(v, 3) for v in got)}")
     assert not misses, "; ".join(misses)
-    assert not markers["Elbow.L"].markers[0].wrap_pair, "a pole target is not paired"
 
 
 def test_fit_to_mesh_pairs_and_wraps_in_one_go():
@@ -186,8 +216,9 @@ def test_fit_to_mesh_pairs_and_wraps_in_one_go():
     assert wrap.wrap_stage == 3
     assert (_at(markers["Hand.L"]) - joints["wrist.L"]).length < 0.04 * H
     assert (_at(markers["Pelvis"]) - joints["pelvis"]).length < 0.02 * H
-    elbow = _at(markers["Elbow.L"])
-    assert elbow.x > joints["shoulder.L"].x and elbow.z < joints["shoulder.L"].z, "the pole target was not carried down the arm"
+    assert (_at(markers["Elbow.L"]) - joints["elbow.L"]).length < 0.03 * H
+    assert (_at(markers["Knee.R"]) - joints["knee.R"]).length < 0.03 * H
+    assert (_at(markers["Hip.L"]) - joints["hip.L"]).length < 0.03 * H, "the hip, carried with the pelvis"
 
 
 def test_fit_keeps_your_picks_and_redoes_its_own_pairs():

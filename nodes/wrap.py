@@ -271,35 +271,64 @@ def world_positions(entries):
     return np.array(points, dtype=float).reshape(-1, 3)
 
 
+# Where a kept pose holds the tree's Position node Offsets: a key no marker has.
+_OFFSETS = "\toffsets"
+
+
 def _dump(entries, points):
-    """A pose to keep on the node: ``points`` for the markers of ``entries``."""
-    return json.dumps({f"{n.name}\t{m.key}": [float(v) for v in p] for (n, m), p in zip(entries, points)})
+    """A pose to keep on the node: ``points`` for the markers of ``entries``,
+    each marker's turn as it is -- and the Offsets of the tree's Position
+    nodes, which Pose aims (a pole) and turns (a head) besides the markers."""
+    pose = {
+        f"{n.name}\t{m.key}": [float(v) for v in (*p, *n.marker_value(m, "rotation"))]
+        for (n, m), p in zip(entries, points)
+    }
+    if entries:
+        pose[_OFFSETS] = {
+            n.name: [float(v) for v in n.socket_value("Offset")]
+            for n in entries[0][0].id_data.nodes if n.bl_idname == "ArmatureNodesPositionNode"
+        }
+    return json.dumps(pose)
+
+
+def _place_offsets(tree, pose):
+    """The Position node Offsets kept in ``pose``, back on their nodes -- none
+    for a pose kept before Offsets were."""
+    for name, offset in json.loads(pose or "{}").get(_OFFSETS, {}).items():
+        move = tree.nodes.get(name)
+        if move is not None and move.bl_idname == "ArmatureNodesPositionNode":
+            move.write_socket("Offset", tuple(offset))
+    tree.mark_dirty()
 
 
 def _load(pose, entries):
-    """(n, 3) the kept ``pose`` for ``entries`` -- where a marker is now, for
-    one added since."""
+    """((n, 3) places, [turn or None]): the kept ``pose`` for ``entries`` --
+    where a marker is now, for one added since; no turn for one kept before
+    turns were."""
     saved = json.loads(pose or "{}")
-    points = [saved.get(f"{n.name}\t{m.key}") or n.marker_value(m, "position") for n, m in entries]
-    return np.array(points, dtype=float).reshape(-1, 3)
+    kept = [saved.get(f"{n.name}\t{m.key}") for n, m in entries]
+    points = [k[:3] if k else n.marker_value(m, "position") for k, (n, m) in zip(kept, entries)]
+    return np.array(points, dtype=float).reshape(-1, 3), [k[3:] if k and len(k) == 6 else None for k in kept]
 
 
-def place_markers(entries, points):
+def place_markers(entries, points, turns=None):
     """Move each marker to its world position in ``points`` -- parents first,
     each child against its parent's new place, as a drag does -- with a
-    Skeleton node's face, finger and toe landmarks riding along. The rig
-    follows on the next tick."""
+    Skeleton node's face, finger and toe landmarks riding along -- and turn
+    it as ``turns`` says, where it says. The rig follows on the next tick."""
     from ..tree import apply_soon
     from .marker_base import deferred_marker_writes
 
     if not entries:
         return
     with deferred_marker_writes():
-        for (node, marker), point in zip(entries, points):
+        for k, ((node, marker), point) in enumerate(zip(entries, points)):
             for key, value in node._with_group_followers({marker.key: Vector(point)}).items():
                 moved = node.marker_by_key(key)
                 if moved is not None:
                     node.write_marker(moved, "position", tuple(value))
+            if turns is not None and turns[k] is not None:
+                node.write_marker(marker, "rotation", tuple(turns[k]))
     entries[0][0].id_data.mark_dirty()
     apply_soon()
 
@@ -458,7 +487,7 @@ def auto_pairs(wrap, mesh):
     from ..human_skeleton import landmarks, spec
 
     found = landmarks(mesh)
-    level = {name for name, _c, _p, _w, how, _s in spec() if how == "height"}
+    level = {name for name, _c, _s, _p, where, _side in spec() if isinstance(where, tuple)}
     todo = [
         m for _n, m in tree_markers(wrap.id_data)
         if m.name in found and not m.wrap_picked and m.wrap_role in ("INSIDE", "SURFACE")
@@ -980,24 +1009,17 @@ class ARMATURE_NODES_OT_wrap_auto_pairs(_WrapOperator, Operator):
 
 class ARMATURE_NODES_OT_wrap_add(Operator):
     """Add a Wrap Markers node to the selected rig's tree, to fit the
-    markers it holds onto a character. Markers named like the Human
-    Skeleton's pole targets (Elbow, Knee) are made Free, as there"""
+    markers it holds onto a character"""
 
     bl_idname = "armature_nodes.wrap_add"
     bl_label = "Wrap These Markers"
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
-        from ..human_skeleton import spec
-
         tree = selected_rig_tree(context)
         if tree is None:
             self.report({"WARNING"}, "Select a rig with an Armature Nodes tree first")
             return {"CANCELLED"}
-        carried = {name for name, _c, _p, _w, how, _s in spec() if how is None}
-        for _node, marker in tree_markers(tree):
-            if marker.name in carried and marker.wrap_role == "INSIDE":
-                marker.wrap_role = "FREE"
         wrap = tree.nodes.new(WRAP_NODE)
         spots = [n.location for n in tree.nodes if n != wrap]
         wrap.location = (min(p.x for p in spots) - 300.0, max(p.y for p in spots)) if spots else (0.0, 0.0)
@@ -1024,7 +1046,8 @@ def selected_rig_tree(context):
 def wrap_node_for(context):
     """The Wrap Markers node the viewport panel works with: one in a
     selected rig's tree or a group it runs -- the rig and the character can
-    be selected in either order -- else one wrapping onto a selected mesh.
+    be selected in either order -- else one beside a selected marker, else
+    one wrapping onto a selected mesh.
     None when there is none."""
     from ..groups import armature_trees, trees_in_use
 
@@ -1035,6 +1058,11 @@ def wrap_node_for(context):
             for node in tree.nodes:
                 if node.bl_idname == WRAP_NODE:
                     return node
+    for obj in objects:  # a marker's own empty, clicked to move it
+        tree = bpy.data.node_groups.get(obj.get("an_tree", "")) if obj.type == "EMPTY" else None
+        for node in tree.nodes if tree is not None else ():
+            if node.bl_idname == WRAP_NODE:
+                return node
     for obj in objects:
         if obj.type == "MESH":
             for tree in armature_trees():
@@ -1071,7 +1099,9 @@ def _preview_set(node, value):
         node.wrap_original = leaving
     else:
         node.wrap_wrapped = leaving
-    place_markers(entries, _load(node.wrap_wrapped if value else node.wrap_original, entries))
+    shown = node.wrap_wrapped if value else node.wrap_original
+    place_markers(entries, *_load(shown, entries))
+    _place_offsets(node.id_data, shown)
     node["wrap_preview"] = value
     _redraw()
 
@@ -1083,9 +1113,8 @@ class WrapMarkersNode(ArmatureNodeBase, Node):
     Two buttons: Pick Pairs, and Fit to Mesh, which fits onto the selected
     character; under them, Original and Wrapped, to see the skeleton before
     the fit and after it. No sockets: it works on the markers of its tree,
-    the skeleton the viewport draws. Each marker's Wrap role (Inside, Surface, Free,
-    Fixed) says what happens to it; the Human Skeleton sets them, and Wrap
-    These Markers frees the pole targets.
+    the skeleton the viewport draws. Each marker's Wrap role (Inside,
+    Surface, Free, Fixed) says what happens to it.
     """
 
     bl_idname = WRAP_NODE
@@ -1163,7 +1192,7 @@ class WrapMarkersNode(ArmatureNodeBase, Node):
 
     def originals(self, entries):
         """(n, 3) where the markers were before the fit."""
-        return _load(self.wrap_original, entries)
+        return _load(self.wrap_original, entries)[0]
 
     def draw_buttons(self, context, layout):
         """Quietly on top, the character it fits to -- or, while Pick Pairs
@@ -1204,6 +1233,9 @@ class WrapMarkersNode(ArmatureNodeBase, Node):
         row = col.row()
         row.scale_y = 1.8
         row.operator("armature_nodes.wrap_run", text=_FIT[1], icon=_FIT[3]).step = _FIT[0]
+        row = col.row()
+        row.scale_y = 1.4
+        row.operator("armature_nodes.wrap_pose", text="Pose", icon="POSE_HLT")
         col.separator(factor=0.6)
         row = col.row(align=True)
         row.enabled = bool(self.wrap_original)  # nothing to show before a fit

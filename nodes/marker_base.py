@@ -255,10 +255,24 @@ def deferred_marker_writes():
         _apply_deferred(pending)
 
 
+def hold_world(node, marker):
+    """Within a pass, keep ``marker`` where it is in the world, whatever its
+    parents do -- for the values the pass does not write itself."""
+    if _deferred is None:
+        return
+    parts = _deferred.setdefault((node.id_data.name, node.name, marker.key), [node, marker, {}])[2]
+    for attr in ("position", "rotation"):
+        parts.setdefault(attr, tuple(node.marker_value(marker, attr)))
+
+
 def _apply_deferred(pending):
     moved = []
     for node, marker, parts in sorted(pending.values(), key=lambda e: e[0].parent_depth()):
         try:
+            # Checked now, after its parents: a marker already where it is
+            # written, their moves and all, needs nothing.
+            if all(same_vec(node.marker_value(marker, attr), value) for attr, value in parts.items()):
+                continue
             node.apply_world(marker, parts)
             moved.append(node)
         except ReferenceError:
@@ -422,14 +436,16 @@ class MarkerHolderMixin:
 
         This is how a node writes through a wired marker (``write_input``).
         No rebuild: the value comes from the rig, which is already there.
-        During a live pass the write waits (``deferred_marker_writes``).
+        During a live pass the write waits (``deferred_marker_writes``) --
+        even one matching the marker now: a parent written in the same pass
+        would carry it off before the writes land.
         """
-        if same_vec(self.marker_value(marker, attr), value):
-            return False
         if _deferred is not None:
             key = (self.id_data.name, self.name, marker.key)
             _deferred.setdefault(key, [self, marker, {}])[2][attr] = tuple(value)
-            return True
+            return not same_vec(self.marker_value(marker, attr), value)
+        if same_vec(self.marker_value(marker, attr), value):
+            return False
         self.apply_world(marker, {attr: value})
         self.push_markers_to_empties()
         return True

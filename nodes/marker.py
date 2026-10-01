@@ -545,8 +545,15 @@ class MarkerNode(MarkerHolderMixin, ArmatureNodeBase, Node):
         return changed
 
     def _read_idle(self, state):
-        """Values nothing drives with show the bone, constraints and all."""
+        """Values nothing drives with show the bone, constraints and all --
+        without carrying the markers parented to this one: they drive bones
+        of their own, which did not move. (Read before the build it starts
+        is evaluated, a shoulder's turn lags its chest's by a build; carried,
+        the elbow and the hand would swing round it.)"""
         from mathutils import Euler
+
+        from ..sockets import source_marker
+        from .marker_base import hold_world
 
         marker = self.marker
         world = state.obj.matrix_world @ state.pbone.matrix
@@ -556,6 +563,12 @@ class MarkerNode(MarkerHolderMixin, ArmatureNodeBase, Node):
                 continue
             value = _bone_part(state.obj, world, attr, Euler(marker.rotation, "XYZ"))
             changed |= self.write_marker(marker, attr, value)
+        if changed:
+            for node in self.id_data.nodes:
+                source = node._parent_source() if node is not self and hasattr(node, "_parent_source") else None
+                if source is not None and source_marker(source)[0] == self:
+                    for child in node.markers:
+                        hold_world(node, child)
         return changed
 
     # -- The handle ------------------------------------------------------------

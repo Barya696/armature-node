@@ -20,7 +20,7 @@ for path in (HERE, PARENT):
     if path not in sys.path:
         sys.path.insert(0, path)
 
-MODULES = ("test_model_roundtrip", "test_diff", "test_migrate", "test_wrap_solver")
+MODULES = ("test_model_roundtrip", "test_diff", "test_migrate", "test_wrap_solver", "test_pose_solver")
 
 
 def run():

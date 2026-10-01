@@ -164,11 +164,20 @@ A marker is a world position with a stable key, drawn as a glowing light and
 backed by an empty in the `MRKS_rig` collection. Placing things by dragging a
 handle beats typing coordinates, which is the only reason markers exist.
 
-**Grab the glow — in any mode, Pose mode included.** The glow is a viewport
-gizmo, like the ones on a light or a camera, so it does not need the empty to
-be clickable (Blender will not let you click another object while the
-armature is in Pose mode). It lights up with the marker's name beside it
-when the mouse is over it.
+**Click a marker, then G, R or S** — as with any object. The glow is drawn
+over the marker's empty, which is drawn in front of everything, so a click
+selects the marker and Blender's own transform does the rest: X / Y / Z,
+typed values, snapping (Face snapping drops a marker onto a surface), several
+markers at once, Esc or right-click to put it back, one undo step each. What
+a marker cannot do is locked on its empty: a position that is only a readout
+of the bone does not move, a marker that supplies no rotation does not turn.
+The glow under the mouse lights up with the marker's name beside it. Markers
+are picked in Object mode — in Pose mode, G / R / S move the bones.
+
+**Or drag a glow** — in any mode — to move the marker freely with the mouse:
+**X / Y / Z** lock the move to that axis, **Shift** moves it finely, **Ctrl**
+drops it onto the surface under the cursor, **Esc** or right-click puts it
+back. A press that does not move is a click, and selects the marker.
 
 **Handles are sized in the scene, like the character they sit on**: zoom in
 and they grow, zoom out and they shrink — so a zoomed-out figure is not
@@ -177,19 +186,7 @@ handle is a fixed share of its figure (the Skeleton's landmarks, or a Marker
 node's rig at rest), times the node's **Size**. Zoomed far out it stops
 shrinking at a size you can still see and grab.
 
-- **Drag the glow** to move the marker. **Ctrl** drops it onto the surface
-  under the cursor, **Shift** moves it finely, **X / Y / Z** lock the move to
-  that axis. **Esc** or right-click puts it back.
-- **Drag the ring** — there when the marker supplies a rotation — to turn it
-  about the view, or with X / Y / Z about that axis. Ctrl: 5° steps.
-- **Drag the square** on the ring — there when it supplies a scale — to scale
-  it. X / Y / Z: that axis only. Ctrl: steps of 0.1.
-- A marker whose position is only a readout of the bone turns (or scales)
-  when you drag its glow instead.
-- Every drag is one undo step.
 
-The drag moves the marker's empty, exactly as grabbing the empty would, so
-locks, mirroring, rigid groups and the live link to the bone all apply.
 
 Each marker node has a **Size** slider for its handles, and a Marker node has
 a **colour** swatch for its glow (MediaPipe landmarks keep their side
@@ -299,14 +296,15 @@ own **Handles** toggle still wins, for hiding one marker without unwiring it.
   bones go to them. A landmark does follow when you grab the bone it drives.
 
 - **Wrap Markers** — fits the tree's markers onto a character mesh, the
-  way the wrap add-on fits a template onto a scan. Two buttons and a switch,
-  on the node and in the 3D Viewport sidebar's **Wrap** tab:
+  way the wrap add-on fits a template onto a scan — and poses a rig from a
+  mesh. On the node and in the 3D Viewport sidebar's **Wrap** tab:
   - **Fit to Mesh** — select the rig and the character, in either order,
     and press it. The markers it knows by name (the Human Skeleton's, below:
-    Pelvis, Chest, Head, Clavicles, Hands, Feet) are paired with their
-    places automatically, found from human proportions and, for the hands,
-    the tips of the arms; then the skeleton is snapped onto the pairs, drawn
-    into the middle of the limbs and stuck there. The line above the buttons
+    Pelvis, Chest, Neck, Head, Shoulders, Elbows, Hands, Knees, Feet) are
+    paired with their places automatically, found from human proportions
+    and, for the elbows and hands, down the arms to their tips; then the
+    skeleton is snapped onto the pairs, drawn into the middle of the limbs
+    and stuck there. The line above the buttons
     says which character it fits to, and when it has.
   - **Pick Pairs** — for a marker the automatic pairs miss or place wrong.
     Press it and it stays pressed in, the picker on: over the viewport the
@@ -328,16 +326,36 @@ own **Handles** toggle still wins, for hiding one marker without unwiring it.
     it shows — a marker touched up after the fit is still touched up when
     you come back to Wrapped — and Fit fits the skeleton as Original shows
     it.
+  - **Pose** — the other way round: the rig posed by a mesh. For a mesh of
+    your character in another pose — generated from a picture (Hunyuan3D,
+    say), with a topology of its own — and the character rigged with
+    Rigify, its mesh skinned to the rig (an Armature modifier). Put the
+    Human Skeleton's markers on the generated mesh's joints (Fit to Mesh,
+    Pick Pairs, or by hand) and press **Pose**. The markers are strong
+    landmarks: they place the joints, the rig's IK reaching for them, the
+    head, hands and feet sliding a little to where the surface says they
+    are. What they cannot say is how each part is turned, and Pose finds that the way the
+    wrap fits a template onto a scan — Snap, Attract, Stick — except that
+    nothing moves but the rig: each pass pairs points spread over the rigged
+    mesh and over the generated one with the closest point of the other,
+    and turns the pelvis, chest, neck, head, hands and feet to bring the
+    pairs together. A part's rest shape also says where the markers beyond
+    it belong — the chest's, the neck and the shoulders — so the markers
+    steer its lean; a turn the surface cannot show is eased back. The turns
+    go to the markers, so the result is the rig's own pose, and **Original
+    | Wrapped** shows it before and after. A head turned far round is found
+    faster if you turn its marker roughly first. It needs a Rigify human
+    (its DEF bones); the biggest mesh the rig deforms is the one wrapped.
 
   How the skeleton moves: its bones are the lines the viewport draws between
   the markers (a marker and its parent, joined markers, MediaPipe's bones).
   Every bone keeps its length, a marker where three or more bones meet (a
   chest, a pelvis) turns as one solid piece, and the joints between bend:
   hands paired into an A-pose swing the arms down at the shoulders instead
-  of dragging the chest. Pole targets (the Human Skeleton's Elbows and
-  Knees) are carried, never drawn into the mesh. A marker moves the way a
-  drag moves it — a child against its parent, a face or finger landmark with
-  its anchor.
+  of dragging the chest. A Free marker (the Human Skeleton's hips) is
+  carried, never drawn into the mesh. A marker moves the way a drag moves
+  it — a child against its parent, a face or finger landmark with its
+  anchor.
 
   The fit streams into the markers, so the skeleton glides onto the
   character and the rig follows live; **Esc** stops it and puts them back,
@@ -347,16 +365,20 @@ own **Handles** toggle still wins, for hiding one marker without unwiring it.
   Symmetrize and each marker's role (Inside, Surface, Free, Fixed) are still
   there for scripts: `armature_nodes.wrap_run`, `wrap_symmetrize`,
   `SkeletonMarker.wrap_role`; the switch is the node's `preview`.
-- **Human Skeleton** (Shift+A › Group) — a ready-made group: thirteen
-  markers — Pelvis, Chest, Head, Clavicles, Elbows, Hands, Knees, Feet —
-  each driving the Rigify control that does that job through a Transform
-  node (torso, chest, head, shoulder, the IK hands and feet, the elbow and
-  knee pole targets), parented like the bones, the thighs drawn as lines. A
-  Rigify Switch turns the poles on and a Wrap Markers node comes with it.
-  The group is made the first time it is added. Wired into a Rigify rig's
-  tree, every marker takes its control's place, so nothing moves until you
-  fit it to a character: select the rig and the character, **Wrap** tab,
-  **Fit to Mesh**.
+- **Human Skeleton** (Shift+A › Group) — a ready-made group: a stick
+  figure of sixteen markers on the joints — Pelvis, Chest, Neck, Head,
+  Shoulders, Elbows, Hands, Hips, Knees, Feet — all one orange, joined as
+  the figure is drawn (the collarbones and the chest between them make a
+  triangle) and parented like the bones. Each moves the Rigify control that
+  does its joint's job: the torso, chest, neck and head, the shoulders, the
+  IK hands and feet; an elbow or a knee sits on the joint and moves its
+  limb's pole target, standing well behind or in front of it, and a hip
+  rides with the pelvis. A Rigify Switch turns the poles on and a Wrap
+  Markers node comes with it. The group is made the first time it is
+  added (a file made with the older, thirteen-marker one keeps that). Wired
+  into a Rigify rig's tree, every marker takes its joint's place on the
+  rig, so nothing moves until you fit it to a character: select the rig and
+  the character, **Wrap** tab, **Fit to Mesh**.
 
 ### Bone
 
@@ -389,6 +411,11 @@ rig already has.
     Position** is ticked or something is wired in (a wired marker counts).
     Ticking the box first fills Position from the bone, so it never jumps.
   - **Offset**: added on top, along world axes.
+
+  A marker wired into Position takes the bone's place — or, with a seed
+  bone set (scripts: `seed_bone`, `seed_at`), a point along that bone, the
+  Offset taking up the difference so nothing moves. That is how the Human
+  Skeleton's elbow sits on the elbow and moves the pole target behind it.
 - **Rotation** — the same pattern for orientation, in **degrees**: *Set
   Rotation* + Rotation for an absolute world orientation, Offset to turn on
   top. A wired marker supplies its own rotation.
@@ -570,7 +597,9 @@ node, which marks the tree dirty, which re-poses the rig.
 | `primary_rig.py` | Marker handles and locks, viewport overlay, MediaPipe preset table, marker operators |
 | `wrap_solver.py` | The Wrap Markers node's maths: Snap, Attract and Stick over a marker skeleton. numpy, no `bpy` |
 | `human_skeleton.py` | The Human Skeleton group, made on first use, and where its markers go on a character (Auto) |
-| `handles.py` | The grabbable marker gizmo: hit-testing, move / turn / scale drags, rings and name label |
+| `pose_solver.py` | Pose's maths: a skinned mesh's parts turned to meet a surface, landmarks and holds — Gauss-Newton, one step a pass. numpy, no `bpy` |
+| `pose_fit.py` | **Pose**: the rigged mesh and the generated one sampled and paired, the steps sent to the Human Skeleton's markers, the runner |
+| `handles.py` | The marker glows: outlined, lit and named under the mouse, dragged freely, clicked to select for G / R / S; the hit-testing Pick Pairs uses |
 | `marker_links.py` | Lines between Marker nodes: the joins, Fusion-style ports, their drawing and drag gizmo |
 | `groups.py` | Node groups: the group node, Make Group / Ungroup / Tab, group sockets kept in step, Shift+A > Group |
 | `widgets.py` | `WGTS_rig` widget library and Rigify-style preset generation |
