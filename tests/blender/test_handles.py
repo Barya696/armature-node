@@ -38,6 +38,14 @@ class FrontView:
 VIEW = FrontView()
 
 
+def _drag(obj, mode, start, end, **options):
+    from armature_nodes.handles import Drag
+
+    drag = Drag(obj, mode, VIEW, start)
+    drag.update(end, **options)
+    return drag
+
+
 def _marker_on(node_type, socket="Position"):
     """A rig, a node on bone.002 and a Marker wired into ``socket``."""
     obj, tree, _s, _o, node = live._fresh(node_type)
@@ -106,12 +114,12 @@ def test_g_moves_a_marker_as_it_moves_any_object():
 def test_dragging_a_glow_moves_the_marker_freely():
     """Press on a glow and drag: the marker follows the mouse in the view's
     plane -- X locks it to that axis -- and the bone follows the marker."""
-    from armature_nodes.handles import Drag
+    from armature_nodes.handles import MOVE, Drag
 
     obj, tree, _node, _mn, _marker, handle = _marker_on("ArmatureNodesPositionNode")
     was = Vector(handle.location)
     start = VIEW.to_screen(was)
-    drag = Drag(handle, VIEW, start)
+    drag = Drag(handle, MOVE, VIEW, start)
     drag.set_axis("X")
     drag.update(start + Vector((40.0, 20.0)))
     assert (Vector(handle.location) - was - Vector((0.4, 0.0, 0.0))).length < 1e-6, "X only"
@@ -134,6 +142,74 @@ def test_a_click_selects_the_marker_for_g_r_s():
     assert handle.select_get() and bpy.context.view_layer.objects.active == handle and not obj.select_get()
     select_marker(bpy.context, handle, extend=True)  # Shift on the active one takes it off
     assert not handle.select_get()
+
+
+def test_turning_the_ring_turns_the_bone():
+    from armature_nodes.handles import ROTATE
+
+    obj, tree, _node, _mn, _marker, handle = _marker_on("ArmatureNodesTransformNode", "Transform")
+    before = live._world_rot(obj)
+    c = VIEW.to_screen(handle.location)
+    # A quarter turn, counter-clockwise on screen.
+    _drag(handle, ROTATE, c + Vector((50.0, 0.0)), c + Vector((0.0, 50.0)))
+    live._full_tick()
+    live._build(tree)
+    turn = Quaternion(VIEW.facing(), math.radians(90.0))
+    live._assert_turn(live._world_rot(obj), turn @ before, "bone")
+
+
+def test_ctrl_turns_in_five_degree_steps():
+    from armature_nodes.handles import ROTATE
+
+    _obj, _tree, _node, _mn, _marker, handle = _marker_on("ArmatureNodesTransformNode", "Transform")
+    before = handle.rotation_euler.to_quaternion()
+    c = VIEW.to_screen(handle.location)
+    tilt = Vector((math.cos(math.radians(12.0)), math.sin(math.radians(12.0)))) * 50.0
+    _drag(handle, ROTATE, c + Vector((50.0, 0.0)), c + tilt, snap=True)
+    turned = handle.rotation_euler.to_quaternion() @ before.inverted()
+    assert abs(math.degrees(2.0 * math.acos(min(1.0, abs(turned.w)))) - 10.0) < 1e-3
+
+
+def test_dragging_the_square_scales_the_bone():
+    from armature_nodes.handles import SCALE
+
+    obj, tree, _node, _mn, _marker, handle = _marker_on("ArmatureNodesTransformNode", "Transform")
+    c = VIEW.to_screen(handle.location)
+    _drag(handle, SCALE, c + Vector((40.0, 0.0)), c + Vector((80.0, 0.0)))
+    live._assert_close(handle.scale, (2.0, 2.0, 2.0), "handle")
+    live._full_tick()
+    live._build(tree)
+    live._assert_close(obj.pose.bones["bone.002"].matrix.to_scale(), (2.0, 2.0, 2.0), "bone")
+
+
+# --- what is offered -------------------------------------------------------------
+
+
+def test_a_marker_that_only_turns_turns_from_its_glow():
+    """Wired into Rotation, the position is a readout: the glow turns it."""
+    from armature_nodes.handles import MOVE, ROTATE, visible_handles
+
+    _obj, _tree, _node, _mn, marker, handle = _marker_on("ArmatureNodesRotationNode", "Rotation")
+    [h] = [h for h in visible_handles() if h.key == marker.key]
+    assert not h.move and h.turn, (h.move, h.turn)
+    assert h.core_mode() == ROTATE
+    before = handle.location.copy()
+    start = VIEW.to_screen(before)
+    _drag(handle, MOVE, start, start + Vector((80.0, 40.0)))
+    live._assert_close(handle.location, before, "a readout position moved")
+
+
+def test_g_r_s_over_a_glow_are_keyed():
+    """G, R and S reach the marker under the mouse in every mode they move
+    things in -- and leave the key to Blender when no glow is hovered."""
+    from armature_nodes import handles
+
+    keyed = {(km.name, kmi.type, kmi.properties.mode) for km, kmi in handles._keymap_items}
+    if bpy.context.window_manager.keyconfigs.addon is not None:  # background Blender may have none
+        for mode in ("Object Mode", "Pose"):
+            assert {(mode, "G", "MOVE"), (mode, "R", "ROTATE"), (mode, "S", "SCALE")} <= keyed
+    handles._set_hovered(None)
+    assert not handles.ARMATURE_NODES_OT_marker_transform.poll(bpy.context)
 
 
 def test_a_mirrored_landmark_is_not_grabbable():

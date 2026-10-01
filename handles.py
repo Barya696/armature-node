@@ -14,15 +14,25 @@ it grows, zoom out and it shrinks (see ``screen_scale``). This gizmo outlines
 every glow and lights the one under the mouse, its name beside it. Press on
 a glow and drag, and the marker moves freely with the mouse: X / Y / Z lock
 the move to that axis, Shift moves it finely, Ctrl drops it onto the surface
-under the cursor, Esc or right-click puts it back. Press and let go without
+under the cursor, Esc or right-click puts it back. Drag its ring -- there
+when the marker supplies a rotation -- to turn it about the view (X / Y / Z:
+about that axis, Ctrl: 5 degree steps), its square -- there when it supplies
+a scale -- to scale it (X / Y / Z: that axis, Ctrl: steps of 0.1); a marker
+whose position is only a readout of its bone turns or scales from its glow. Press and let go without
 moving -- a click -- and the marker's empty is selected, as a click on any
-object selects it, ready for G / R / S.
+object selects it, ready for Blender's own G / R / S (Object mode).
+
+Or hover a glow and press G, R or S -- in any mode, Pose mode included --
+and that marker moves, turns or scales with the mouse, as its glow, ring and
+square do: X / Y / Z for an axis, Shift finely, Ctrl in steps; click or
+Enter to keep it, Esc or right-click to put it back. Away from a glow the
+keys are Blender's own.
 """
 
 import math
 
 import bpy
-from mathutils import Vector
+from mathutils import Quaternion, Vector
 
 try:
     import blf
@@ -33,6 +43,7 @@ except ImportError:  # outside Blender (unit tests)
     blf = gpu = view3d_utils = batch_for_shader = None
 
 MOVE, ROTATE, SCALE = 0, 1, 2
+_MODE_NAMES = ("Move", "Rotate", "Scale")
 
 # Sizes in pixels, before the node's Size -- the pixels of a full-body view,
 # where the figure is FIGURE_PIXELS tall on screen. Zoomed in or out, the
@@ -227,17 +238,36 @@ class View:
 # ---------------------------------------------------------------------------
 
 
-class Drag:
-    """One free drag of a marker's glow: its empty follows the mouse in the
-    view's plane. X / Y / Z lock it to that axis, Shift moves it finely, Ctrl
-    drops it onto the surface under the cursor. Its locked channels stay
-    put, as they do under G."""
+def _signed_angle(a, b):
+    """Angle from 2D vector ``a`` to ``b``, counter-clockwise positive."""
+    angle = math.atan2(b.y, b.x) - math.atan2(a.y, a.x)
+    while angle > math.pi:
+        angle -= 2.0 * math.pi
+    while angle < -math.pi:
+        angle += 2.0 * math.pi
+    return angle
 
-    def __init__(self, obj, view, mouse):
-        self.obj, self.view = obj, view
+
+class Drag:
+    """One drag of one handle: move, turn or scale it, the way G / R / S do.
+
+    Works on the handle's empty and nothing else. Locked channels stay put,
+    so a Skeleton's Lock Depth, a mirrored landmark or a marker whose
+    position is only a readout are respected exactly as they are when the
+    empty is grabbed directly.
+    """
+
+    def __init__(self, obj, mode, view, mouse):
+        self.obj, self.mode, self.view = obj, mode, view
         self.loc0 = obj.location.copy()
+        self.rot0 = obj.rotation_euler.copy()
+        self.scale0 = obj.scale.copy()
+        # Turns and scales are measured from where the drag started, so a
+        # press on the ring or the square changes nothing by itself.
         self.mouse0 = Vector(mouse)
+        self.center = view.to_screen(self.loc0) or Vector(self.mouse0)
         self.axis = None
+        self.last = None
 
     def set_axis(self, name):
         """X / Y / Z pressed: lock to that axis, or free it again."""
@@ -247,6 +277,21 @@ class Drag:
         mouse = Vector(mouse)
         if precise:
             mouse = self.mouse0 + (mouse - self.mouse0) * 0.1
+        (self._move, self._rotate, self._scale)[self.mode](mouse, snap, context)
+        self.last = mouse
+
+    def cancel(self):
+        self.obj.location = self.loc0
+        self.obj.rotation_euler = self.rot0
+        self.obj.scale = self.scale0
+
+    def describe(self):
+        text = _MODE_NAMES[self.mode]
+        return f"{text} {self.axis}" if self.axis else text
+
+    # -- The three motions -------------------------------------------------------
+
+    def _move(self, mouse, snap, context):
         target = self._surface(mouse, context) if snap else None
         if target is None:
             delta = self.view.on_plane(mouse, self.loc0) - self.view.on_plane(self.mouse0, self.loc0)
@@ -261,16 +306,51 @@ class Drag:
         if (Vector(self.obj.location) - new).length > 1e-9:
             self.obj.location = new
 
-    def cancel(self):
-        self.obj.location = self.loc0
-
     def _surface(self, mouse, context):
         """The first surface under the cursor, or None."""
         if context is None:
             return None
         origin, direction = self.view.ray(mouse)
-        hit, location, *_rest = context.scene.ray_cast(context.evaluated_depsgraph_get(), origin, direction)
+        hit, location, *_rest = context.scene.ray_cast(
+            context.evaluated_depsgraph_get(), origin, direction
+        )
         return Vector(location) if hit else None
+
+    def _rotate(self, mouse, snap, context):
+        angle = _signed_angle(self.mouse0 - self.center, mouse - self.center)
+        facing = self.view.facing()
+        if self.axis:
+            axis = _AXES[self.axis]
+            # Keep the turn going the way the mouse goes, whichever way the
+            # axis happens to point relative to the viewer.
+            if axis.dot(facing) < 0.0:
+                axis = -axis
+        else:
+            axis = facing
+        if snap:
+            step = math.radians(5.0)
+            angle = round(angle / step) * step
+        q = Quaternion(axis, angle) @ self.rot0.to_quaternion()
+        new = q.to_euler("XYZ", self.rot0)
+        for i, locked in enumerate(self.obj.lock_rotation):
+            if locked:
+                new[i] = self.rot0[i]
+        if (Vector(self.obj.rotation_euler) - Vector(new)).length > 1e-9:
+            self.obj.rotation_euler = new
+
+    def _scale(self, mouse, snap, context):
+        start = max((self.mouse0 - self.center).length, 1.0)
+        factor = (mouse - self.center).length / start
+        if snap:
+            factor = round(factor * 10.0) / 10.0
+        factor = max(factor, 1e-3)
+        new = self.scale0.copy()
+        for i, name in enumerate("XYZ"):
+            if self.obj.lock_scale[i] or (self.axis and self.axis != name):
+                continue
+            new[i] = self.scale0[i] * factor
+        if (Vector(self.obj.scale) - new).length > 1e-9:
+            self.obj.scale = new
 
 
 def select_marker(context, obj, extend=False):
@@ -326,18 +406,28 @@ def _circle(center, right, up, radius, segments=40):
     return points
 
 
+def _square(center, right, up, half):
+    corners = [(-1, -1), (1, -1), (1, 1), (-1, 1)]
+    points = []
+    for i in range(4):
+        for cx, cy in (corners[i], corners[(i + 1) % 4]):
+            points.append(center + (right * cx + up * cy) * half)
+    return points
+
+
 class ARMATURE_NODES_GT_marker_handles(bpy.types.Gizmo):
-    """Every marker's glow in one gizmo, hit-tested on the CPU: lit under the
-    mouse; pressed and dragged, it moves the marker freely; clicked, it
-    selects the marker's empty for G / R / S."""
+    """Every marker handle in one gizmo, hit-tested on the CPU: the glow, its
+    ring when the marker supplies a rotation, its square when it supplies a
+    scale. Dragged, each moves, turns or scales the marker; a click on the
+    glow selects the marker's empty, for G / R / S."""
 
     bl_idname = "ARMATURE_NODES_GT_marker_handles"
 
-    __slots__ = ("hit", "drag", "press", "moved", "extend")
+    __slots__ = ("hit", "drag", "press", "moved", "extend", "core")
 
     def setup(self):
         self.hit = self.drag = self.press = None
-        self.moved = self.extend = False
+        self.moved = self.extend = self.core = False
 
     def test_select(self, context, location):
         handles = visible_handles()
@@ -348,19 +438,20 @@ class ARMATURE_NODES_GT_marker_handles(bpy.types.Gizmo):
             points = []
             for h in handles:
                 xy, s = view.to_screen(h.obj.location), h.scale(view)
-                points.append((xy if s else None, s or 0.0, MOVE, False, False))
+                points.append((xy if s else None, s or 0.0, h.core_mode(), h.turn, h.grow))
             found = pick(points, location)
             if found is not None:
-                self.hit = handles[found[0]]
-        _set_hovered(self.hit.ident() if self.hit is not None else None)
-        return MOVE if self.hit is not None else -1
+                self.hit = (handles[found[0]], found[1])
+        _set_hovered(self.hit[0].ident() if self.hit is not None else None)
+        return self.hit[1] if self.hit is not None else -1
 
     def invoke(self, context, event):
         if self.hit is None:
             return {"CANCELLED"}
+        handle, part = self.hit
         self.press = Vector((event.mouse_region_x, event.mouse_region_y))
-        self.drag = Drag(self.hit.obj, View(context.region, context.region_data), self.press)
-        self.moved, self.extend = False, event.shift
+        self.drag = Drag(handle.obj, part, View(context.region, context.region_data), self.press)
+        self.moved, self.extend, self.core = False, event.shift, part == handle.core_mode()
         return {"RUNNING_MODAL"}
 
     def modal(self, context, event, tweak):
@@ -380,19 +471,24 @@ class ARMATURE_NODES_GT_marker_handles(bpy.types.Gizmo):
         if self.drag is not None:
             if cancel:
                 self.drag.cancel()
-            elif not self.moved:
+            elif not self.moved and self.core:
                 select_marker(context, self.drag.obj, self.extend)
         self.drag = None
         _redraw()
 
     def draw(self, context):
-        _draw_outlines(context, self.hit)
+        if not (self.is_highlight or self.is_modal):
+            _set_hovered(None)
+        _draw_rings(context, self.hit if (self.is_highlight or self.is_modal) else None)
 
 
-def _draw_outlines(context, hot):
-    """A white outline round every glow, so a marker reads against any
-    background -- brighter round the one under the mouse. The glow itself is
-    drawn by the marker overlay (``primary_rig``)."""
+def _draw_rings(context, hit):
+    """Outline, rotation ring and scale square for every handle.
+
+    The glow itself is drawn by the marker overlay (``primary_rig``); this
+    adds the parts you grab. Outlined in white so a handle reads against any
+    background, and brighter where the mouse is.
+    """
     if gpu is None:
         return
     region, rv3d = context.region, context.region_data
@@ -402,7 +498,8 @@ def _draw_outlines(context, hot):
     right, up = view.right_up()
     line = line_shader(region)
     scale = ui_scale()
-    hot_ident = hot.ident() if hot is not None else None
+    hot_ident = hit[0].ident() if hit else None
+    hot_part = hit[1] if hit else None
     gpu.state.blend_set("ALPHA")
     gpu.state.depth_test_set("NONE")
     try:
@@ -411,13 +508,86 @@ def _draw_outlines(context, hot):
             wpp, s = view.world_per_pixel(co), handle.scale(view)
             if not wpp or not s:
                 continue
-            lit = handle.ident() == hot_ident
-            draw_lines(line, _circle(co, right, up, CORE_RADIUS * s * (1.25 if lit else 1.0) * wpp),
-                       (1.0, 1.0, 1.0, 1.0 if lit else 0.55), (2.5 if lit else 1.5) * scale)
+            hot = handle.ident() == hot_ident
+            r, g, b, _a = handle.color
+            shapes = []
+            core_hot = hot and hot_part == handle.core_mode()
+            shapes.append(
+                (
+                    _circle(co, right, up, CORE_RADIUS * s * (1.25 if core_hot else 1.0) * wpp),
+                    (1.0, 1.0, 1.0, 1.0 if core_hot else 0.55),
+                    2.5 if core_hot else 1.5,
+                )
+            )
+            if handle.turn:
+                ring_hot = hot and hot_part == ROTATE
+                shapes.append(
+                    (
+                        _circle(co, right, up, RING_RADIUS * s * wpp, segments=56),
+                        (r, g, b, 1.0 if ring_hot else 0.55),
+                        3.0 if ring_hot else 1.5,
+                    )
+                )
+            if handle.grow:
+                knob_hot = hot and hot_part == SCALE
+                offset = knob_offset(s)
+                center = co + (right * offset.x + up * offset.y) * wpp
+                shapes.append(
+                    (
+                        _square(center, right, up, KNOB_HALF * s * wpp),
+                        (1.0, 1.0, 1.0, 1.0 if knob_hot else 0.7),
+                        2.5 if knob_hot else 1.5,
+                    )
+                )
+            for coords, color, width in shapes:
+                draw_lines(line, coords, color, width * scale)
     finally:
         gpu.state.line_width_set(1.0)
         gpu.state.blend_set("NONE")
         gpu.state.depth_test_set("LESS_EQUAL")
+
+
+class ARMATURE_NODES_OT_marker_transform(bpy.types.Operator):
+    """Move, turn or scale the marker under the mouse -- G / R / S over its
+    glow, in any mode"""
+
+    bl_idname = "armature_nodes.marker_transform"
+    bl_label = "Transform Marker"
+    bl_options = {"REGISTER", "UNDO", "BLOCKING"}
+
+    mode: bpy.props.EnumProperty(
+        items=(("MOVE", "Move", ""), ("ROTATE", "Rotate", ""), ("SCALE", "Scale", "")),
+        options={"SKIP_SAVE"},
+    )
+
+    @classmethod
+    def poll(cls, context):
+        # No glow under the mouse: the key goes on to Blender's own transform.
+        return hovered_ident() is not None and context.region_data is not None
+
+    def invoke(self, context, event):
+        handle = next((h for h in visible_handles() if h.ident() == hovered_ident()), None)
+        if handle is None:
+            return {"PASS_THROUGH"}
+        part = {"MOVE": MOVE, "ROTATE": ROTATE, "SCALE": SCALE}[self.mode]
+        view = View(context.region, context.region_data)
+        self.drag = Drag(handle.obj, part, view, (event.mouse_region_x, event.mouse_region_y))
+        context.window_manager.modal_handler_add(self)
+        return {"RUNNING_MODAL"}
+
+    def modal(self, context, event):
+        if event.type in {"ESC", "RIGHTMOUSE"} and event.value == "PRESS":
+            self.drag.cancel()
+            _redraw()
+            return {"CANCELLED"}
+        if event.type in {"LEFTMOUSE", "RET", "NUMPAD_ENTER"} and event.value == "PRESS":
+            _redraw()
+            return {"FINISHED"}
+        if event.value == "PRESS" and event.type in _AXES:
+            self.drag.set_axis(event.type)
+        self.drag.update((event.mouse_region_x, event.mouse_region_y), precise=event.shift, snap=event.ctrl, context=context)
+        _redraw()
+        return {"RUNNING_MODAL"}
 
 
 def line_shader(region):
@@ -520,13 +690,22 @@ def _draw_label():
     blf.disable(font, blf.SHADOW)
 
 
-classes = (ARMATURE_NODES_GT_marker_handles, ARMATURE_NODES_GGT_marker_handles)
+classes = (ARMATURE_NODES_GT_marker_handles, ARMATURE_NODES_GGT_marker_handles, ARMATURE_NODES_OT_marker_transform)
+_keymap_items = []
 
 
 def register():
     global _label_handle
     for cls in classes:
         bpy.utils.register_class(cls)
+    keyconfig = bpy.context.window_manager.keyconfigs.addon
+    if keyconfig is not None:  # G / R / S over a glow, ahead of the mode's own
+        for name in ("Object Mode", "Pose", "Mesh", "Armature"):
+            km = keyconfig.keymaps.new(name=name)
+            for key, mode in (("G", "MOVE"), ("R", "ROTATE"), ("S", "SCALE")):
+                kmi = km.keymap_items.new(ARMATURE_NODES_OT_marker_transform.bl_idname, key, "PRESS")
+                kmi.properties.mode = mode
+                _keymap_items.append((km, kmi))
     if blf is not None and _label_handle is None:
         _label_handle = bpy.types.SpaceView3D.draw_handler_add(
             _draw_label, (), "WINDOW", "POST_PIXEL"
@@ -538,6 +717,12 @@ def unregister():
     if _label_handle is not None:
         bpy.types.SpaceView3D.draw_handler_remove(_label_handle, "WINDOW")
         _label_handle = None
+    for km, kmi in _keymap_items:
+        try:
+            km.keymap_items.remove(kmi)
+        except (ReferenceError, RuntimeError):
+            pass
+    _keymap_items.clear()
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)
     _hovered = None

@@ -460,6 +460,12 @@ class MarkerNode(MarkerHolderMixin, ArmatureNodeBase, Node):
             return reparented  # pose matrices are stale in Edit mode
         changed = self._track_links(state) or reparented
         if state.pbone is not None:
+            from .. import livelink
+
+            if livelink.release(self):
+                # Held while another marker was moved: the rig moved this
+                # bone, so the marker is read off it, as when first wired.
+                changed |= self._take_over(state, {f"{c.name}\t{n}" for c, n, *_ in state.wired}, set())
             changed |= self._read_idle(state)
         self._place_handle(state)
         return changed
@@ -680,7 +686,10 @@ class MarkerNode(MarkerHolderMixin, ArmatureNodeBase, Node):
         if grow and not same_vec(self.marker_value(marker, "scale"), handle.scale):
             parts["scale"] = tuple(handle.scale)
         if parts:
+            from .. import livelink
+
             self.apply_world(marker, parts)
+            livelink.hold_others(self)  # moved by hand: it alone drives the rig
         _remember_handle(handle)
         if parts:
             self.schedule_rebuild()

@@ -162,6 +162,44 @@ def forget(node):
 def reset():
     """Drop every snapshot. Undo, redo and file load all invalidate them."""
     _snapshots.clear()
+    _held.clear()
+
+
+# One marker leads. The marker moved by hand drives its bone alone; every
+# other marker of its tree lets go of its own bone for the next build -- the
+# bone keeps its pose, carried by its parents as Pose mode carries it (an FK
+# child rides along, an IK hand stays) -- and is then read off it, as when it
+# was first wired. (tree, node) -> [to hold at the next build, held by it].
+_held = {}
+
+
+def hold_others(driver):
+    """``driver``, a Marker node, was just moved by hand."""
+    tree = driver.id_data
+    for node in tree.nodes:
+        if node != driver and node.bl_idname == "ArmatureNodesMarkerNode":
+            _held.setdefault((tree.name, node.name), [False, False])[0] = True
+
+
+def take_held(node):
+    """For a build: True if ``node``'s bone keeps its pose through it."""
+    entry = _held.get((node.id_data.name, node.name))
+    if entry is None or not entry[0]:
+        return False
+    entry[:] = [False, True]
+    return True
+
+
+def release(node):
+    """After that build: True if ``node`` is now to be read off its bone."""
+    key = (node.id_data.name, node.name)
+    entry = _held.get(key)
+    if entry is None or not entry[1]:
+        return False
+    entry[1] = False
+    if not entry[0]:
+        del _held[key]
+    return True
 
 
 def compose(rotation, euler, compat=None):

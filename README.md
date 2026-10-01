@@ -174,10 +174,26 @@ of the bone does not move, a marker that supplies no rotation does not turn.
 The glow under the mouse lights up with the marker's name beside it. Markers
 are picked in Object mode — in Pose mode, G / R / S move the bones.
 
+**One marker leads.** The marker you move drives its bone, and only it: the
+bones of all the others keep their own pose meanwhile, carried by the rig as
+in Pose mode — an FK child rides along, an IK hand or foot stays where it is
+— and their markers are read back off them, an elbow's onto the elbow. So a
+marker never pins the rig except while you hold it.
+
 **Or drag a glow** — in any mode — to move the marker freely with the mouse:
 **X / Y / Z** lock the move to that axis, **Shift** moves it finely, **Ctrl**
 drops it onto the surface under the cursor, **Esc** or right-click puts it
 back. A press that does not move is a click, and selects the marker.
+**Drag the ring** — there when the marker supplies a rotation — to turn it
+about the view, or with X / Y / Z about that axis; Ctrl: 5° steps. **Drag the
+square** on the ring — there when it supplies a scale — to scale it; X / Y / Z:
+that axis only, Ctrl: steps of 0.1. A marker whose position is only a readout
+of its bone turns (or scales) from its glow instead.
+
+**Or hover a glow and press G, R or S** — in any mode, Pose mode included —
+to move, turn or scale that marker with the mouse: X / Y / Z for an axis,
+Shift finely, Ctrl in steps; click or Enter keeps it, Esc or right-click
+puts it back. Away from a glow the keys are Blender's own.
 
 **Handles are sized in the scene, like the character they sit on**: zoom in
 and they grow, zoom out and they shrink — so a zoomed-out figure is not

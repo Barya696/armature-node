@@ -188,6 +188,31 @@ def test_pose_finds_the_turns_the_markers_cannot_say():
     assert _off(markers["Chest"], truth["Chest"]) < 3.0, "and Wrapped as Pose left it"
 
 
+def test_only_the_marker_moved_drives_the_rig():
+    """A marker moved by hand drives its control alone. The rest of the rig
+    moves as Rigify moves it -- the chest rides down with the torso instead
+    of staying pinned -- and every other marker is read off its bone: the
+    hands on their IK controls, the elbow on the elbow."""
+    rig, _body, tree, group = _rigify_scene()
+    markers = _markers(group)
+    pose, mw = rig.pose.bones, rig.matrix_world
+
+    def at(name):
+        return Vector(markers[name].marker_value(markers[name].markers[0], "position"))
+
+    torso, chest = mw @ pose["torso"].head, mw @ pose["chest"].head
+    handle = live._handle(markers["Pelvis"], markers["Pelvis"].markers[0])
+    drop = Vector((0.0, 0.0, -0.1))
+    handle.location = Vector(handle.location) + drop
+    _settle(tree)
+    assert (mw @ pose["torso"].head - (torso + drop)).length < 1e-4, "the moved marker drives its control"
+    assert (mw @ pose["chest"].head - (chest + drop)).length < 1e-3, "the chest rides on the torso"
+    for side in "LR":
+        assert (at(f"Hand.{side}") - mw @ pose[f"hand_ik.{side}"].head).length < 1e-4, "a hand marker on its control"
+        assert (at(f"Elbow.{side}") - mw @ pose[f"ORG-forearm.{side}"].head).length < 1e-3, "an elbow marker on the elbow"
+    assert (at("Chest") - mw @ pose["chest"].head).length < 1e-4
+
+
 def test_the_hips_sit_on_the_rigs_hip_joints():
     """A hip moves no control, so nothing seeds it: added to a rig, the
     skeleton puts its hips on the rig's own hip joints, whatever its size."""

@@ -304,7 +304,19 @@ def _modify_pass(tree, name, bone_defs):
     # mode_set is an operator, so each flip emitted a depsgraph update, which
     # scheduled another build, which flipped again. Most builds write nothing
     # at all, so the whole dance was for a no-op.
+    # One marker leads (see livelink.hold_others): the bones of the markers
+    # not being moved keep their pose through this build.
+    from . import livelink
+
+    keep = {}
+    for node in _live_nodes(tree):
+        if node.bl_idname == "ArmatureNodesMarkerNode" and livelink.take_held(node):
+            state = node.link_state()
+            if state.pbone is not None and state.obj == obj:
+                keep[state.pbone.name] = state.pbone.matrix_basis.copy()
     result = pipeline.apply(obj, base, target, touched_store.read(obj))
+    for bone, basis in keep.items():
+        obj.pose.bones[bone].matrix_basis = basis
     _note_built(tree)
 
     tree.last_error = "; ".join(result.errors[:2]) if result.errors else ""
